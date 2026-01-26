@@ -9,18 +9,45 @@ interface WeightingPanelProps {
   onWeightingChange: (weighting: WeightingType) => void;
   customWeighting: { te: number; tr: number; ti: number };
   onCustomWeightingChange: (params: { te: number; tr: number; ti: number }) => void;
+  /** Selected plane for the main viewport */
+  selectedPlane: 'axial' | 'sagittal' | 'coronal';
+  onPlaneChange: (plane: 'axial' | 'sagittal' | 'coronal') => void;
 }
 
 export function WeightingPanel({ 
   weighting, 
   onWeightingChange, 
   customWeighting, 
-  onCustomWeightingChange 
+  onCustomWeightingChange,
+  selectedPlane,
+  onPlaneChange,
 }: WeightingPanelProps) {
   return (
-    <div className="w-72 bg-gray-900 border-l border-gray-800 p-4 overflow-y-auto">
+    <div className="bg-gray-900 border-l border-gray-800 p-4 overflow-y-auto">
       <h2 className="text-sm font-semibold text-gray-300 mb-4">Image Weighting</h2>
       
+      <div className="mb-4">
+        <h3 className="text-sm font-semibold text-gray-300 mb-2">Plane</h3>
+        <RadioGroup value={selectedPlane} onValueChange={(v) => onPlaneChange(v as 'axial' | 'sagittal' | 'coronal')}>
+          <div className="space-y-2">
+            <div className="flex items-center space-x-2">
+              <RadioGroupItem value="axial" id="axial" className="border-gray-600" />
+              <Label htmlFor="axial" className="text-sm text-gray-300 cursor-pointer">Axial</Label>
+            </div>
+            <div className="flex items-center space-x-2">
+              <RadioGroupItem value="sagittal" id="sagittal" className="border-gray-600" />
+              <Label htmlFor="sagittal" className="text-sm text-gray-300 cursor-pointer">Sagittal</Label>
+            </div>
+            <div className="flex items-center space-x-2">
+              <RadioGroupItem value="coronal" id="coronal" className="border-gray-600" />
+              <Label htmlFor="coronal" className="text-sm text-gray-300 cursor-pointer">Coronal</Label>
+            </div>
+          </div>
+        </RadioGroup>
+
+
+      </div>
+
       <div className="space-y-4">
         <div className="bg-gray-800 p-3 rounded-lg border border-gray-700">
           <p className="text-xs text-gray-400 mb-3">

@@ -17,9 +17,14 @@ interface ToolbarProps {
   onToolChange: (tool: MeasurementTool) => void;
   measurements: Measurement[];
   onMeasurementDelete: (id: string) => void;
+  /** show/hide crosshair in viewport */
+  showCrosshair: boolean;
+  onToggleCrosshair: () => void;
+  /** compute auto window/level for current slice */
+  onAutoWindowLevel: () => void;
 }
 
-export function Toolbar({ activeTool, onToolChange, measurements, onMeasurementDelete }: ToolbarProps) {
+export function Toolbar({ activeTool, onToolChange, measurements, onMeasurementDelete, showCrosshair, onToggleCrosshair, onAutoWindowLevel }: ToolbarProps) {
   const tools: { id: MeasurementTool; icon: any; label: string }[] = [
     { id: 'none', icon: MousePointer, label: 'Select' },
     { id: 'distance', icon: Ruler, label: 'Distance' },
@@ -30,9 +35,29 @@ export function Toolbar({ activeTool, onToolChange, measurements, onMeasurementD
   ];
 
   return (
-    <div className="w-60 bg-gray-900 border-r border-gray-800 flex flex-col">
+    <div className="bg-gray-900 border-r border-gray-800 flex flex-col">
       <div className="p-4">
-        <h2 className="text-sm font-semibold text-gray-300 mb-3">Measurement Tools</h2>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-sm font-semibold text-gray-300">Measurement Tools</h2>
+          <div className="flex items-center space-x-2">
+            <Button
+              size="sm"
+              variant={showCrosshair ? 'default' : 'ghost'}
+              className={showCrosshair ? 'bg-blue-600 text-white' : 'text-gray-300'}
+              onClick={() => onToggleCrosshair()}
+            >
+              Crosshair
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="text-gray-300"
+              onClick={() => onAutoWindowLevel()}
+            >
+              Auto WL
+            </Button>
+          </div>
+        </div>
         <div className="space-y-1">
           {tools.map(tool => {
             const Icon = tool.icon;
