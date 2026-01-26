@@ -15,6 +15,7 @@ interface ViewportProps {
   onMeasurementAdd: (measurement: Measurement) => void;
   applyWeighting: (pixelValue: number) => number;
   showCrosshair?: boolean;
+  parentWindowHeight?: number;
 }
 
 export function Viewport({
@@ -30,6 +31,7 @@ export function Viewport({
   onMeasurementAdd,
   applyWeighting,
   showCrosshair = false,
+  parentWindowHeight,
 }: ViewportProps) {
   const [autoFlash, setAutoFlash] = useState<{ window: number; level: number } | null>(null);
 
@@ -44,6 +46,7 @@ export function Viewport({
   // container for responsive sizing
   const containerRef = useRef<HTMLDivElement>(null);
   const [displaySize, setDisplaySize] = useState({ width: 0, height: 0 });
+  const displaySizeRef = useRef(displaySize);
   // for debugging: container rect seen by ResizeObserver
   const [containerRect, setContainerRect] = useState({ width: 0, height: 0 });
   const [ancestorRects, setAncestorRects] = useState<{ parent: { width: number; height: number } | null; grandParent: { width: number; height: number } | null }>({ parent: null, grandParent: null });
@@ -52,6 +55,14 @@ export function Viewport({
   const [isDrawing, setIsDrawing] = useState(false);
   const [drawingPoints, setDrawingPoints] = useState<{ x: number; y: number }[]>([]);
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
+
+  // Pan state
+  const [panSrc, setPanSrc] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const panStartRef = useRef<{ clientX: number; clientY: number; startX: number; startY: number } | null>(null);
+  const [isPanning, setIsPanning] = useState(false);
+  const [zoomScale, setZoomScale] = useState(1);
+  const sliceDimsRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
+  const cropRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
 
 
 
@@ -114,15 +125,7 @@ export function Viewport({
         return;
       }
 
-      // Compute available size from window and subtract left/right panels and header to avoid feedback loops
-      const leftPanel = document.querySelector('.w-60') as HTMLElement | null;
-      const rightPanel = document.querySelector('.w-72') as HTMLElement | null;
-      const headerEl = document.querySelector('header') as HTMLElement | null;
-
-      const leftW = leftPanel ? Math.round(leftPanel.getBoundingClientRect().width) : 0;
-      const rightW = rightPanel ? Math.round(rightPanel.getBoundingClientRect().width) : 0;
-      const headerH = headerEl ? Math.round(headerEl.getBoundingClientRect().height) : 0;
-
+      // Compute available size from the container rect (for floating windows this avoids using the full window size)
       let sliderWidth = 0;
       let sliderMarginLeft = 0;
       const sliderEl = sliderRef.current;
@@ -133,47 +136,79 @@ export function Viewport({
         sliderMarginLeft = parseFloat(sStyle.marginLeft || '0') || 0;
       }
 
+      // Rebuilt fit algorithm (aspect-preserving, deterministic)
       const paddingBuffer = 8;
-      const availW = Math.max(1, window.innerWidth - leftW - rightW - sliderWidth - sliderMarginLeft - paddingBuffer * 2);
-      const availH = Math.max(1, window.innerHeight - headerH - paddingBuffer * 2);
-
       const { width: imgW, height: imgH } = getSliceData();
 
-      let dw = Math.max(1, Math.round(availW));
-      let dh = Math.max(1, Math.round(availH));
+      // Available area inside the container (subtract slider if present)
+      const availW = Math.max(1, rect.width - sliderWidth - sliderMarginLeft - paddingBuffer * 2);
+      const availH = Math.max(1, rect.height - paddingBuffer * 2);
 
-      // Fit-only: scale image to fit inside available width/height
-      {
-        const sx = availW / imgW || 1;
-        const sy = availH / imgH || 1;
-        const scale = Math.min(sx, sy);
-        dw = Math.max(1, Math.round(imgW * scale));
-        dh = Math.max(1, Math.round(imgH * scale));
-      }
+      // If image has invalid dimensions, fallback to small default
+      const safeImgW = Math.max(1, imgW || 1);
+      const safeImgH = Math.max(1, imgH || 1);
 
-      // Avoid tiny oscillations: only update if size changed by at least 1px
-      if (Math.abs(displaySize.width - Math.round(dw)) < 1 && Math.abs(displaySize.height - Math.round(dh)) < 1) {
+      // Compute scale so image fits into the available area using the smaller dimension
+      // (allow upscaling so the image can fill the smaller container dimension)
+      const scale = Math.min(availW / safeImgW, availH / safeImgH);
+      const computedW = Math.max(1, Math.round(safeImgW * scale));
+      const computedH = Math.max(1, Math.round(safeImgH * scale));
+
+      // Enforce sensible min / max so the wrapper never collapses
+      const MIN_DISPLAY = 48; // absolute lower bound
+      const maxW = Math.max(MIN_DISPLAY, Math.round(rect.width - paddingBuffer * 2));
+      const maxH = Math.max(MIN_DISPLAY, Math.round(rect.height - paddingBuffer * 2));
+
+      const finalW = Math.max(MIN_DISPLAY, Math.min(maxW, Math.round(computedW)));
+      const finalH = Math.max(MIN_DISPLAY, Math.min(maxH, Math.round(computedH)));
+
+      // Adaptive hysteresis based on the container size to avoid micro updates
+      const deltaW = Math.max(2, Math.round(rect.width * 0.005));
+      const deltaH = Math.max(2, Math.round(rect.height * 0.005));
+      if (Math.abs(displaySizeRef.current.width - finalW) < deltaW && Math.abs(displaySizeRef.current.height - finalH) < deltaH) {
         return;
       }
 
-      // log details for debugging
-      console.debug('avail', availW, availH, 'panels', leftW, rightW, 'slider', sliderWidth, 'img', imgW, imgH, 'display', dw, dh);
+      // Debug trace (left intentionally minimal)
+      console.debug('fit', { rectW: rect.width, rectH: rect.height, availW, availH, imgW: safeImgW, imgH: safeImgH, finalW, finalH });
 
-      setDisplaySize({ width: Math.round(dw), height: Math.round(dh) });
+      displaySizeRef.current = { width: finalW, height: finalH };
+      setDisplaySize({ width: finalW, height: finalH });
     };
 
-    const ro = new ResizeObserver(() => update());
+    // Debounced ResizeObserver + rAF to avoid reacting to rapid micro-changes
+    let rafId: number | null = null;
+    const debouncedUpdate = () => {
+      if (rafId != null) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        update();
+      });
+    };
+
+    const ro = new ResizeObserver(debouncedUpdate);
     ro.observe(container);
-    window.addEventListener('resize', update);
+
+    const onResize = () => debouncedUpdate();
+    const onScroll = () => debouncedUpdate();
+
+    window.addEventListener('resize', onResize);
     // use capture to catch scrolls from ancestors
-    window.addEventListener('scroll', update, true);
+    window.addEventListener('scroll', onScroll, true);
+
+    // run once immediately
     update();
+
     return () => {
       ro.disconnect();
-      window.removeEventListener('resize', update);
-      window.removeEventListener('scroll', update, true);
+      window.removeEventListener('resize', onResize);
+      window.removeEventListener('scroll', onScroll, true);
+      if (rafId != null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
     };
-  }, [getSliceData, displaySize]);
+  }, [getSliceData]);
 
   // Apply window/level and weighting to image
   const applyWindowLevel = useCallback((value: number): number => {
@@ -191,7 +226,11 @@ export function Viewport({
     return Math.round(((weighted - min) / window) * 255);
   }, [windowLevel, applyWeighting]);
 
-  // Render image (draw scaled to the target display size using ImageBitmap)
+  // Heavy rendering effect: builds source canvas and caches ImageBitmap when slice/WL/weighting changes
+  const bitmapRef = useRef<ImageBitmap | null>(null);
+  const bitmapKeyRef = useRef<string | null>(null);
+  const sourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
   useEffect(() => {
     let cancelled = false;
     const canvas = canvasRef.current;
@@ -203,6 +242,9 @@ export function Viewport({
 
     (async () => {
       const { sliceData, width, height } = getSliceData();
+
+      // Track slice dimensions for pan calculations
+      sliceDimsRef.current = { w: width, h: height };
 
       // Build RGBA image buffer after applying window/level
       const rgba = new Uint8ClampedArray(width * height * 4);
@@ -240,27 +282,64 @@ export function Viewport({
       // Scale canvas CSS size to the target display size (CSS pixels)
       canvas.style.width = `${displayW}px`;
       canvas.style.height = `${displayH}px`;
-      try {
-        const bitmap = await createImageBitmap(imgData);
-        if (cancelled) {
-          bitmap.close?.();
-          return;
-        }
 
-        // Draw bitmap stretched to full backing pixels
-        // Use identity transform since we're drawing into the full backing size
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.imageSmoothingEnabled = false;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-        bitmap.close?.();
-      } catch (err) {
-        // Fallback to putImageData if createImageBitmap isn't available
-        const fallbackCtx = ctx;
-        fallbackCtx.setTransform(1, 0, 0, 1, 0, 0);
-        fallbackCtx.clearRect(0, 0, canvas.width, canvas.height);
-        // draw at top-left; it will be scaled by CSS
-        fallbackCtx.putImageData(imgData, 0, 0);
+      // Ensure we have a source canvas to draw from synchronously
+      if (!sourceCanvasRef.current) sourceCanvasRef.current = document.createElement('canvas');
+      const src = sourceCanvasRef.current;
+      if (src.width !== width || src.height !== height) {
+        src.width = width;
+        src.height = height;
+      }
+      const sctx = src.getContext('2d');
+      sctx?.putImageData(imgData, 0, 0);
+
+      // Draw immediately from source canvas (synchronous and fast)
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.imageSmoothingEnabled = false;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Compute CSS display sizes (canvas backing divided by DPR)
+      const displayW_css = canvas.width / dpr;
+      const displayH_css = canvas.height / dpr;
+
+      // compute scaled draw size preserving aspect and centering
+      const sx = displayW_css / imgW || 1;
+      const sy = displayH_css / imgH || 1;
+      const scale = Math.min(sx, sy);
+      const drawW = Math.max(1, Math.round(imgW * scale));
+      const drawH = Math.max(1, Math.round(imgH * scale));
+      const offsetX = Math.round((displayW_css - drawW) / 2);
+      const offsetY = Math.round((displayH_css - drawH) / 2);
+
+      if (zoomScale > 1) {
+        const cropW = Math.max(1, Math.floor(width / zoomScale));
+        const cropH = Math.max(1, Math.floor(height / zoomScale));
+        cropRef.current = { w: cropW, h: cropH };
+
+        const px = Math.max(0, Math.min(sliceDimsRef.current.w - cropW, Math.round(panSrc.x || 0)));
+        const py = Math.max(0, Math.min(sliceDimsRef.current.h - cropH, Math.round(panSrc.y || 0)));
+        if (panSrc.x !== px || panSrc.y !== py) setPanSrc({ x: px, y: py });
+
+        ctx.drawImage(src, px, py, cropW, cropH, offsetX * dpr, offsetY * dpr, drawW * dpr, drawH * dpr);
+      } else {
+        // draw full image centered and scaled
+        ctx.drawImage(src, 0, 0, width, height, offsetX * dpr, offsetY * dpr, drawW * dpr, drawH * dpr);
+      }
+
+      // Asynchronously build and cache an ImageBitmap for faster subsequent draws
+      const key = `${plane}:${currentSlice}:${windowLevel.window}:${windowLevel.level}`;
+      if (bitmapKeyRef.current !== key) {
+        try {
+          const b = await createImageBitmap(imgData);
+          if (cancelled) { b.close?.(); }
+          else {
+            bitmapRef.current?.close?.();
+            bitmapRef.current = b;
+            bitmapKeyRef.current = key;
+          }
+        } catch (e) {
+          // ignore
+        }
       }
 
       // Ensure overlay canvas matches backing store and CSS size
@@ -274,6 +353,48 @@ export function Viewport({
 
     return () => { cancelled = true; };
   }, [imageData, currentSlice, plane, windowLevel, applyWindowLevel, getSliceData, displaySize]);
+
+  // Fast pan/zoom draw effect: responds to panSrc and zoomScale without rebuilding pixels
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const src = sourceCanvasRef.current;
+    if (!src) return;
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    const width = src.width;
+    const height = src.height;
+
+    const dpr = window.devicePixelRatio || 1;
+    const displayW_css = canvas.width / dpr;
+    const displayH_css = canvas.height / dpr;
+    const sx = displayW_css / width || 1;
+    const sy = displayH_css / height || 1;
+    const scale = Math.min(sx, sy);
+    const drawW = Math.max(1, Math.round(width * scale));
+    const drawH = Math.max(1, Math.round(height * scale));
+    const offsetX = Math.round((displayW_css - drawW) / 2);
+    const offsetY = Math.round((displayH_css - drawH) / 2);
+
+    if (zoomScale > 1) {
+      const cropW = Math.max(1, Math.floor(width / zoomScale));
+      const cropH = Math.max(1, Math.floor(height / zoomScale));
+      cropRef.current = { w: cropW, h: cropH };
+
+      const px = Math.max(0, Math.min(sliceDimsRef.current.w - cropW, Math.round(panSrc.x || 0)));
+      const py = Math.max(0, Math.min(sliceDimsRef.current.h - cropH, Math.round(panSrc.y || 0)));
+
+      ctx.drawImage(src, px, py, cropW, cropH, offsetX * dpr, offsetY * dpr, drawW * dpr, drawH * dpr);
+    } else {
+      ctx.drawImage(src, 0, 0, width, height, offsetX * dpr, offsetY * dpr, drawW * dpr, drawH * dpr);
+    }
+  }, [panSrc, zoomScale, displaySize]);
 
   // Render measurements overlay
   useEffect(() => {
@@ -454,13 +575,51 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    if (activeTool === 'none') {
+    if (activeTool === 'pan') {
+      // start panning
+      setIsPanning(true);
+      panStartRef.current = { clientX: e.clientX, clientY: e.clientY, startX: panSrc.x, startY: panSrc.y };
+    } else if (activeTool === 'none') {
       setIsDragging(true);
       setDragStart({ x: e.clientX, y: e.clientY });
     } else {
       setIsDrawing(true);
       setDrawingPoints([{ x, y }]);
     }
+  };
+
+  const panRafRef = useRef<number | null>(null);
+
+  const drawPanImmediate = (newX: number, newY: number) => {
+    const canvas = canvasRef.current;
+    const src = sourceCanvasRef.current;
+    if (!canvas || !src) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const width = src.width;
+    const height = src.height;
+
+    const displayW_css = canvas.width / dpr;
+    const displayH_css = canvas.height / dpr;
+    const sx = displayW_css / width || 1;
+    const sy = displayH_css / height || 1;
+    const scale = Math.min(sx, sy);
+    const drawW = Math.max(1, Math.round(width * scale));
+    const drawH = Math.max(1, Math.round(height * scale));
+    const offsetX = Math.round((displayW_css - drawW) / 2);
+    const offsetY = Math.round((displayH_css - drawH) / 2);
+
+    const cropW = Math.max(1, Math.floor(width / zoomScale));
+    const cropH = Math.max(1, Math.floor(height / zoomScale));
+
+    // clear then draw
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    ctx.drawImage(src, newX, newY, cropW, cropH, offsetX * dpr, offsetY * dpr, drawW * dpr, drawH * dpr);
   };
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -470,7 +629,29 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    if (isDragging && dragStart) {
+    if (activeTool === 'pan' && isPanning && panStartRef.current) {
+      // Calculate image crop size
+      const cropW = Math.max(1, Math.floor(sliceDimsRef.current.w / zoomScale));
+      const cropH = Math.max(1, Math.floor(sliceDimsRef.current.h / zoomScale));
+      const displayW = displaySize.width || sliceDimsRef.current.w;
+      const displayH = displaySize.height || sliceDimsRef.current.h;
+
+      const dx = e.clientX - panStartRef.current.clientX;
+      const dy = e.clientY - panStartRef.current.clientY;
+
+      const imageDx = Math.round((dx / displayW) * cropW);
+      const imageDy = Math.round((dy / displayH) * cropH);
+
+      const newX = Math.max(0, Math.min(sliceDimsRef.current.w - cropW, panStartRef.current.startX - imageDx));
+      const newY = Math.max(0, Math.min(sliceDimsRef.current.h - cropH, panStartRef.current.startY - imageDy));
+
+      // Immediate visual update via rAF draw
+      if (panRafRef.current != null) cancelAnimationFrame(panRafRef.current);
+      panRafRef.current = requestAnimationFrame(() => drawPanImmediate(newX, newY));
+
+      // Still update state for persistence and other effects
+      setPanSrc({ x: newX, y: newY });
+    } else if (isDragging && dragStart) {
       // Window/Level adjustment
       const dx = e.clientX - dragStart.x;
       const dy = e.clientY - dragStart.y;
@@ -496,7 +677,10 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    if (isDragging) {
+    if (activeTool === 'pan' && isPanning) {
+      setIsPanning(false);
+      panStartRef.current = null;
+    } else if (isDragging) {
       setIsDragging(false);
       setDragStart(null);
     } else if (isDrawing) {
@@ -599,6 +783,35 @@ export function Viewport({
     onSliceChange(newSlice);
   };
 
+  // When entering pan mode, initialize panSrc to center the zoomed crop
+  useEffect(() => {
+    if (activeTool !== 'pan') return;
+
+    // Decide a sensible initial zoom for pan (do not force via a separate effect)
+    const initialZoom = 2;
+
+    const dims = sliceDimsRef.current;
+    const w = Math.max(1, dims.w || getSliceData().width);
+    const h = Math.max(1, dims.h || getSliceData().height);
+
+    const cropW = Math.max(1, Math.floor(w / initialZoom));
+    const cropH = Math.max(1, Math.floor(h / initialZoom));
+
+    const centerX = Math.max(0, Math.floor((w - cropW) / 2));
+    const centerY = Math.max(0, Math.floor((h - cropH) / 2));
+
+    // Only initialize if user hasn't panned yet (avoid overwriting manual pan)
+    if ((panSrc.x === 0 && panSrc.y === 0) || (panSrc.x <= 1 && panSrc.y <= 1)) {
+      setZoomScale(initialZoom);
+      setPanSrc({ x: centerX, y: centerY });
+    }
+  }, [activeTool]);
+
+  // Reset zoom when leaving pan tool so other tools use 1:1 fit
+  useEffect(() => {
+    if (activeTool !== 'pan') setZoomScale(1);
+  }, [activeTool]);
+
   const dims = header.dims;
   const maxSlice = plane === 'axial' ? dims[3] : plane === 'sagittal' ? dims[1] : dims[2];
 
@@ -608,7 +821,14 @@ export function Viewport({
   const displayH = displaySize.height || imgH;
 
   return (
-    <div className="relative bg-gray-900 rounded-lg border border-gray-800 overflow-hidden flex flex-col">
+    <div className="relative bg-gray-900 rounded-lg border border-gray-800 overflow-hidden flex flex-col h-full w-full">
+      {process.env.NODE_ENV !== 'production' && (
+        <div className="absolute right-2 top-2 z-30 bg-black bg-opacity-60 text-xs text-white px-2 py-1 rounded">
+          <div>parentH: {parentWindowHeight ?? 'n/a'}</div>
+          <div>measuredH: {containerRect.height}</div>
+          <div>displayH: {displaySize.height}</div>
+        </div>
+      )}
       <div className="absolute top-2 left-2 z-10 bg-black bg-opacity-50 px-2 py-1 rounded text-xs text-white">
         <div className="font-semibold capitalize">{plane}</div>
         <div className="text-gray-400">
@@ -619,15 +839,6 @@ export function Viewport({
         </div>
       </div>
 
-  {/* Debug overlay: container and image sizes */}
-      <div className="absolute top-2 right-2 z-10 bg-black bg-opacity-50 px-2 py-1 rounded text-xs text-white">
-        <div className="font-semibold">Debug</div>
-        <div className="text-gray-400 text-xs">Container: {containerRect.width} x {containerRect.height}</div>
-        <div className="text-gray-400 text-xs">Display: {displaySize.width} x {displaySize.height}</div>
-        <div className="text-gray-400 text-xs">Image: {getSliceData().width} x {getSliceData().height}</div>
-        <div className="text-gray-400 text-xs mt-1">Parent: {ancestorRects.parent ? `${ancestorRects.parent.width} x ${ancestorRects.parent.height}` : '—'}</div>
-        <div className="text-gray-400 text-xs">GrandParent: {ancestorRects.grandParent ? `${ancestorRects.grandParent.width} x ${ancestorRects.grandParent.height}` : '—'}</div>
-      </div>
 
       {/* Auto WL flash */}
       {autoFlash && (
@@ -636,9 +847,12 @@ export function Viewport({
         </div>
       )}
 
-      <div className="flex-1 flex items-center justify-center p-4 overflow-auto min-h-0">
-        <div ref={containerRef} className="relative w-full h-full flex items-center justify-center" style={{ maxWidth: '100%', maxHeight: '100%' }}>
-          <div className="flex items-center max-w-full max-h-full">
+      <div ref={containerRef} className="flex-1 flex items-center justify-center p-4 overflow-auto min-h-0">
+        <div
+          className="relative flex items-center justify-center w-full h-full"
+          style={{ overflow: 'hidden' }}
+        >
+          <div className="flex items-center" style={{ width: '100%', height: '100%', alignItems: 'center', justifyContent: 'center' }}>
             <div className="relative" style={{ width: `${displayW}px`, height: `${displayH}px` }}>
               <canvas
                 ref={canvasRef}
@@ -647,7 +861,8 @@ export function Viewport({
               />
               <canvas
                 ref={overlayCanvasRef}
-                className="absolute inset-0 w-full h-full cursor-crosshair"
+                className="absolute inset-0 w-full h-full"
+                style={{ cursor: activeTool === 'pan' ? (isPanning ? 'grabbing' : 'grab') : 'crosshair' }}
                 onMouseDown={handleMouseDown}
                 onMouseMove={handleMouseMove}
                 onMouseUp={handleMouseUp}

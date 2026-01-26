@@ -7,11 +7,14 @@ import { WeightingType } from './MedicalImageViewer';
 interface WeightingPanelProps {
   weighting: WeightingType;
   onWeightingChange: (weighting: WeightingType) => void;
-  customWeighting: { te: number; tr: number; ti: number };
-  onCustomWeightingChange: (params: { te: number; tr: number; ti: number }) => void;
-  /** Selected plane for the main viewport */
-  selectedPlane: 'axial' | 'sagittal' | 'coronal';
-  onPlaneChange: (plane: 'axial' | 'sagittal' | 'coronal') => void;
+  customWeighting: { psi: number };
+  onCustomWeightingChange: (params: { psi: number }) => void;
+  /** Contrast mode: 'disk' (pregenerated) or 'gpu' (real-time) */
+  contrastMode: 'disk' | 'gpu';
+  onContrastModeChange: (mode: 'disk' | 'gpu') => void;
+  /** Selected planes (multi-select) */
+  selectedPlanes: Array<'axial' | 'sagittal' | 'coronal'>;
+  onPlanesChange: (planes: Array<'axial' | 'sagittal' | 'coronal'>) => void;
 }
 
 export function WeightingPanel({ 
@@ -19,72 +22,76 @@ export function WeightingPanel({
   onWeightingChange, 
   customWeighting, 
   onCustomWeightingChange,
-  selectedPlane,
-  onPlaneChange,
+  contrastMode,
+  onContrastModeChange,
+  selectedPlanes,
+  onPlanesChange,
 }: WeightingPanelProps) {
+  const togglePlane = (p: 'axial' | 'sagittal' | 'coronal') => {
+    if (selectedPlanes.includes(p)) {
+      onPlanesChange(selectedPlanes.filter(x => x !== p));
+    } else {
+      onPlanesChange([...selectedPlanes, p]);
+    }
+  };
+
+  const isPlaneSelected = (p: 'axial' | 'sagittal' | 'coronal') => selectedPlanes.includes(p);
+
   return (
     <div className="bg-gray-900 border-l border-gray-800 p-4 overflow-y-auto">
-      <h2 className="text-sm font-semibold text-gray-300 mb-4">Image Weighting</h2>
-      
+      <h2 className="text-sm font-semibold text-gray-300 mb-2">SMART MRI Tissue Weighting Tool</h2>
+      <p className="text-xs text-gray-400 mb-4">multi-contrast image generation from single MRI sequence</p>
+
       <div className="mb-4">
-        <h3 className="text-sm font-semibold text-gray-300 mb-2">Plane</h3>
-        <RadioGroup value={selectedPlane} onValueChange={(v) => onPlaneChange(v as 'axial' | 'sagittal' | 'coronal')}>
+        <h3 className="text-sm font-semibold text-gray-300 mb-2">Processing Mode</h3>
+        <RadioGroup value={contrastMode} onValueChange={(v) => onContrastModeChange(v as 'disk' | 'gpu')}>
           <div className="space-y-2">
             <div className="flex items-center space-x-2">
-              <RadioGroupItem value="axial" id="axial" className="border-gray-600" />
-              <Label htmlFor="axial" className="text-sm text-gray-300 cursor-pointer">Axial</Label>
+              <RadioGroupItem value="disk" id="disk" className="border-gray-600" />
+              <Label htmlFor="disk" className="text-sm text-gray-300 cursor-pointer">Pregenerated contrast mode (Disk)</Label>
             </div>
             <div className="flex items-center space-x-2">
-              <RadioGroupItem value="sagittal" id="sagittal" className="border-gray-600" />
-              <Label htmlFor="sagittal" className="text-sm text-gray-300 cursor-pointer">Sagittal</Label>
-            </div>
-            <div className="flex items-center space-x-2">
-              <RadioGroupItem value="coronal" id="coronal" className="border-gray-600" />
-              <Label htmlFor="coronal" className="text-sm text-gray-300 cursor-pointer">Coronal</Label>
+              <RadioGroupItem value="gpu" id="gpu" className="border-gray-600" />
+              <Label htmlFor="gpu" className="text-sm text-gray-300 cursor-pointer">Real time contrast mode (GPU)</Label>
             </div>
           </div>
         </RadioGroup>
+      </div>
 
-
+      <div className="mb-4">
+        <h3 className="text-sm font-semibold text-gray-300 mb-2">Open Planes</h3>
+        <div className="flex space-x-2">
+          <button onClick={() => togglePlane('axial')} className={`px-3 py-1 rounded ${isPlaneSelected('axial') ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Axial</button>
+          <button onClick={() => togglePlane('sagittal')} className={`px-3 py-1 rounded ${isPlaneSelected('sagittal') ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Sagittal</button>
+          <button onClick={() => togglePlane('coronal')} className={`px-3 py-1 rounded ${isPlaneSelected('coronal') ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Coronal</button>
+        </div>
       </div>
 
       <div className="space-y-4">
         <div className="bg-gray-800 p-3 rounded-lg border border-gray-700">
-          <p className="text-xs text-gray-400 mb-3">
-            DREAMER Algorithm: Multi-contrast synthesis from single acquisition
-          </p>
+
           
           <RadioGroup value={weighting} onValueChange={(v) => onWeightingChange(v as WeightingType)}>
             <div className="space-y-3">
               <div className="flex items-center space-x-2">
                 <RadioGroupItem value="T1" id="t1" className="border-gray-600" />
-                <Label htmlFor="t1" className="text-sm text-gray-300 cursor-pointer">
-                  T1-Weighted
-                </Label>
+                <Label htmlFor="t1" className="text-sm text-gray-300 cursor-pointer">T1-Weighted</Label>
               </div>
               <div className="flex items-center space-x-2">
                 <RadioGroupItem value="T2" id="t2" className="border-gray-600" />
-                <Label htmlFor="t2" className="text-sm text-gray-300 cursor-pointer">
-                  T2-Weighted
-                </Label>
+                <Label htmlFor="t2" className="text-sm text-gray-300 cursor-pointer">T2-Weighted</Label>
               </div>
               <div className="flex items-center space-x-2">
                 <RadioGroupItem value="PD" id="pd" className="border-gray-600" />
-                <Label htmlFor="pd" className="text-sm text-gray-300 cursor-pointer">
-                  Proton Density (PD)
-                </Label>
+                <Label htmlFor="pd" className="text-sm text-gray-300 cursor-pointer">Proton Density (PD)</Label>
               </div>
               <div className="flex items-center space-x-2">
                 <RadioGroupItem value="CT" id="ct" className="border-gray-600" />
-                <Label htmlFor="ct" className="text-sm text-gray-300 cursor-pointer">
-                  Hard Tissue (CT)
-                </Label>
+                <Label htmlFor="ct" className="text-sm text-gray-300 cursor-pointer">Hard Tissue (CT)</Label>
               </div>
               <div className="flex items-center space-x-2">
                 <RadioGroupItem value="Custom" id="custom" className="border-gray-600" />
-                <Label htmlFor="custom" className="text-sm text-gray-300 cursor-pointer">
-                  Custom Parameters
-                </Label>
+                <Label htmlFor="custom" className="text-sm text-gray-300 cursor-pointer">Custom Weighting</Label>
               </div>
             </div>
           </RadioGroup>
@@ -94,51 +101,19 @@ export function WeightingPanel({
           <>
             <Separator className="bg-gray-800" />
             
-            <div className="space-y-4">
-              <div>
-                <div className="flex justify-between mb-2">
-                  <Label className="text-xs text-gray-400">Echo Time (TE)</Label>
-                  <span className="text-xs text-gray-300">{customWeighting.te} ms</span>
-                </div>
-                <Slider
-                  value={[customWeighting.te]}
-                  onValueChange={([te]) => onCustomWeightingChange({ ...customWeighting, te })}
-                  min={0}
-                  max={200}
-                  step={1}
-                  className="w-full"
-                />
+            <div>
+              <div className="flex justify-between mb-2">
+                <Label className="text-xs text-gray-400">Tissue weight ψ</Label>
+                <span className="text-xs text-gray-300">{customWeighting.psi}°</span>
               </div>
-
-              <div>
-                <div className="flex justify-between mb-2">
-                  <Label className="text-xs text-gray-400">Repetition Time (TR)</Label>
-                  <span className="text-xs text-gray-300">{customWeighting.tr} ms</span>
-                </div>
-                <Slider
-                  value={[customWeighting.tr]}
-                  onValueChange={([tr]) => onCustomWeightingChange({ ...customWeighting, tr })}
-                  min={0}
-                  max={5000}
-                  step={10}
-                  className="w-full"
-                />
-              </div>
-
-              <div>
-                <div className="flex justify-between mb-2">
-                  <Label className="text-xs text-gray-400">Inversion Time (TI)</Label>
-                  <span className="text-xs text-gray-300">{customWeighting.ti} ms</span>
-                </div>
-                <Slider
-                  value={[customWeighting.ti]}
-                  onValueChange={([ti]) => onCustomWeightingChange({ ...customWeighting, ti })}
-                  min={0}
-                  max={3000}
-                  step={10}
-                  className="w-full"
-                />
-              </div>
+              <Slider
+                value={[customWeighting.psi]}
+                onValueChange={([psi]) => onCustomWeightingChange({ psi })}
+                min={0}
+                max={180}
+                step={1}
+                className="w-full"
+              />
             </div>
           </>
         )}
@@ -177,7 +152,7 @@ export function WeightingPanel({
               </>
             )}
             {weighting === 'Custom' && (
-              <p>Custom contrast based on MR parameters</p>
+              <p>Custom weighting based on tissue weight ψ</p>
             )}
           </div>
         </div>

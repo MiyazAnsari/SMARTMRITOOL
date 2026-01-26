@@ -1,14 +1,15 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import * as nifti from 'nifti-reader-js';
 import { ViewportGrid } from './ViewportGrid';
-import { Toolbar } from './Toolbar';
 import { WeightingPanel } from './WeightingPanel';
+import { Button } from '@/app/components/ui/button';
+import { MousePointer, Circle as CircleIcon, Pencil, Layout, Move } from 'lucide-react';
 
 export interface MedicalImageViewerProps {
   niftiData: ArrayBuffer;
 }
 
-export type MeasurementTool = 'none' | 'distance' | 'angle' | 'ellipse' | 'closedCurve' | 'freehand';
+export type MeasurementTool = 'none' | 'distance' | 'angle' | 'ellipse' | 'closedCurve' | 'freehand' | 'pan';
 export type WeightingType = 'T1' | 'T2' | 'PD' | 'CT' | 'Custom';
 
 export interface WindowLevel {
@@ -34,16 +35,19 @@ export function MedicalImageViewer({ niftiData }: MedicalImageViewerProps) {
   const [activeTool, setActiveTool] = useState<MeasurementTool>('none');
   const [measurements, setMeasurements] = useState<Measurement[]>([]);
   const [weighting, setWeighting] = useState<WeightingType>('T1');
-  const [customWeighting, setCustomWeighting] = useState({ te: 0, tr: 0, ti: 0 });
-  // Which plane is currently shown in the main viewport (single-plane view)
-  const [selectedPlane, setSelectedPlane] = useState<'axial' | 'sagittal' | 'coronal'>('axial');
+  // single psi slider for custom weighting (0-180 degrees)
+  const [customWeighting, setCustomWeighting] = useState({ psi: 90 });
+  // Which planes are currently open in the center (multi-window)
+  const [selectedPlanes, setSelectedPlanes] = useState<Array<'axial' | 'sagittal' | 'coronal'>>(['axial']);
+  // Processing mode for contrasts
+  const [contrastMode, setContrastMode] = useState<'disk' | 'gpu'>('disk');
   // UI helpers
   const [showCrosshair, setShowCrosshair] = useState<boolean>(false);
-  // resizable panel widths (px)
-  const [leftWidth, setLeftWidth] = useState<number>(240); // default w-60 (15rem)
+  // resizable right panel width (px)
   const [rightWidth, setRightWidth] = useState<number>(288); // default w-72 (18rem)
-  const leftResizing = useRef(false);
   const rightResizing = useRef(false);
+  // tiling signal for ViewportGrid
+  const [tileSignal, setTileSignal] = useState<number>(0);
 
   useEffect(() => {
     if (!niftiData) return;
@@ -158,33 +162,25 @@ export function MedicalImageViewer({ niftiData }: MedicalImageViewerProps) {
     setWindowLevel(wl);
   }, []);
 
-  // Resizer handlers
+  // Resizer handlers (only right panel now)
   useEffect(() => {
     const onMouseMove = (e: MouseEvent) => {
-      // Keep reasonable minimums so the center viewport never collapses
-      const MIN_LEFT = 120;
       const MIN_RIGHT = 160;
       const MIN_CENTER = 320; // ensure the viewport remains usable
       const totalW = window.innerWidth;
       const rect = document.body.getBoundingClientRect();
       const x = e.clientX - rect.left;
 
-      if (leftResizing.current) {
-        // compute maximum left width so center doesn't collapse and right panel retains min
-        const maxLeft = Math.max(MIN_LEFT, totalW - MIN_RIGHT - MIN_CENTER);
-        const newW = Math.min(Math.max(MIN_LEFT, x), maxLeft);
-        setLeftWidth(newW);
-      } else if (rightResizing.current) {
+      if (rightResizing.current) {
         // compute right width measured from right edge and clamp so center stays visible
         const rawRight = Math.max(MIN_RIGHT, totalW - x);
-        const maxRight = Math.max(MIN_RIGHT, totalW - MIN_LEFT - MIN_CENTER);
+        const maxRight = Math.max(MIN_RIGHT, totalW - MIN_CENTER);
         const newRight = Math.min(rawRight, maxRight);
         setRightWidth(newRight);
       }
     };
 
     const onMouseUp = () => {
-      leftResizing.current = false;
       rightResizing.current = false;
       document.body.style.cursor = '';
     };
@@ -213,7 +209,8 @@ export function MedicalImageViewer({ niftiData }: MedicalImageViewerProps) {
     if (!imageData || !header) return;
     const dims = header.dims;
 
-    const plane = selectedPlane;
+    // Use the first selected plane as the primary context for Auto WL
+    const plane = selectedPlanes.length > 0 ? selectedPlanes[0] : 'axial';
     const sliceIndex = plane === 'axial' ? currentSlice.axial : plane === 'sagittal' ? currentSlice.sagittal : currentSlice.coronal;
 
     let min = Infinity;
@@ -259,7 +256,7 @@ export function MedicalImageViewer({ niftiData }: MedicalImageViewerProps) {
     const level = Math.round((min + max) / 2);
 
     setWindowLevel({ window, level });
-  }, [imageData, header, selectedPlane, currentSlice]);
+  }, [imageData, header, selectedPlanes, currentSlice]);
 
   const applyWeighting = useCallback((pixelValue: number): number => {
     // DREAMER algorithm simulation - in reality this would be much more complex
@@ -278,11 +275,9 @@ export function MedicalImageViewer({ niftiData }: MedicalImageViewerProps) {
         // CT/Hard tissue: Bone is bright
         return Math.min(255, Math.max(0, pixelValue - 20) * 1.5);
       case 'Custom':
-        // Custom weighting based on TE, TR, TI parameters
-        const teFactor = customWeighting.te / 100;
-        const trFactor = customWeighting.tr / 1000;
-        const tiFactor = customWeighting.ti / 500;
-        return Math.min(255, pixelValue * (1 + teFactor - trFactor + tiFactor));
+        // Custom weighting based on single tissue weight psi (0-180)
+        const psiFactor = (customWeighting.psi || 0) / 180; // normalized 0..1
+        return Math.min(255, pixelValue * (1 + psiFactor));
       default:
         return pixelValue;
     }
@@ -298,39 +293,14 @@ export function MedicalImageViewer({ niftiData }: MedicalImageViewerProps) {
 
   return (
     <div className="h-full flex">
-      <div style={{ width: leftWidth }} className="flex-shrink-0">
-        <Toolbar 
-          activeTool={activeTool}
-          onToolChange={setActiveTool}
-          measurements={measurements}
-          onMeasurementDelete={handleMeasurementDelete}
-          showCrosshair={showCrosshair}
-          onToggleCrosshair={() => setShowCrosshair(v => !v)}
-          onAutoWindowLevel={handleAutoWindowLevel}
-        />
-      </div>
-
-      {/* left resizer: larger interactive hit area with thin visual line */}
-      <div
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="Resize left panel"
-        onMouseDown={() => { leftResizing.current = true; document.body.style.cursor = 'col-resize'; }}
-        onTouchStart={() => { leftResizing.current = true; document.body.style.cursor = 'col-resize'; }}
-        onDoubleClick={() => { setLeftWidth(240); }}
-        className="w-8 -ml-4 -mr-4 cursor-col-resize relative"
-        style={{ zIndex: 40 }}
-      >
-        {/* thin visible divider centered inside the hit area */}
-        <div className="absolute inset-y-0 left-1/2 w-px bg-transparent hover:bg-gray-700" />
-      </div>
-      
-      <div className="flex-1 flex flex-col min-h-0">
+      <div className="flex-1 flex flex-col min-h-0 relative">
         <ViewportGrid
           imageData={imageData}
           header={header}
           currentSlice={currentSlice}
-          selectedPlane={selectedPlane}
+          selectedPlanes={selectedPlanes}
+          tileSignal={tileSignal}
+          onClosePlane={(p) => setSelectedPlanes(prev => prev.filter(x => x !== p))}
           onSliceChange={handleSliceChange}
           windowLevel={windowLevel}
           onWindowLevelChange={handleWindowLevelChange}
@@ -340,8 +310,70 @@ export function MedicalImageViewer({ niftiData }: MedicalImageViewerProps) {
           applyWeighting={applyWeighting}
           showCrosshair={showCrosshair}
         />
-      </div>
 
+        {/* Floating bottom-right tool bar (select, ellipse, freehand, auto WL, tile) */}
+        <div className="absolute bottom-4 right-4 flex items-center space-x-2" style={{ zIndex: 9999 }}>
+          <Button
+            size="sm"
+            variant={activeTool === 'none' ? 'default' : 'ghost'}
+            className={activeTool === 'none' ? 'bg-blue-600 text-white' : 'text-gray-300'}
+            onClick={() => setActiveTool('none')}
+            aria-label="Select tool"
+          >
+            <MousePointer className="h-4 w-4" />
+          </Button>
+
+          <Button
+            size="sm"
+            variant={activeTool === 'ellipse' ? 'default' : 'ghost'}
+            className={activeTool === 'ellipse' ? 'bg-blue-600 text-white' : 'text-gray-300'}
+            onClick={() => setActiveTool('ellipse')}
+            aria-label="Ellipse tool"
+          >
+            <CircleIcon className="h-4 w-4" />
+          </Button>
+
+          <Button
+            size="sm"
+            variant={activeTool === 'freehand' ? 'default' : 'ghost'}
+            className={activeTool === 'freehand' ? 'bg-blue-600 text-white' : 'text-gray-300'}
+            onClick={() => setActiveTool('freehand')}
+            aria-label="Freehand tool"
+          >
+            <Pencil className="h-4 w-4" />
+          </Button>
+
+          <Button
+            size="sm"
+            variant={activeTool === 'pan' ? 'default' : 'ghost'}
+            className={activeTool === 'pan' ? 'bg-blue-600 text-white' : 'text-gray-300'}
+            onClick={() => setActiveTool(v => v === 'pan' ? 'none' : 'pan')}
+            aria-label="Pan tool"
+          >
+            <Move className="h-4 w-4" />
+          </Button>
+
+          <Button
+            size="sm"
+            variant="ghost"
+            className="text-gray-300"
+            onClick={() => handleAutoWindowLevel()}
+            aria-label="Auto window level"
+          >
+            Auto WL
+          </Button>
+
+          <Button
+            size="sm"
+            variant="ghost"
+            className="text-gray-300"
+            onClick={() => setTileSignal(s => s + 1)}
+            aria-label="Tile windows"
+          >
+            <Layout className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
       {/* right resizer: larger interactive hit area with thin visual line */}
       <div
         role="separator"
@@ -361,9 +393,11 @@ export function MedicalImageViewer({ niftiData }: MedicalImageViewerProps) {
           weighting={weighting}
           onWeightingChange={setWeighting}
           customWeighting={customWeighting}
-          onCustomWeightingChange={setCustomWeighting}
-          selectedPlane={selectedPlane}
-          onPlaneChange={setSelectedPlane}
+          onCustomWeightingChange={(p) => setCustomWeighting(p)}
+          contrastMode={contrastMode}
+          onContrastModeChange={(m) => setContrastMode(m)}
+          selectedPlanes={selectedPlanes}
+          onPlanesChange={(planes) => setSelectedPlanes(planes)}
         />
       </div>
     </div>

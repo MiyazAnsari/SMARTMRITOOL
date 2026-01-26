@@ -49,7 +49,7 @@ export function FileUpload({ onFileLoad }: FileUploadProps) {
         className="border-gray-700 bg-gray-800 text-gray-200 hover:bg-gray-700"
       >
         <Upload className="mr-2 h-4 w-4" />
-        Load NIfTI File
+        Load Imaging Data
       </Button>
     </>
   );
