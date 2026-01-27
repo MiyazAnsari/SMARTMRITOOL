@@ -424,7 +424,7 @@ export function WeightingPanel({
 
             <div>
               <div className="flex justify-between mb-2">
-                <Label className="text-xs text-gray-400">Tissue weight ψ</Label>
+                <Label className="text-xs text-gray-400">Phase Modulation ψ</Label>
                 <span className="text-xs text-gray-300">180°</span>
               </div>
               <div className="relative">
@@ -486,7 +486,7 @@ export function WeightingPanel({
               </>
             )}
             {weighting === 'Custom' && (
-              <p>Custom weighting based on tissue weight ψ</p>
+              <p>Custom weighting based on Phase Modulation ψ</p>
             )}
           </div>
         </div>
