@@ -39,6 +39,8 @@ export function WeightingPanel({
 }: WeightingPanelProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const controlsRef = useRef<HTMLDivElement | null>(null);
+  const openPlanesRef = useRef<HTMLDivElement | null>(null);
+  const placementRef = useRef<HTMLDivElement | null>(null);
   const measureRef = useRef<HTMLDivElement | null>(null);
   const [isOverflowing, setIsOverflowing] = useState(false);
   const prevOverflowRef = useRef<boolean>(false);
@@ -52,10 +54,12 @@ export function WeightingPanel({
     let lastResizeAt = 0;
 
     // hysteresis and stability to avoid rapid flips at the boundary
-    let overflowStableCount = 0;
-    let underflowStableCount = 0;
-    const HYSTERESIS_PX = 24; // px guard band around the threshold
-    const REQUIRED_STABLE = 3; // require this many consecutive checks
+    // use refs (here simple objects) so counters persist across effect runs
+    const overflowStableRef = { current: 0 } as { current: number };
+    const underflowStableRef = { current: 0 } as { current: number };
+    const HYSTERESIS_PX = 36; // larger guard band to reduce flips
+    const REQUIRED_STABLE = 4; // require more consecutive checks for stability
+    const STABLE_DELAY = 300; // ms to wait after resize stops before committing
 
     const check = () => {
       const el = containerRef.current;
@@ -74,17 +78,97 @@ export function WeightingPanel({
         // ignore
       }
 
-      // Use the off-screen clone's scrollHeight to determine the intrinsic required height.
-      // If the visible controls are hidden (we moved them to the bottom toolbar),
-      // simulate the height the sidebar would need by adding the full weighting
-      // controls' intrinsic height to the current sidebar height. If the controls
-      // are already visible, the container's scrollHeight already includes them.
-      const measureH = measure.scrollHeight || measure.getBoundingClientRect().height;
+      // Use the off-screen clone's scrollHeight to determine the intrinsic
+      // height of the sections we may move (Open Planes + Window Placement).
+      // We want to decide whether to move those sections out of the sidebar
+      // into the bottom toolbar. When computing the thresholds we compare the
+      // full container height (when kept) against the available height, and
+      // we also compute the height if those sections were moved.
+      const movedSectionsH_offscreen = measure.scrollHeight || measure.getBoundingClientRect().height;
       const containerScrollH = el.scrollHeight || el.getBoundingClientRect().height;
-      const controlsStyle = window.getComputedStyle(controls);
-      const controlsVisible = controlsStyle.display !== 'none' && controlsStyle.visibility !== 'hidden' && controlsStyle.opacity !== '0';
 
-      const requiredH = controlsVisible ? containerScrollH : (containerScrollH + measureH);
+      // If the movable sections are currently present in the DOM, measure
+      // their actual combined height (openPlanes + placement). Use the larger
+      // of the measured-offscreen height and the live DOM height as a
+      // conservative estimate for how much space they'd consume when kept
+      // in the sidebar.
+      // Prefer live DOM measurement when sections exist; otherwise fall back
+      // to the off-screen template sections inside `measureRef` for a reliable
+      // estimate that matches styling.
+      let openH = 0;
+      let placeH = 0;
+      if (openPlanesRef.current) {
+        openH = openPlanesRef.current.scrollHeight || openPlanesRef.current.getBoundingClientRect().height;
+      } else if (measure) {
+        const node = measure.querySelector('[data-section="openPlanes"]') as HTMLElement | null;
+        openH = node ? (node.scrollHeight || node.getBoundingClientRect().height) : 0;
+      }
+      if (placementRef.current) {
+        placeH = placementRef.current.scrollHeight || placementRef.current.getBoundingClientRect().height;
+      } else if (measure) {
+        const node = measure.querySelector('[data-section="placement"]') as HTMLElement | null;
+        placeH = node ? (node.scrollHeight || node.getBoundingClientRect().height) : 0;
+      }
+      const movedSectionsH_live = Math.max(0, openH + placeH);
+      const movedSectionsH = Math.max(movedSectionsH_offscreen, movedSectionsH_live);
+
+      // Determine whether the movable sections are currently visible (not moved)
+      const openVisible = openPlanesRef.current ? window.getComputedStyle(openPlanesRef.current).display !== 'none' : false;
+      const placeVisible = placementRef.current ? window.getComputedStyle(placementRef.current).display !== 'none' : false;
+      const movableVisible = openVisible || placeVisible;
+
+      // Robust measurement strategy:
+      // - Prefer live measurements for the movable sections (including margins)
+      // - Fall back to the off-screen template's scrollHeight as a conservative
+      //   upper-bound if live nodes aren't present
+      const measureWithMargins = (node: HTMLElement | null) => {
+        if (!node) return 0;
+        try {
+          const rectH = node.getBoundingClientRect().height || 0;
+          const style = window.getComputedStyle(node);
+          const mt = parseFloat(style.marginTop || '0') || 0;
+          const mb = parseFloat(style.marginBottom || '0') || 0;
+          return Math.ceil(rectH + mt + mb);
+        } catch (e) {
+          return Math.ceil(node.getBoundingClientRect().height || 0);
+        }
+      };
+
+      const openLiveH = openPlanesRef.current ? measureWithMargins(openPlanesRef.current) : 0;
+      const placeLiveH = placementRef.current ? measureWithMargins(placementRef.current) : 0;
+      const movedSectionsH_live_measure = Math.max(0, openLiveH + placeLiveH);
+
+      // offscreen template conservative estimate (includes spacing in template)
+      const movedSectionsH_offscreen_measure = measure ? (measure.scrollHeight || measure.getBoundingClientRect().height) : 0;
+      const movedSectionsH_final = Math.max(movedSectionsH_offscreen_measure, movedSectionsH_live_measure, movedSectionsH);
+
+      const baseContainerH = containerScrollH;
+      let requiredIfKeptCalc: number;
+      let requiredIfMovedCalc: number;
+      if (movableVisible) {
+        // currently kept in sidebar
+        requiredIfKeptCalc = baseContainerH;
+        requiredIfMovedCalc = Math.max(0, baseContainerH - movedSectionsH_final);
+      } else {
+        // currently moved out; simulate adding them back
+        requiredIfKeptCalc = baseContainerH + movedSectionsH_final;
+        requiredIfMovedCalc = baseContainerH;
+      }
+
+      // Suspend toggles while recent resize activity is ongoing. Use the
+      // `lastResizeAt` timestamp updated by the ResizeObserver; this is more
+      // reliable than inspecting `document.body.style.cursor` across envs.
+      const now = Date.now();
+      const isResizingActive = lastResizeAt && (now - lastResizeAt) < STABLE_DELAY;
+      if (isResizingActive) {
+        overflowStableRef.current = 0;
+        underflowStableRef.current = 0;
+        return false;
+      }
+
+      // finally assign into variables used below
+      var requiredIfKept = requiredIfKeptCalc;
+      var requiredIfMoved = requiredIfMovedCalc;
 
       // Simplified, reliable overflow check:
       // - use parent element as viewport when available
@@ -97,61 +181,75 @@ export function WeightingPanel({
 
       const controlsRect = controls.getBoundingClientRect();
       const available = (parentRect ? parentRect.height : window.innerHeight) - margin;
-      const controlsOverflowingNow = controlsRect.bottom > (parentRect ? parentRect.bottom : viewportBottom);
 
-      // Asymmetric hysteresis: when currently not overflowing, require a positive
-      // margin before switching to overflowing. When currently overflowing, allow
-      // a smaller negative margin before switching back.
-      const thresholdPlus = available + HYSTERESIS_PX;
-      const thresholdMinus = available - HYSTERESIS_PX;
+      // Candidate logic:
+      // - when NOT currently overflowing: switch to overflow only if the
+      //   full (kept) height exceeds available by HYSTERESIS_PX.
+      // - when currently overflowing: switch back only if the reduced height
+      //   (after moving sections) fits within available minus HYSTERESIS_PX.
+      const thresholdEnter = available + HYSTERESIS_PX; // need this much extra to enter overflow
+      const thresholdExit = available - HYSTERESIS_PX; // must shrink below this to exit
 
-      let candidateOverflow = controlsOverflowingNow || requiredH > thresholdPlus;
-      // If already marked overflowing, be more tolerant to remain so until below thresholdMinus
-      if (isOverflowing) {
-        candidateOverflow = controlsOverflowingNow || requiredH > thresholdMinus;
-      }
+      const wouldOverflowIfKept = requiredIfKept > available;
+      const wouldOverflowIfMoved = requiredIfMoved > available;
 
-      // Update stability counters
-      if (candidateOverflow) {
-        overflowStableCount += 1;
-        underflowStableCount = 0;
+      // Determine candidate state using asymmetric hysteresis
+      const prevOverflow = prevOverflowRef.current;
+      let candidateOverflow = prevOverflow ? true : false;
+      if (!prevOverflow) {
+        // enter overflow when the kept form doesn't fit the available height
+        // or when the controls currently extend below the parent's bottom.
+        const controlsOverflowing = parentRect ? (controlsRect.bottom > parentRect.bottom) : (controlsRect.bottom > viewportBottom);
+        candidateOverflow = requiredIfKept > available || controlsOverflowing;
       } else {
-        underflowStableCount += 1;
-        overflowStableCount = 0;
+        // only exit overflow if the moved form clearly fits within available - hysteresis
+        candidateOverflow = !(requiredIfMoved <= thresholdExit);
       }
 
-      let overflowing = isOverflowing;
-      if (!isOverflowing && overflowStableCount >= REQUIRED_STABLE) {
+      // Update stability counters stored in refs so they survive effect re-inits
+      if (candidateOverflow) {
+        overflowStableRef.current += 1;
+        underflowStableRef.current = 0;
+      } else {
+        underflowStableRef.current += 1;
+        overflowStableRef.current = 0;
+      }
+
+      let overflowing = prevOverflow;
+      if (!prevOverflow && overflowStableRef.current >= REQUIRED_STABLE) {
         overflowing = true;
-        overflowStableCount = 0;
-      } else if (isOverflowing && underflowStableCount >= REQUIRED_STABLE) {
+        overflowStableRef.current = 0;
+      } else if (prevOverflow && underflowStableRef.current >= REQUIRED_STABLE) {
         overflowing = false;
-        underflowStableCount = 0;
+        underflowStableRef.current = 0;
       }
 
       console.debug('WeightingPanel.check sizes', {
-        simulatedMeasureH: measureH,
+        movedSectionsH,
+        movedSectionsH_offscreen,
+        movedSectionsH_live,
         containerScrollH,
-        requiredH,
+        requiredIfKept,
+        requiredIfMoved,
         containerClientH: el.clientHeight,
         available,
-        thresholdPlus,
-        thresholdMinus,
+        thresholdEnter,
+        thresholdExit,
         containerRect,
         parentRect,
         measureRect: measure.getBoundingClientRect(),
         controlsRect,
-        controlsVisible,
-        controlsOverflowingNow,
         candidateOverflow,
-        overflowStableCount,
-        underflowStableCount,
+        overflowStable: overflowStableRef.current,
+        underflowStable: underflowStableRef.current,
         decidedOverflow: overflowing,
       });
 
       // Commit state change immediately when stability condition met
-      if (overflowing !== isOverflowing) {
+      const prev = prevOverflowRef.current;
+      if (overflowing !== prev) {
         console.debug('WeightingPanel overflow toggled:', overflowing);
+        prevOverflowRef.current = overflowing;
         setIsOverflowing(overflowing);
         onOverflowChange?.(overflowing);
       }
@@ -180,6 +278,12 @@ export function WeightingPanel({
         lastResizeAt = Date.now();
         if (rafId != null) cancelAnimationFrame(rafId);
         rafId = requestAnimationFrame(() => { rafId = null; check(); });
+        // schedule a final stability check after resizing settles
+        if (stableTimer != null) clearTimeout(stableTimer);
+        stableTimer = window.setTimeout(() => {
+          stableTimer = null;
+          check();
+        }, STABLE_DELAY);
       });
       ro.observe(el);
       ro.observe(controls);
@@ -204,7 +308,7 @@ export function WeightingPanel({
       window.removeEventListener('resize', check);
       window.removeEventListener('orientationchange', check);
     };
-  }, [onOverflowChange, isOverflowing, weighting, customWeighting.psi]);
+  }, [onOverflowChange, weighting, customWeighting.psi]);
   const togglePlane = (p: 'axial' | 'sagittal' | 'coronal') => {
     if (selectedPlanes.includes(p)) {
       onPlanesChange(selectedPlanes.filter(x => x !== p));
@@ -219,15 +323,11 @@ export function WeightingPanel({
     <div ref={containerRef} className="bg-gray-900 border-l border-gray-800 p-4 overflow-y-auto">
       <div className="flex items-start justify-between">
         <div>
-          <h2 className="text-sm font-semibold text-gray-300 mb-2">SMART MRI Tissue Weighting Tool</h2>
+          <h2 className="text-sm font-bold text-blue-300 mb-2">SMART MRI Tissue Weighting Tool</h2>
         </div>
         <div className="ml-2">
           {onFileLoad && <FileUpload onFileLoad={onFileLoad} />}
         </div>
-      </div>
-
-      <div className="w-full">
-        <p className="text-xs text-gray-400 mb-4">multi-contrast image generation from single MRI sequence</p>
       </div>
 
       <div className="mb-4">
@@ -246,27 +346,31 @@ export function WeightingPanel({
         </RadioGroup>
       </div>
 
-      <div className="mb-4">
-        <h3 className="text-sm font-semibold text-gray-300 mb-2">Open Planes</h3>
-        <div className="flex flex-wrap gap-2">
-          <button onClick={() => togglePlane('axial')} className={`px-3 py-1 rounded ${isPlaneSelected('axial') ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Axial</button>
-          <button onClick={() => togglePlane('sagittal')} className={`px-3 py-1 rounded ${isPlaneSelected('sagittal') ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Sagittal</button>
-          <button onClick={() => togglePlane('coronal')} className={`px-3 py-1 rounded ${isPlaneSelected('coronal') ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Coronal</button>
+      {!isOverflowing && (
+        <div className="mb-4" ref={openPlanesRef}>
+          <h3 className="text-sm font-semibold text-gray-300 mb-2">Open Planes</h3>
+          <div className="flex flex-wrap gap-2">
+            <button onClick={() => togglePlane('axial')} className={`px-3 py-1 rounded ${isPlaneSelected('axial') ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Axial</button>
+            <button onClick={() => togglePlane('sagittal')} className={`px-3 py-1 rounded ${isPlaneSelected('sagittal') ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Sagittal</button>
+            <button onClick={() => togglePlane('coronal')} className={`px-3 py-1 rounded ${isPlaneSelected('coronal') ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Coronal</button>
+          </div>
         </div>
-      </div>
+      )}
 
-      <div className="mb-4">
-        <h3 className="text-sm font-semibold text-gray-300 mb-2">Window Placement</h3>
-        <div className="flex flex-wrap gap-2">
-          <button type="button" onClick={() => onLayoutPreferenceChange?.('auto')} className={`px-2 py-1 rounded ${layoutPreference === 'auto' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Auto</button>
-          <button type="button" onClick={() => onLayoutPreferenceChange?.('row')} className={`px-2 py-1 rounded ${layoutPreference === 'row' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Row</button>
-          <button type="button" onClick={() => onLayoutPreferenceChange?.('column')} className={`px-2 py-1 rounded ${layoutPreference === 'column' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Column</button>
-          <button type="button" onClick={() => onLayoutPreferenceChange?.('grid')} className={`px-2 py-1 rounded ${layoutPreference === 'grid' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Grid</button>
+      {!isOverflowing && (
+        <div className="mb-4" ref={placementRef}>
+          <h3 className="text-sm font-semibold text-gray-300 mb-2">Window Placement</h3>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" onClick={() => onLayoutPreferenceChange?.('auto')} className={`px-2 py-1 rounded ${layoutPreference === 'auto' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Auto</button>
+            <button type="button" onClick={() => onLayoutPreferenceChange?.('row')} className={`px-2 py-1 rounded ${layoutPreference === 'row' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Row</button>
+            <button type="button" onClick={() => onLayoutPreferenceChange?.('column')} className={`px-2 py-1 rounded ${layoutPreference === 'column' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Column</button>
+            <button type="button" onClick={() => onLayoutPreferenceChange?.('grid')} className={`px-2 py-1 rounded ${layoutPreference === 'grid' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Grid</button>
+          </div>
         </div>
-      </div>
+      )}
 
       <div className="space-y-4">
-        <div ref={controlsRef} style={{ display: isOverflowing ? 'none' : undefined }}>
+      <div ref={controlsRef}>
           <div className="bg-gray-800 p-3 rounded-lg border border-gray-700">
             <RadioGroup value={weighting} onValueChange={(v) => onWeightingChange(v as WeightingType)}>
               <div className="flex flex-wrap gap-3">
@@ -294,28 +398,27 @@ export function WeightingPanel({
             </RadioGroup>
           </div>
         </div>
-        {/* Off-screen clone used for accurate measurement when controls are hidden */}
+        {/* Off-screen clone used for accurate measurement of the sections we may move (Open Planes + Window Placement) */}
         <div ref={measureRef} style={{ position: 'absolute', left: -9999, top: -9999, visibility: 'hidden', pointerEvents: 'none', width: '200px' }} aria-hidden>
-          <div className="bg-gray-800 p-3 rounded-lg border border-gray-700">
-            <RadioGroup value={weighting} onValueChange={() => {}}>
-              <div className="flex flex-wrap gap-3">
-                <div className="flex items-center space-x-2"><RadioGroupItem value="T1" /><Label className="text-sm text-gray-300">T1-Weighted</Label></div>
-                <div className="flex items-center space-x-2"><RadioGroupItem value="T2" /><Label className="text-sm text-gray-300">T2-Weighted</Label></div>
-                <div className="flex items-center space-x-2"><RadioGroupItem value="PD" /><Label className="text-sm text-gray-300">Proton Density (PD)</Label></div>
-                <div className="flex items-center space-x-2"><RadioGroupItem value="CT" /><Label className="text-sm text-gray-300">Hard Tissue (CT)</Label></div>
-                <div className="flex items-center space-x-2"><RadioGroupItem value="Custom" /><Label className="text-sm text-gray-300">Custom Weighting</Label></div>
-              </div>
-            </RadioGroup>
-            {weighting === 'Custom' && (
-              <div style={{ marginTop: 8 }}>
-                <div className="flex justify-between mb-2"><Label className="text-xs text-gray-400">Tissue weight ψ</Label><span className="text-xs text-gray-300">{customWeighting.psi}°</span></div>
-                <Slider value={[customWeighting.psi]} onValueChange={() => {}} min={0} max={180} step={1} className="w-full" />
-              </div>
-            )}
+          <div data-section="openPlanes" className="bg-gray-800 p-3 rounded-lg border border-gray-700">
+            <div className="flex flex-wrap gap-2">
+              <div className="px-3 py-1 rounded bg-gray-800 text-gray-300">Axial</div>
+              <div className="px-3 py-1 rounded bg-gray-800 text-gray-300">Sagittal</div>
+              <div className="px-3 py-1 rounded bg-gray-800 text-gray-300">Coronal</div>
+            </div>
+          </div>
+          <div style={{ height: 8 }} />
+          <div data-section="placement" className="bg-gray-800 p-3 rounded-lg border border-gray-700">
+            <div className="flex flex-wrap gap-2">
+              <div className="px-2 py-1 rounded bg-gray-800 text-gray-300">Auto</div>
+              <div className="px-2 py-1 rounded bg-gray-800 text-gray-300">Row</div>
+              <div className="px-2 py-1 rounded bg-gray-800 text-gray-300">Column</div>
+              <div className="px-2 py-1 rounded bg-gray-800 text-gray-300">Grid</div>
+            </div>
           </div>
         </div>
 
-        {weighting === 'Custom' && !isOverflowing && (
+        {weighting === 'Custom' && (
           <>
             <Separator className="bg-gray-800" />
 

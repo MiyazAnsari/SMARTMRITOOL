@@ -379,39 +379,21 @@ export function MedicalImageViewer({ niftiData, onFileLoad }: MedicalImageViewer
             Auto WL
           </Button>
 
-          {/* If right panel overflowed, render weighting controls into the bottom menu */}
+          {/* If right panel overflowed, render Open Planes + Window Placement into the bottom menu */}
           {rightPanelOverflow && (
-            <div className="bg-gray-800 p-2 rounded border border-gray-700 flex items-center space-x-3">
-              <RadioGroup value={weighting} onValueChange={(v) => setWeighting(v as WeightingType)}>
-                <div className="flex items-center space-x-2">
-                  <div className="flex items-center space-x-1">
-                    <RadioGroupItem value="T1" id="t1-bottom" />
-                    <Label htmlFor="t1-bottom" className="text-xs text-gray-300 cursor-pointer">T1</Label>
-                  </div>
-                  <div className="flex items-center space-x-1">
-                    <RadioGroupItem value="T2" id="t2-bottom" />
-                    <Label htmlFor="t2-bottom" className="text-xs text-gray-300 cursor-pointer">T2</Label>
-                  </div>
-                  <div className="flex items-center space-x-1">
-                    <RadioGroupItem value="PD" id="pd-bottom" />
-                    <Label htmlFor="pd-bottom" className="text-xs text-gray-300 cursor-pointer">PD</Label>
-                  </div>
-                  <div className="flex items-center space-x-1">
-                    <RadioGroupItem value="CT" id="ct-bottom" />
-                    <Label htmlFor="ct-bottom" className="text-xs text-gray-300 cursor-pointer">CT</Label>
-                  </div>
-                  <div className="flex items-center space-x-1">
-                    <RadioGroupItem value="Custom" id="custom-bottom" />
-                    <Label htmlFor="custom-bottom" className="text-xs text-gray-300 cursor-pointer">Custom</Label>
-                  </div>
-                </div>
-              </RadioGroup>
+            <div className="flex items-center space-x-4">
+              <div className="flex items-center space-x-2">
+                <Button size="sm" variant={selectedPlanes.includes('axial') ? 'default' : 'ghost'} className={selectedPlanes.includes('axial') ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => setSelectedPlanes(prev => prev.includes('axial') ? prev.filter(p => p !== 'axial') : [...prev, 'axial'])}>Axial</Button>
+                <Button size="sm" variant={selectedPlanes.includes('sagittal') ? 'default' : 'ghost'} className={selectedPlanes.includes('sagittal') ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => setSelectedPlanes(prev => prev.includes('sagittal') ? prev.filter(p => p !== 'sagittal') : [...prev, 'sagittal'])}>Sagittal</Button>
+                <Button size="sm" variant={selectedPlanes.includes('coronal') ? 'default' : 'ghost'} className={selectedPlanes.includes('coronal') ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => setSelectedPlanes(prev => prev.includes('coronal') ? prev.filter(p => p !== 'coronal') : [...prev, 'coronal'])}>Coronal</Button>
+              </div>
 
-              {weighting === 'Custom' && (
-                <div className="w-40">
-                  <Slider value={[customWeighting.psi]} onValueChange={([psi]) => setCustomWeighting({ psi })} min={0} max={180} step={1} />
-                </div>
-              )}
+              <div className="flex items-center space-x-2">
+                <Button size="sm" variant={layoutPreference === 'auto' ? 'default' : 'ghost'} className={layoutPreference === 'auto' ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => { setLayoutPreference('auto'); setTileSignal(s => s + 1); }}>Auto</Button>
+                <Button size="sm" variant={layoutPreference === 'row' ? 'default' : 'ghost'} className={layoutPreference === 'row' ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => { setLayoutPreference('row'); setTileSignal(s => s + 1); }}>Row</Button>
+                <Button size="sm" variant={layoutPreference === 'column' ? 'default' : 'ghost'} className={layoutPreference === 'column' ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => { setLayoutPreference('column'); setTileSignal(s => s + 1); }}>Column</Button>
+                <Button size="sm" variant={layoutPreference === 'grid' ? 'default' : 'ghost'} className={layoutPreference === 'grid' ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => { setLayoutPreference('grid'); setTileSignal(s => s + 1); }}>Grid</Button>
+              </div>
             </div>
           )}
 
