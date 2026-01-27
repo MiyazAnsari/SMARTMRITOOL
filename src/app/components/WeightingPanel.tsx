@@ -424,17 +424,30 @@ export function WeightingPanel({
 
             <div>
               <div className="flex justify-between mb-2">
-                <Label className="text-xs text-gray-400">Tissue weight ψ ∈ [0°, 180°)</Label>
-                <span className="text-xs text-gray-300">{customWeighting.psi}°</span>
+                <Label className="text-xs text-gray-400">Tissue weight ψ</Label>
+                <span className="text-xs text-gray-300">180°</span>
               </div>
-              <Slider
-                value={[customWeighting.psi]}
-                onValueChange={([psi]) => onCustomWeightingChange({ psi })}
-                min={0}
-                max={180}
-                step={1}
-                className="w-full"
-              />
+              <div className="relative">
+                <div className="absolute inset-0 pointer-events-none flex items-center">
+                  <div className="relative w-full">
+                    <span
+                      aria-hidden
+                      className="absolute text-xs font-semibold text-blue-300 bg-gray-800 px-1 rounded pointer-events-none"
+                      style={{ top:10, left: `calc(${(customWeighting.psi / 180) * 100}% - 14px)`, zIndex: 20 }}
+                    >
+                      {customWeighting.psi}°
+                    </span>
+                  </div>
+                </div>
+                <Slider
+                  value={[customWeighting.psi]}
+                  onValueChange={([psi]) => onCustomWeightingChange({ psi })}
+                  min={0}
+                  max={180}
+                  step={1}
+                  className="w-full"
+                />
+              </div>
             </div>
           </>
         )}
