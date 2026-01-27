@@ -424,7 +424,7 @@ export function WeightingPanel({
 
             <div>
               <div className="flex justify-between mb-2">
-                <Label className="text-xs text-gray-400">Tissue weight ψ</Label>
+                <Label className="text-xs text-gray-400">Tissue weight ψ ∈ [0°, 180°)</Label>
                 <span className="text-xs text-gray-300">{customWeighting.psi}°</span>
               </div>
               <Slider
