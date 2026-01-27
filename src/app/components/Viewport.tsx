@@ -1,6 +1,6 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
 import type { WindowLevel, MeasurementTool, Measurement } from './MedicalImageViewer';
-import { Slider } from '@/app/components/ui/slider';
+import { Slider } from './ui/slider';
 
 interface ViewportProps {
   imageData: Uint8Array;
@@ -822,13 +822,7 @@ export function Viewport({
 
   return (
     <div className="relative bg-gray-900 rounded-lg border border-gray-800 overflow-hidden flex flex-col h-full w-full">
-      {process.env.NODE_ENV !== 'production' && (
-        <div className="absolute right-2 top-2 z-30 bg-black bg-opacity-60 text-xs text-white px-2 py-1 rounded">
-          <div>parentH: {parentWindowHeight ?? 'n/a'}</div>
-          <div>measuredH: {containerRect.height}</div>
-          <div>displayH: {displaySize.height}</div>
-        </div>
-      )}
+      {/* debug overlay removed for cleaner UI */}
       <div className="absolute top-2 left-2 z-10 bg-black bg-opacity-50 px-2 py-1 rounded text-xs text-white">
         <div className="font-semibold capitalize">{plane}</div>
         <div className="text-gray-400">
@@ -850,7 +844,7 @@ export function Viewport({
       <div ref={containerRef} className="flex-1 flex items-center justify-center p-4 overflow-auto min-h-0">
         <div
           className="relative flex items-center justify-center w-full h-full"
-          style={{ overflow: 'hidden' }}
+          style={{ overflow: 'visible' }}
         >
           <div className="flex items-center" style={{ width: '100%', height: '100%', alignItems: 'center', justifyContent: 'center' }}>
             <div className="relative" style={{ width: `${displayW}px`, height: `${displayH}px` }}>
@@ -872,7 +866,7 @@ export function Viewport({
             </div>
 
             {/* Vertical slice slider in the non-image area to the right */}
-            <div ref={sliderRef} className="ml-4 flex flex-col items-center" style={{ height: `${displayH}px` }}>
+            <div ref={sliderRef} className="ml-4 flex flex-col items-center" style={{ height: `${displayH}px`, minHeight: '56px' }}>
               <div className="text-xs text-gray-200 mb-2">{currentSlice + 1}</div>
               <div className="h-full flex items-center">
                 <Slider

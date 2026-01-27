@@ -2,7 +2,10 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import * as nifti from 'nifti-reader-js';
 import { ViewportGrid } from './ViewportGrid';
 import { WeightingPanel } from './WeightingPanel';
-import { Button } from '@/app/components/ui/button';
+import { Button } from './ui/button';
+import { RadioGroup, RadioGroupItem } from './ui/radio-group';
+import { Slider } from './ui/slider';
+import { Label } from './ui/label';
 import { MousePointer, Circle as CircleIcon, Pencil, Layout, Move } from 'lucide-react';
 
 export interface MedicalImageViewerProps {
@@ -53,6 +56,7 @@ export function MedicalImageViewer({ niftiData, onFileLoad }: MedicalImageViewer
   // tiling signal for ViewportGrid
   const [tileSignal, setTileSignal] = useState<number>(0);
   const [layoutPreference, setLayoutPreference] = useState<'auto' | 'row' | 'column' | 'grid'>('auto');
+  const [rightPanelOverflow, setRightPanelOverflow] = useState(false);
 
   useEffect(() => {
     if (!niftiData) return;
@@ -375,6 +379,42 @@ export function MedicalImageViewer({ niftiData, onFileLoad }: MedicalImageViewer
             Auto WL
           </Button>
 
+          {/* If right panel overflowed, render weighting controls into the bottom menu */}
+          {rightPanelOverflow && (
+            <div className="bg-gray-800 p-2 rounded border border-gray-700 flex items-center space-x-3">
+              <RadioGroup value={weighting} onValueChange={(v) => setWeighting(v as WeightingType)}>
+                <div className="flex items-center space-x-2">
+                  <div className="flex items-center space-x-1">
+                    <RadioGroupItem value="T1" id="t1-bottom" />
+                    <Label htmlFor="t1-bottom" className="text-xs text-gray-300 cursor-pointer">T1</Label>
+                  </div>
+                  <div className="flex items-center space-x-1">
+                    <RadioGroupItem value="T2" id="t2-bottom" />
+                    <Label htmlFor="t2-bottom" className="text-xs text-gray-300 cursor-pointer">T2</Label>
+                  </div>
+                  <div className="flex items-center space-x-1">
+                    <RadioGroupItem value="PD" id="pd-bottom" />
+                    <Label htmlFor="pd-bottom" className="text-xs text-gray-300 cursor-pointer">PD</Label>
+                  </div>
+                  <div className="flex items-center space-x-1">
+                    <RadioGroupItem value="CT" id="ct-bottom" />
+                    <Label htmlFor="ct-bottom" className="text-xs text-gray-300 cursor-pointer">CT</Label>
+                  </div>
+                  <div className="flex items-center space-x-1">
+                    <RadioGroupItem value="Custom" id="custom-bottom" />
+                    <Label htmlFor="custom-bottom" className="text-xs text-gray-300 cursor-pointer">Custom</Label>
+                  </div>
+                </div>
+              </RadioGroup>
+
+              {weighting === 'Custom' && (
+                <div className="w-40">
+                  <Slider value={[customWeighting.psi]} onValueChange={([psi]) => setCustomWeighting({ psi })} min={0} max={180} step={1} />
+                </div>
+              )}
+            </div>
+          )}
+
           <Button
             size="sm"
             variant="ghost"
@@ -417,6 +457,7 @@ export function MedicalImageViewer({ niftiData, onFileLoad }: MedicalImageViewer
             // ensure layoutPreference state updates propagate before tiling runs
             setTimeout(() => setTileSignal(s => s + 1), 0);
           }}
+          onOverflowChange={(v) => setRightPanelOverflow(v)}
         />
       </div>
     </div>
