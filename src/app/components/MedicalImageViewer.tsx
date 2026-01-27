@@ -6,7 +6,7 @@ import { Button } from '@/app/components/ui/button';
 import { MousePointer, Circle as CircleIcon, Pencil, Layout, Move } from 'lucide-react';
 
 export interface MedicalImageViewerProps {
-  niftiData: ArrayBuffer;
+  niftiData?: ArrayBuffer | null;
 }
 
 export type MeasurementTool = 'none' | 'distance' | 'angle' | 'ellipse' | 'closedCurve' | 'freehand' | 'pan';
@@ -26,7 +26,11 @@ export interface Measurement {
   value?: string;
 }
 
-export function MedicalImageViewer({ niftiData }: MedicalImageViewerProps) {
+interface MedicalImageViewerExtras {
+  onFileLoad?: (data: ArrayBuffer, name: string) => void;
+}
+
+export function MedicalImageViewer({ niftiData, onFileLoad }: MedicalImageViewerProps & MedicalImageViewerExtras) {
   const [imageData, setImageData] = useState<Uint8Array | null>(null);
   const [header, setHeader] = useState<any>(null);
   const [dataRange, setDataRange] = useState<{ min: number; max: number }>({ min: 0, max: 255 });
@@ -48,6 +52,7 @@ export function MedicalImageViewer({ niftiData }: MedicalImageViewerProps) {
   const rightResizing = useRef(false);
   // tiling signal for ViewportGrid
   const [tileSignal, setTileSignal] = useState<number>(0);
+  const [layoutPreference, setLayoutPreference] = useState<'auto' | 'row' | 'column' | 'grid'>('auto');
 
   useEffect(() => {
     if (!niftiData) return;
@@ -283,33 +288,40 @@ export function MedicalImageViewer({ niftiData }: MedicalImageViewerProps) {
     }
   }, [weighting, customWeighting]);
 
-  if (!imageData || !header) {
-    return (
-      <div className="h-full flex items-center justify-center">
-        <div className="text-gray-400">Loading image...</div>
-      </div>
-    );
-  }
+  const loaded = Boolean(imageData && header);
 
   return (
     <div className="h-full flex">
       <div className="flex-1 flex flex-col min-h-0 relative">
-        <ViewportGrid
-          imageData={imageData}
-          header={header}
-          currentSlice={currentSlice}
-          selectedPlanes={selectedPlanes}
-          tileSignal={tileSignal}
-          onClosePlane={(p) => setSelectedPlanes(prev => prev.filter(x => x !== p))}
-          onSliceChange={handleSliceChange}
-          windowLevel={windowLevel}
-          onWindowLevelChange={handleWindowLevelChange}
-          activeTool={activeTool}
-          measurements={measurements}
-          onMeasurementAdd={handleMeasurementAdd}
-          applyWeighting={applyWeighting}
-          showCrosshair={showCrosshair}
-        />
+        {loaded ? (
+          <ViewportGrid
+            imageData={imageData!}
+            header={header!}
+            currentSlice={currentSlice}
+            selectedPlanes={selectedPlanes}
+            tileSignal={tileSignal}
+            layoutPreference={layoutPreference}
+            onClosePlane={(p) => setSelectedPlanes(prev => prev.filter(x => x !== p))}
+            onSliceChange={handleSliceChange}
+            windowLevel={windowLevel}
+            onWindowLevelChange={handleWindowLevelChange}
+            activeTool={activeTool}
+            measurements={measurements}
+            onMeasurementAdd={handleMeasurementAdd}
+            applyWeighting={applyWeighting}
+            showCrosshair={showCrosshair}
+          />
+        ) : (
+          <div className="h-full flex items-center justify-center">
+            <div className="text-center max-w-md">
+              <svg className="mx-auto h-16 w-16 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+              </svg>
+              <h3 className="mt-4 text-lg font-medium text-gray-300">No image loaded</h3>
+              <p className="mt-2 text-sm text-gray-500">Load imaging data (.nii or .nii.gz) to begin</p>
+            </div>
+          </div>
+        )}
 
         {/* Floating bottom-right tool bar (select, ellipse, freehand, auto WL, tile) */}
         <div className="absolute bottom-4 right-4 flex items-center space-x-2" style={{ zIndex: 9999 }}>
@@ -398,6 +410,13 @@ export function MedicalImageViewer({ niftiData }: MedicalImageViewerProps) {
           onContrastModeChange={(m) => setContrastMode(m)}
           selectedPlanes={selectedPlanes}
           onPlanesChange={(planes) => setSelectedPlanes(planes)}
+          onFileLoad={onFileLoad}
+          layoutPreference={layoutPreference}
+          onLayoutPreferenceChange={(p) => {
+            setLayoutPreference(p);
+            // ensure layoutPreference state updates propagate before tiling runs
+            setTimeout(() => setTileSignal(s => s + 1), 0);
+          }}
         />
       </div>
     </div>

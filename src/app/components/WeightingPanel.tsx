@@ -3,6 +3,7 @@ import { RadioGroup, RadioGroupItem } from '@/app/components/ui/radio-group';
 import { Slider } from '@/app/components/ui/slider';
 import { Separator } from '@/app/components/ui/separator';
 import { WeightingType } from './MedicalImageViewer';
+import { FileUpload } from './FileUpload';
 
 interface WeightingPanelProps {
   weighting: WeightingType;
@@ -15,6 +16,9 @@ interface WeightingPanelProps {
   /** Selected planes (multi-select) */
   selectedPlanes: Array<'axial' | 'sagittal' | 'coronal'>;
   onPlanesChange: (planes: Array<'axial' | 'sagittal' | 'coronal'>) => void;
+  onFileLoad?: (data: ArrayBuffer, name: string) => void;
+  layoutPreference?: 'auto' | 'row' | 'column' | 'grid';
+  onLayoutPreferenceChange?: (p: 'auto' | 'row' | 'column' | 'grid') => void;
 }
 
 export function WeightingPanel({ 
@@ -26,6 +30,9 @@ export function WeightingPanel({
   onContrastModeChange,
   selectedPlanes,
   onPlanesChange,
+  onFileLoad,
+  layoutPreference = 'auto',
+  onLayoutPreferenceChange,
 }: WeightingPanelProps) {
   const togglePlane = (p: 'axial' | 'sagittal' | 'coronal') => {
     if (selectedPlanes.includes(p)) {
@@ -39,8 +46,18 @@ export function WeightingPanel({
 
   return (
     <div className="bg-gray-900 border-l border-gray-800 p-4 overflow-y-auto">
-      <h2 className="text-sm font-semibold text-gray-300 mb-2">SMART MRI Tissue Weighting Tool</h2>
-      <p className="text-xs text-gray-400 mb-4">multi-contrast image generation from single MRI sequence</p>
+      <div className="flex items-start justify-between">
+        <div>
+          <h2 className="text-sm font-semibold text-gray-300 mb-2">SMART MRI Tissue Weighting Tool</h2>
+        </div>
+        <div className="ml-2">
+          {onFileLoad && <FileUpload onFileLoad={onFileLoad} />}
+        </div>
+      </div>
+
+      <div className="w-full">
+        <p className="text-xs text-gray-400 mb-4">multi-contrast image generation from single MRI sequence</p>
+      </div>
 
       <div className="mb-4">
         <h3 className="text-sm font-semibold text-gray-300 mb-2">Processing Mode</h3>
@@ -60,10 +77,20 @@ export function WeightingPanel({
 
       <div className="mb-4">
         <h3 className="text-sm font-semibold text-gray-300 mb-2">Open Planes</h3>
-        <div className="flex space-x-2">
+        <div className="flex flex-wrap gap-2">
           <button onClick={() => togglePlane('axial')} className={`px-3 py-1 rounded ${isPlaneSelected('axial') ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Axial</button>
           <button onClick={() => togglePlane('sagittal')} className={`px-3 py-1 rounded ${isPlaneSelected('sagittal') ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Sagittal</button>
           <button onClick={() => togglePlane('coronal')} className={`px-3 py-1 rounded ${isPlaneSelected('coronal') ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Coronal</button>
+        </div>
+      </div>
+
+      <div className="mb-4">
+        <h3 className="text-sm font-semibold text-gray-300 mb-2">Window Placement</h3>
+        <div className="flex flex-wrap gap-2">
+          <button type="button" onClick={() => onLayoutPreferenceChange?.('auto')} className={`px-2 py-1 rounded ${layoutPreference === 'auto' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Auto</button>
+          <button type="button" onClick={() => onLayoutPreferenceChange?.('row')} className={`px-2 py-1 rounded ${layoutPreference === 'row' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Row</button>
+          <button type="button" onClick={() => onLayoutPreferenceChange?.('column')} className={`px-2 py-1 rounded ${layoutPreference === 'column' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Column</button>
+          <button type="button" onClick={() => onLayoutPreferenceChange?.('grid')} className={`px-2 py-1 rounded ${layoutPreference === 'grid' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Grid</button>
         </div>
       </div>
 
@@ -72,7 +99,7 @@ export function WeightingPanel({
 
           
           <RadioGroup value={weighting} onValueChange={(v) => onWeightingChange(v as WeightingType)}>
-            <div className="space-y-3">
+            <div className="flex flex-wrap gap-3">
               <div className="flex items-center space-x-2">
                 <RadioGroupItem value="T1" id="t1" className="border-gray-600" />
                 <Label htmlFor="t1" className="text-sm text-gray-300 cursor-pointer">T1-Weighted</Label>

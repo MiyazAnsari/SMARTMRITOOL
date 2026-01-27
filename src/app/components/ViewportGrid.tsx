@@ -20,6 +20,7 @@ interface ViewportGridProps {
   showCrosshair?: boolean;
   /** Signal to trigger tiling layout (increment to re-tile) */
   tileSignal?: number;
+  layoutPreference?: 'auto' | 'row' | 'column' | 'grid';
 }
 
 export function ViewportGrid({
@@ -37,6 +38,7 @@ export function ViewportGrid({
   applyWeighting,
   showCrosshair = false,
   tileSignal = 0,
+  layoutPreference = 'auto',
 }: ViewportGridProps & { tileSignal?: number }) {
   // track positions and sizes for draggable & resizable windows
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -165,25 +167,69 @@ export function ViewportGrid({
     const open = selectedPlanes.length;
     if (open === 0) return;
 
-    // Prefer explicit layouts for small counts: 1x1, 1x2, 1x3, 2x2
     let cols: number;
     let rows: number;
-    if (open <= 3) {
+
+    // honor explicit user preference
+    if (layoutPreference === 'row') {
       cols = open;
       rows = 1;
-    } else if (open === 4) {
-      cols = 2;
-      rows = 2;
-    } else {
-      // For larger counts, pick a near-square grid (cols >= rows)
+    } else if (layoutPreference === 'column') {
+      cols = 1;
+      rows = open;
+    } else if (layoutPreference === 'grid') {
       cols = Math.ceil(Math.sqrt(open));
       rows = Math.ceil(open / cols);
+    } else {
+      // auto: pick the grid (cols x rows) that minimizes wasted/free area
+      // between the fitted image (preserving aspect) and the tile rectangle.
+      // Enumerate candidate column counts from 1..open and pick the best.
+      const dims = header?.dims || [];
+
+      const planeImgSize = (plane: string) => {
+        // match logic in Viewport.getSliceData
+        const imgW = plane === 'sagittal' ? dims[2] : dims[1];
+        const imgH = plane === 'axial' ? dims[2] : dims[3];
+        return { imgW: Math.max(1, imgW || 1), imgH: Math.max(1, imgH || 1) };
+      };
+
+      let best: { cols: number; rows: number; free: number } | null = null;
+      const padding = 12;
+      const containerW = c.width;
+      const containerH = c.height;
+
+      for (let candidateCols = 1; candidateCols <= open; candidateCols++) {
+        const r = Math.ceil(open / candidateCols);
+
+        const candidateTileW = Math.max(MIN_W, Math.floor((containerW - (candidateCols + 1) * padding) / candidateCols));
+        const candidateTileH = Math.max(MIN_H, Math.floor((containerH - (r + 1) * padding) / r));
+
+        // sum wasted area across all selected planes
+        let totalFree = 0;
+        for (let i = 0; i < selectedPlanes.length; i++) {
+          const plane = selectedPlanes[i];
+          const { imgW, imgH } = planeImgSize(plane);
+          const scale = Math.min(candidateTileW / imgW, candidateTileH / imgH);
+          const displayW = imgW * scale;
+          const displayH = imgH * scale;
+          const free = Math.max(0, candidateTileW * candidateTileH - displayW * displayH);
+          totalFree += free;
+        }
+
+        if (!best || totalFree < best.free) best = { cols: candidateCols, rows: r, free: totalFree };
+      }
+
+      cols = best?.cols || 1;
+      rows = best?.rows || open;
     }
+
     const padding = 12;
     const tileW = Math.max(MIN_W, Math.floor((c.width - (cols + 1) * padding) / cols));
     const tileH = Math.max(MIN_H, Math.floor((c.height - (rows + 1) * padding) / rows));
 
     const next: Record<string, { top: number; left: number; width: number; height: number }> = {};
+    // debug trace to help diagnose layout preference issues
+    console.debug('tiling:', { layoutPreference, open, cols, rows, containerW: c.width, containerH: c.height });
     selectedPlanes.forEach((p, i) => {
       const r = Math.floor(i / cols);
       const col = i % cols;
@@ -192,7 +238,7 @@ export function ViewportGrid({
       next[p] = { top: snap(top), left: snap(left), width: snap(tileW), height: snap(tileH) };
     });
     setPositions(prev => ({ ...prev, ...next }));
-  }, [selectedPlanes, tileSignal]);
+  }, [selectedPlanes, tileSignal, layoutPreference]);
 
   return (
     <div ref={containerRef} className="flex-1 p-2 bg-gray-950 flex items-stretch min-h-0 min-w-0 relative">
