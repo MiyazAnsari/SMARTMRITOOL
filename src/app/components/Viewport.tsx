@@ -444,18 +444,48 @@ export function Viewport({
 
       const points = measurement.points;
 
-      if (measurement.type === 'distance' && points.length >= 2) {
+      if ((measurement.type === 'distance' || measurement.type === 'line') && points.length >= 2) {
+        if (measurement.type === 'line') {
+          // Visualize the line as extending across the canvas to make tangent
+          // placement obvious.
+          const dx = points[1].x - points[0].x;
+          const dy = points[1].y - points[0].y;
+          const len = Math.hypot(dx, dy) || 1;
+          const ux = dx / len;
+          const uy = dy / len;
+          const big = (canvas.width + canvas.height) / dpr;
+          const a = { x: points[0].x - ux * big, y: points[0].y - uy * big };
+          const b = { x: points[1].x + ux * big, y: points[1].y + uy * big };
+          ctx.save();
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.stroke();
+          ctx.restore();
+        }
         ctx.beginPath();
         ctx.moveTo(points[0].x, points[0].y);
         ctx.lineTo(points[1].x, points[1].y);
         ctx.stroke();
-        
-        // Draw endpoints
+
         points.forEach(p => {
           ctx.beginPath();
           ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
           ctx.fill();
         });
+      } else if (measurement.type === 'point' && points.length >= 1) {
+        const p = points[0];
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1;
+        ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.strokeStyle = '#3b82f6';
+        ctx.lineWidth = 2;
       } else if (measurement.type === 'angle' && points.length >= 3) {
         ctx.beginPath();
         ctx.moveTo(points[0].x, points[0].y);
@@ -503,7 +533,7 @@ export function Viewport({
       ctx.fillStyle = '#60a5fa';
       ctx.lineWidth = 2;
 
-      if (activeTool === 'distance' || activeTool === 'angle') {
+      if (activeTool === 'distance' || activeTool === 'line' || activeTool === 'angle') {
         ctx.beginPath();
         ctx.moveTo(drawingPoints[0].x, drawingPoints[0].y);
         drawingPoints.forEach(p => ctx.lineTo(p.x, p.y));
@@ -582,6 +612,15 @@ export function Viewport({
     } else if (activeTool === 'none') {
       setIsDragging(true);
       setDragStart({ x: e.clientX, y: e.clientY });
+    } else if (activeTool === 'point') {
+      // Single-click point primitive — emit immediately, no drag phase.
+      onMeasurementAdd({
+        id: Date.now().toString(),
+        type: 'point',
+        points: [{ x, y }],
+        slice: currentSlice,
+        plane,
+      });
     } else {
       setIsDrawing(true);
       setDrawingPoints([{ x, y }]);
@@ -664,7 +703,10 @@ export function Viewport({
     } else if (isDrawing) {
       if (activeTool === 'freehand') {
         setDrawingPoints(prev => [...prev, { x, y }]);
-      } else if (activeTool === 'ellipse' || (activeTool === 'distance' && drawingPoints.length === 1)) {
+      } else if (
+        activeTool === 'ellipse' ||
+        ((activeTool === 'distance' || activeTool === 'line') && drawingPoints.length === 1)
+      ) {
         setDrawingPoints([drawingPoints[0], { x, y }]);
       }
     }
@@ -684,13 +726,13 @@ export function Viewport({
       setIsDragging(false);
       setDragStart(null);
     } else if (isDrawing) {
-      if (activeTool === 'distance') {
+      if (activeTool === 'distance' || activeTool === 'line') {
         if (drawingPoints.length === 1) {
           const points = [...drawingPoints, { x, y }];
           const value = calculateMeasurementValue('distance', points);
           onMeasurementAdd({
             id: Date.now().toString(),
-            type: 'distance',
+            type: activeTool,
             points,
             slice: currentSlice,
             plane,

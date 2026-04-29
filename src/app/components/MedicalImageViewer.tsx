@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import * as nifti from 'nifti-reader-js';
 import { ViewportGrid } from './ViewportGrid';
 import { WeightingPanel } from './WeightingPanel';
@@ -7,12 +7,32 @@ import { RadioGroup, RadioGroupItem } from './ui/radio-group';
 import { Slider } from './ui/slider';
 import { Label } from './ui/label';
 import { MousePointer, Circle as CircleIcon, Pencil, Layout, Move } from 'lucide-react';
+import type { DicomStudy } from './dicom/DicomStudy';
+import type { Plane } from './dicom/DicomLoader';
+import {
+  initialWorkflowState,
+  recordStepResult,
+  WorkflowState,
+} from './measurement/MeasurementWorkflow';
+import {
+  getProtocol,
+  Primitive,
+} from './measurement/MeasurementProtocols';
 
 export interface MedicalImageViewerProps {
   niftiData?: ArrayBuffer | null;
 }
 
-export type MeasurementTool = 'none' | 'distance' | 'angle' | 'ellipse' | 'closedCurve' | 'freehand' | 'pan';
+export type MeasurementTool =
+  | 'none'
+  | 'distance'
+  | 'angle'
+  | 'ellipse'
+  | 'closedCurve'
+  | 'freehand'
+  | 'pan'
+  | 'line'
+  | 'point';
 export type WeightingType = 'T1' | 'T2' | 'PD' | 'CT' | 'Custom';
 
 export interface WindowLevel {
@@ -31,9 +51,40 @@ export interface Measurement {
 
 interface MedicalImageViewerExtras {
   onFileLoad?: (data: ArrayBuffer, name: string) => void;
+  studyData?: DicomStudy | null;
+  onStudyLoad?: (study: DicomStudy) => void;
 }
 
-export function MedicalImageViewer({ niftiData, onFileLoad }: MedicalImageViewerProps & MedicalImageViewerExtras) {
+/** Map a protocol primitive to one of the existing viewport tools. */
+function primitiveToTool(p: Primitive): MeasurementTool {
+  switch (p) {
+    case 'line':
+      return 'line';
+    case 'angle':
+      return 'angle';
+    case 'point':
+      return 'point';
+    case 'distance':
+    default:
+      return 'distance';
+  }
+}
+
+/** Does a measurement (as captured by the viewport) satisfy a primitive? */
+function measurementMatchesPrimitive(measurement: Measurement, primitive: Primitive): boolean {
+  if (primitive === 'line') return measurement.type === 'line' || measurement.type === 'distance';
+  if (primitive === 'distance') return measurement.type === 'distance' || measurement.type === 'line';
+  if (primitive === 'angle') return measurement.type === 'angle';
+  if (primitive === 'point') return measurement.type === 'point';
+  return false;
+}
+
+export function MedicalImageViewer({
+  niftiData,
+  onFileLoad,
+  studyData = null,
+  onStudyLoad,
+}: MedicalImageViewerProps & MedicalImageViewerExtras) {
   const [imageData, setImageData] = useState<Uint8Array | null>(null);
   const [header, setHeader] = useState<any>(null);
   const [dataRange, setDataRange] = useState<{ min: number; max: number }>({ min: 0, max: 255 });
@@ -57,6 +108,19 @@ export function MedicalImageViewer({ niftiData, onFileLoad }: MedicalImageViewer
   const [tileSignal, setTileSignal] = useState<number>(0);
   const [layoutPreference, setLayoutPreference] = useState<'auto' | 'row' | 'column' | 'grid'>('auto');
   const [rightPanelOverflow, setRightPanelOverflow] = useState(false);
+  // Measurement workflow (TT-TG, Insall–Salvati, etc.)
+  const [workflow, setWorkflow] = useState<WorkflowState>(initialWorkflowState);
+  // In study mode we drive `imageData/header` from the volume that matches the
+  // currently-active plane so each measurement uses its native acquisition.
+  const [activeStudyPlane, setActiveStudyPlane] = useState<Plane>('axial');
+
+  const protocol = useMemo(() => getProtocol(workflow.protocolId), [workflow.protocolId]);
+  const activeStep = protocol?.steps[workflow.activeStepIndex] ?? null;
+  // When a workflow step is active, override the user-selected tool so the
+  // correct primitive is always armed.
+  const effectiveTool: MeasurementTool = activeStep
+    ? primitiveToTool(activeStep.primitive)
+    : activeTool;
 
   useEffect(() => {
     if (!niftiData) return;
@@ -163,9 +227,67 @@ export function MedicalImageViewer({ niftiData, onFileLoad }: MedicalImageViewer
     }
   }, [niftiData]);
 
+  // Load a DICOM volume from the study into the viewer when:
+  //   a) a study is loaded, and
+  //   b) the active study plane changes (e.g. the user picked a measurement
+  //      whose required plane differs from the one currently shown).
+  useEffect(() => {
+    if (!studyData) return;
+    const vol = studyData.volumes[activeStudyPlane];
+    if (!vol) {
+      // Fallback: show whichever plane the study DOES have
+      const fallbackPlane = (Object.keys(studyData.volumes) as Plane[])[0];
+      if (fallbackPlane) setActiveStudyPlane(fallbackPlane);
+      return;
+    }
+    setHeader(vol.header);
+    setImageData(vol.imageData);
+    setDataRange(vol.dataRange);
+    setWindowLevel(vol.defaultWindowLevel);
+    setCurrentSlice({
+      axial: 0,
+      sagittal: 0,
+      coronal: 0,
+      [activeStudyPlane]: Math.floor(vol.sliceCount / 2),
+    } as { axial: number; sagittal: number; coronal: number });
+    // In study mode, only the active plane is shown — each plane has its own
+    // native acquisition and we don't reformat across volumes.
+    setSelectedPlanes([activeStudyPlane]);
+  }, [studyData, activeStudyPlane]);
+
   const handleSliceChange = useCallback((plane: 'axial' | 'sagittal' | 'coronal', slice: number) => {
     setCurrentSlice(prev => ({ ...prev, [plane]: slice }));
   }, []);
+
+  /** Pixel spacing (mm/pixel) of whatever volume is currently in the viewer. */
+  const pixelSpacing = useMemo(() => {
+    if (studyData) {
+      const vol = studyData.volumes[activeStudyPlane];
+      if (vol) return { x: vol.header.pixDims[1], y: vol.header.pixDims[2] };
+    }
+    if (header?.pixDims) return { x: header.pixDims[1] || 1, y: header.pixDims[2] || 1 };
+    return { x: 1, y: 1 };
+  }, [studyData, activeStudyPlane, header]);
+
+  /** Switch the active plane (and DICOM volume) the workflow is asking for. */
+  const handlePlaneRequest = useCallback(
+    (plane: Plane) => {
+      if (studyData) {
+        if (studyData.volumes[plane]) {
+          setActiveStudyPlane(plane);
+        } else {
+          alert(
+            `This study does not contain a ${plane} series. Available: ${Object.keys(
+              studyData.volumes,
+            ).join(', ') || 'none'}.`,
+          );
+        }
+      } else {
+        setSelectedPlanes([plane]);
+      }
+    },
+    [studyData],
+  );
 
   const handleWindowLevelChange = useCallback((wl: WindowLevel) => {
     setWindowLevel(wl);
@@ -206,9 +328,25 @@ export function MedicalImageViewer({ niftiData, onFileLoad }: MedicalImageViewer
     };
   }, []);
 
-  const handleMeasurementAdd = useCallback((measurement: Measurement) => {
-    setMeasurements(prev => [...prev, measurement]);
-  }, []);
+  const handleMeasurementAdd = useCallback(
+    (measurement: Measurement) => {
+      setMeasurements(prev => [...prev, measurement]);
+
+      // If a workflow step is active and the drawn primitive matches what the
+      // step expects, fold it into workflow state so the checklist advances and
+      // the final clinical value can be computed.
+      if (protocol && activeStep && measurementMatchesPrimitive(measurement, activeStep.primitive)) {
+        setWorkflow(prev =>
+          recordStepResult(prev, protocol, {
+            primitive: activeStep.primitive,
+            points: measurement.points,
+            slice: measurement.slice,
+          }),
+        );
+      }
+    },
+    [protocol, activeStep],
+  );
 
   const handleMeasurementDelete = useCallback((id: string) => {
     setMeasurements(prev => prev.filter(m => m.id !== id));
@@ -309,7 +447,7 @@ export function MedicalImageViewer({ niftiData, onFileLoad }: MedicalImageViewer
             onSliceChange={handleSliceChange}
             windowLevel={windowLevel}
             onWindowLevelChange={handleWindowLevelChange}
-            activeTool={activeTool}
+            activeTool={effectiveTool}
             measurements={measurements}
             onMeasurementAdd={handleMeasurementAdd}
             applyWeighting={applyWeighting}
@@ -433,6 +571,13 @@ export function MedicalImageViewer({ niftiData, onFileLoad }: MedicalImageViewer
           selectedPlanes={selectedPlanes}
           onPlanesChange={(planes) => setSelectedPlanes(planes)}
           onFileLoad={onFileLoad}
+          onStudyLoad={onStudyLoad}
+          studyData={studyData}
+          activeStudyPlane={activeStudyPlane}
+          workflow={workflow}
+          onWorkflowChange={setWorkflow}
+          pixelSpacing={pixelSpacing}
+          onPlaneRequest={handlePlaneRequest}
           layoutPreference={layoutPreference}
           onLayoutPreferenceChange={(p) => {
             setLayoutPreference(p);

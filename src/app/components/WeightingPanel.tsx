@@ -4,7 +4,13 @@ import { RadioGroup, RadioGroupItem } from './ui/radio-group';
 import { Slider } from './ui/slider';
 import { Separator } from './ui/separator';
 import { WeightingType } from './MedicalImageViewer';
-import { FileUpload } from './FileUpload';
+import { StudyUpload } from './dicom/StudyUpload';
+import type { DicomStudy } from './dicom/DicomStudy';
+import type { Plane } from './dicom/DicomLoader';
+import {
+  MeasurementWorkflow,
+  WorkflowState,
+} from './measurement/MeasurementWorkflow';
 
 interface WeightingPanelProps {
   weighting: WeightingType;
@@ -18,6 +24,13 @@ interface WeightingPanelProps {
   selectedPlanes: Array<'axial' | 'sagittal' | 'coronal'>;
   onPlanesChange: (planes: Array<'axial' | 'sagittal' | 'coronal'>) => void;
   onFileLoad?: (data: ArrayBuffer, name: string) => void;
+  onStudyLoad?: (study: DicomStudy) => void;
+  studyData?: DicomStudy | null;
+  activeStudyPlane?: Plane;
+  workflow: WorkflowState;
+  onWorkflowChange: (s: WorkflowState) => void;
+  pixelSpacing: { x: number; y: number };
+  onPlaneRequest?: (plane: Plane) => void;
   layoutPreference?: 'auto' | 'row' | 'column' | 'grid';
   onLayoutPreferenceChange?: (p: 'auto' | 'row' | 'column' | 'grid') => void;
   onOverflowChange?: (overflowing: boolean) => void;
@@ -33,6 +46,13 @@ export function WeightingPanel({
   selectedPlanes,
   onPlanesChange,
   onFileLoad,
+  onStudyLoad,
+  studyData,
+  activeStudyPlane,
+  workflow,
+  onWorkflowChange,
+  pixelSpacing,
+  onPlaneRequest,
   layoutPreference = 'auto',
   onLayoutPreferenceChange,
   onOverflowChange,
@@ -320,15 +340,43 @@ export function WeightingPanel({
   const isPlaneSelected = (p: 'axial' | 'sagittal' | 'coronal') => selectedPlanes.includes(p);
 
   return (
-    <div ref={containerRef} className="bg-gray-900 border-l border-gray-800 p-4 overflow-y-auto">
-      <div className="flex items-start justify-between">
-        <div>
-          <h2 className="text-sm font-bold text-blue-300 mb-2">SMART MRI Tissue Weighting Tool</h2>
-        </div>
-        <div className="ml-2">
-          {onFileLoad && <FileUpload onFileLoad={onFileLoad} />}
-        </div>
+    <div ref={containerRef} className="bg-gray-900 border-l border-gray-800 p-4 overflow-y-auto h-full">
+      <div className="mb-4">
+        <h2 className="text-sm font-bold text-blue-300 mb-3">SMART MRI Tissue Weighting Tool</h2>
+        {(onFileLoad || onStudyLoad) && (
+          <StudyUpload
+            onNiftiLoad={(buf, name) => onFileLoad?.(buf, name)}
+            onStudyLoad={(study) => onStudyLoad?.(study)}
+          />
+        )}
+        {studyData && (
+          <div className="mt-2 text-[10px] text-gray-400">
+            Loaded study: <span className="text-gray-200">{studyData.studyName}</span>
+            <div className="mt-0.5">
+              Series:{' '}
+              {(['axial', 'sagittal', 'coronal'] as Plane[])
+                .filter((p) => studyData.volumes[p])
+                .map((p) => (
+                  <span
+                    key={p}
+                    className={`inline-block mr-1 px-1.5 py-0.5 rounded ${
+                      activeStudyPlane === p ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'
+                    }`}
+                  >
+                    {p}
+                  </span>
+                ))}
+            </div>
+          </div>
+        )}
       </div>
+
+      <MeasurementWorkflow
+        state={workflow}
+        onStateChange={onWorkflowChange}
+        pixelSpacing={pixelSpacing}
+        onPlaneRequest={onPlaneRequest}
+      />
 
       <div className="mb-4">
         <h3 className="text-sm font-semibold text-gray-300 mb-2">Processing Mode</h3>
