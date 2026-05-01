@@ -18,6 +18,10 @@ export interface DicomVolume {
   defaultWindowLevel: { window: number; level: number };
   plane: Plane;
   seriesDescription: string;
+  patientId: string;
+  patientName: string;
+  studyInstanceUID: string;
+  seriesInstanceUID: string;
   sliceCount: number;
   origin: 'dicom';
 }
@@ -35,6 +39,10 @@ interface ParsedSlice {
   windowCenter?: number;
   windowWidth?: number;
   seriesDescription: string;
+  patientId: string;
+  patientName: string;
+  studyInstanceUID: string;
+  seriesInstanceUID: string;
 }
 
 const tag = {
@@ -58,6 +66,10 @@ const tag = {
   imagePositionPatient: 'x00200032',
   imageOrientationPatient: 'x00200037',
   seriesDescription: 'x0008103e',
+  patientId: 'x00100020',
+  patientName: 'x00100010',
+  studyInstanceUID: 'x0020000d',
+  seriesInstanceUID: 'x0020000e',
 } as const;
 
 function readFloatString(dataSet: any, t: string): number | undefined {
@@ -117,6 +129,10 @@ function parseDicomFile(buffer: ArrayBuffer): ParsedSlice | null {
     | [number, number, number, number, number, number]
     | undefined;
   const seriesDescription = dataSet.string(tag.seriesDescription) || '';
+  const patientId = (dataSet.string(tag.patientId) || '').trim();
+  const patientName = (dataSet.string(tag.patientName) || '').replace(/\^/g, ' ').trim();
+  const studyInstanceUID = (dataSet.string(tag.studyInstanceUID) || '').trim();
+  const seriesInstanceUID = (dataSet.string(tag.seriesInstanceUID) || '').trim();
 
   const numFrames = parseInt(dataSet.string(tag.numberOfFrames) || '1', 10) || 1;
   const sliceSize = rows * cols;
@@ -154,6 +170,10 @@ function parseDicomFile(buffer: ArrayBuffer): ParsedSlice | null {
     windowCenter,
     windowWidth,
     seriesDescription,
+    patientId,
+    patientName,
+    studyInstanceUID,
+    seriesInstanceUID,
   };
 }
 
@@ -295,6 +315,10 @@ export async function loadDicomSeries(
     defaultWindowLevel: { window: defaultWindow, level: defaultLevel },
     plane,
     seriesDescription: consistent[0].seriesDescription || hint || plane,
+    patientId: consistent[0].patientId || 'unknown-patient',
+    patientName: consistent[0].patientName || 'Unknown Patient',
+    studyInstanceUID: consistent[0].studyInstanceUID || '',
+    seriesInstanceUID: consistent[0].seriesInstanceUID || '',
     sliceCount,
     origin: 'dicom',
   };

@@ -298,22 +298,31 @@ export function WeightingPanel({
         {studyData && (
           <div className="mt-2 text-[10px] text-gray-400">
             Loaded study: <span className="text-gray-200">{studyData.studyName}</span>
-            <div className="mt-0.5">
-              Series:{' '}
-              {(['axial', 'sagittal', 'coronal'] as Plane[])
-                .filter((p) => studyData.volumes[p])
-                .map((p) => (
-                  <button
-                    key={p}
-                    type="button"
-                    onClick={() => onStudyPlaneSelect?.(p)}
-                    className={`inline-block mr-1 px-1.5 py-0.5 rounded cursor-pointer ${
-                      activeStudyPlane === p ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'
-                    }`}
-                  >
-                    {p}
-                  </button>
-                ))}
+            <div className="mt-1">
+              <div className="mb-1 text-gray-500">Select sequence to view:</div>
+              <div className="flex flex-wrap gap-1">
+                {(['axial', 'sagittal', 'coronal'] as Plane[]).map((p) => {
+                  const exists = Boolean(studyData.volumes[p]);
+                  const active = activeStudyPlane === p;
+                  return (
+                    <button
+                      key={p}
+                      type="button"
+                      onClick={() => onStudyPlaneSelect?.(p)}
+                      className={`px-2 py-0.5 rounded capitalize border ${
+                        active
+                          ? 'bg-blue-600 text-white border-blue-500'
+                          : exists
+                            ? 'bg-gray-800 text-gray-200 border-gray-700 hover:bg-gray-700'
+                            : 'bg-gray-900 text-gray-500 border-gray-800'
+                      }`}
+                      title={exists ? `Load ${p} sequence` : `${p} sequence not loaded`}
+                    >
+                      {p}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           </div>
         )}

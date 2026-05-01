@@ -370,11 +370,16 @@ export function MedicalImageViewer({
     setMeasurements(prev => prev.filter(m => m.id !== id));
   }, []);
 
+  // Always render with axial interaction/view behavior regardless of which
+  // sequence (A/S/C) is loaded. Sequence identity is shown in metadata labels.
+  const currentViewPlane: Plane = 'axial';
+  const activeVolumeMeta = studyData ? studyData.volumes[activeStudyPlane] : null;
+
   const handleAutoWindowLevel = useCallback(() => {
     if (!imageData || !header) return;
     const dims = header.dims;
 
-    const plane = 'axial' as const;
+    const plane = currentViewPlane;
     const sliceIndex = plane === 'axial' ? currentSlice.axial : plane === 'sagittal' ? currentSlice.sagittal : currentSlice.coronal;
 
     let min = Infinity;
@@ -420,7 +425,7 @@ export function MedicalImageViewer({
     const level = Math.round((min + max) / 2);
 
     setWindowLevel({ window, level });
-  }, [imageData, header, currentSlice]);
+  }, [imageData, header, currentSlice, currentViewPlane]);
 
   const applyWeighting = useCallback((pixelValue: number): number => {
     // DREAMER algorithm simulation - in reality this would be much more complex
@@ -457,7 +462,7 @@ export function MedicalImageViewer({
             imageData={imageData!}
             header={header!}
             currentSlice={currentSlice}
-            viewPlane="axial"
+            viewPlane={currentViewPlane}
             onSliceChange={handleSliceChange}
             windowLevel={windowLevel}
             onWindowLevelChange={handleWindowLevelChange}
@@ -479,7 +484,24 @@ export function MedicalImageViewer({
           </div>
         )}
 
-        {/* Floating bottom-right tool bar (select, ellipse, freehand, auto WL, tile) */}
+        {studyData && (
+          <div className="absolute top-2 left-2 z-20 bg-black/60 border border-gray-700 rounded px-2 py-1 text-[10px] text-gray-200">
+            <div>
+              Patient: <span className="text-gray-100">{studyData.patientId || 'unknown-patient'}</span>
+              {' · '}
+              {studyData.patientName || 'Unknown Patient'}
+            </div>
+            <div>
+              Study: <span className="text-gray-100">{studyData.studyName}</span>
+            </div>
+            <div>
+              Sequence: <span className="text-gray-100 capitalize">{activeStudyPlane}</span>
+              {activeVolumeMeta?.seriesDescription ? ` (${activeVolumeMeta.seriesDescription})` : ''}
+            </div>
+          </div>
+        )}
+
+        {/* Floating bottom-right tool bar (select, ellipse, freehand, auto WL) */}
         <div className="absolute bottom-4 right-4 flex items-center space-x-2" style={{ zIndex: 9999 }}>
           <Button
             size="sm"

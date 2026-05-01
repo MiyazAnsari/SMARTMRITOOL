@@ -8,6 +8,9 @@ import {
 
 export interface DicomStudy {
   studyName: string;
+  patientId: string;
+  patientName: string;
+  studyInstanceUID: string;
   /** One volume per orientation. Any of these can be undefined if missing. */
   volumes: Partial<Record<Plane, DicomVolume>>;
 }
@@ -83,5 +86,15 @@ export async function loadDicomStudy(
     }
   }
 
-  return { studyName, volumes };
+  const representative = (['axial', 'sagittal', 'coronal'] as Plane[])
+    .map((p) => volumes[p])
+    .find(Boolean);
+
+  return {
+    studyName,
+    patientId: representative?.patientId || `unknown-${studyName}`,
+    patientName: representative?.patientName || 'Unknown Patient',
+    studyInstanceUID: representative?.studyInstanceUID || '',
+    volumes,
+  };
 }
