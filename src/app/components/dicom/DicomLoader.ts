@@ -158,13 +158,17 @@ function parseDicomFile(buffer: ArrayBuffer): ParsedSlice | null {
 }
 
 /**
- * Decide which orientation a series is from its ImageOrientationPatient direction
- * cosines. Falls back to the series description and finally to 'axial'.
+ * Decide plane from folder hint + SeriesDescription first (reliable for A_/S_/C_DICOM),
+ * then ImageOrientationPatient, then axial default.
  */
 function detectPlane(slice: ParsedSlice, hint?: string): Plane {
+  const text = `${hint || ''} ${slice.seriesDescription || ''}`.toLowerCase();
+  if (/sag|sagittal|s_dicom\b|^s\b/.test(text)) return 'sagittal';
+  if (/cor|coronal|c_dicom\b|^c\b/.test(text)) return 'coronal';
+  if (/ax|axial|tra|transverse|a_dicom\b|^a\b/.test(text)) return 'axial';
+
   const iop = slice.imageOrientationPatient;
   if (iop && iop.length === 6) {
-    // Normal vector = rowDir x colDir
     const r = [iop[0], iop[1], iop[2]];
     const c = [iop[3], iop[4], iop[5]];
     const n = [
@@ -180,10 +184,6 @@ function detectPlane(slice: ParsedSlice, hint?: string): Plane {
     return 'coronal';
   }
 
-  const text = `${hint || ''} ${slice.seriesDescription || ''}`.toLowerCase();
-  if (/sag|sagittal|s_dicom\b|^s\b/.test(text)) return 'sagittal';
-  if (/cor|coronal|c_dicom\b|^c\b/.test(text)) return 'coronal';
-  if (/ax|axial|tra|transverse|a_dicom\b|^a\b/.test(text)) return 'axial';
   return 'axial';
 }
 

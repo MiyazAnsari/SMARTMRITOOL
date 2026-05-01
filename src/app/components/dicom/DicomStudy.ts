@@ -25,6 +25,17 @@ function planeFromName(name: string): Plane | null {
   return null;
 }
 
+/** Scan every path segment (folder or file name) for A_/S_/C_DICOM-style hints. */
+function planeHintFromRelativePath(rel: string): Plane | null {
+  const norm = rel.replace(/\\/g, '/');
+  for (const segment of norm.split('/')) {
+    if (!segment) continue;
+    const p = planeFromName(segment);
+    if (p) return p;
+  }
+  return null;
+}
+
 /**
  * Load a full knee-MRI study (folder containing A_DICOM, S_DICOM, C_DICOM
  * subfolders) by reading every file once and grouping by parent directory.
@@ -48,15 +59,21 @@ export async function loadDicomStudy(
       dirFiles.map(async (f) => ({ name: f.name, buffer: await f.arrayBuffer() })),
     );
 
-    // Hint plane from the directory name (more reliable than per-file metadata
-    // when folders are explicitly named A_DICOM / S_DICOM / C_DICOM).
+    // Hint plane from folder names. When the user selects a single series folder,
+    // webkitRelativePath is often flat ("0001.dcm") so the parent folder name is
+    // missing from `dir` — scan the full relative path of the first file too.
+    const firstRel =
+      (dirFiles[0] as File & { webkitRelativePath?: string })?.webkitRelativePath ||
+      dirFiles[0]?.name ||
+      '';
     const dirHint = planeFromName(dir.split('/').pop() || dir);
-    const vol = await loadDicomSeries(buffers, dirHint || undefined);
+    const pathHint = planeHintFromRelativePath(firstRel);
+    const seriesHint = dirHint ?? pathHint;
+    const vol = await loadDicomSeries(buffers, seriesHint || undefined);
     if (!vol) continue;
 
-    // If the directory hint disagrees with the orientation we detected, trust
-    // the directory hint (Danish's convention: A_DICOM, S_DICOM, C_DICOM).
-    const finalPlane = dirHint ?? vol.plane;
+    // Prefer explicit folder/path naming over geometry heuristics.
+    const finalPlane = dirHint ?? pathHint ?? vol.plane;
     vol.plane = finalPlane;
 
     // If we already filled this plane, keep the larger series.

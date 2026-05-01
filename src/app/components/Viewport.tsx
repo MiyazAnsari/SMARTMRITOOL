@@ -51,26 +51,76 @@ export function Viewport({
   const [containerRect, setContainerRect] = useState({ width: 0, height: 0 });
   const [ancestorRects, setAncestorRects] = useState<{ parent: { width: number; height: number } | null; grandParent: { width: number; height: number } | null }>({ parent: null, grandParent: null });
   const sliderRef = useRef<HTMLDivElement | null>(null);
-  const [isDragging, setIsDragging] = useState(false);
   const [isDrawing, setIsDrawing] = useState(false);
   const [drawingPoints, setDrawingPoints] = useState<{ x: number; y: number }[]>([]);
-  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
 
   // Pan state
   const [panSrc, setPanSrc] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const panStartRef = useRef<{ clientX: number; clientY: number; startX: number; startY: number } | null>(null);
   const [isPanning, setIsPanning] = useState(false);
   const [zoomScale, setZoomScale] = useState(1);
+  const [axialTransform, setAxialTransform] = useState<{ rotation: number }>({
+    rotation: 0,
+  });
+  const [isRotateMode, setIsRotateMode] = useState(false);
+  const [isZoomMode, setIsZoomMode] = useState(false);
+  /** Last pointer over the overlay (for wheel focal when clientX/Y on wheel is unreliable). */
+  const lastPointerClientRef = useRef<{ x: number; y: number } | null>(null);
+  const zoomScaleRef = useRef(zoomScale);
+  const panSrcRef = useRef(panSrc);
+  useEffect(() => {
+    zoomScaleRef.current = zoomScale;
+    panSrcRef.current = panSrc;
+  }, [zoomScale, panSrc]);
+  const rotateDragRef = useRef<{ dragging: boolean; startAngle: number; startRotation: number }>({
+    dragging: false,
+    startAngle: 0,
+    startRotation: 0,
+  });
   const sliceDimsRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
   const cropRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
+  const isAxial = plane === 'axial';
+  const normalizeAngle = useCallback((angle: number) => {
+    return ((angle % 360) + 360) % 360;
+  }, []);
+
+  const getPlaneGeometry = useCallback(() => {
+    const dims = header.dims;
+    const pixDims = header.pixDims || header?.pixdim || [];
+    const width = plane === 'sagittal' ? dims[2] : dims[1];
+    const height = plane === 'axial' ? dims[2] : dims[3];
+
+    const p1 = Number.isFinite(pixDims[1]) && pixDims[1] > 0 ? pixDims[1] : 1;
+    const p2 = Number.isFinite(pixDims[2]) && pixDims[2] > 0 ? pixDims[2] : 1;
+    /** In-plane voxel pitch (typical MRI: ~0.5–1 mm, matrix often 512×512). */
+    const dInPlane = Math.min(p1, p2);
+
+    let spacingX: number;
+    let spacingY: number;
+    if (plane === 'axial') {
+      spacingX = p1;
+      spacingY = p2;
+    } else if (plane === 'coronal') {
+      // Horizontal = x (same as axial width). Vertical = through-plane (z). Using true dz here
+      // often stretches anatomy because slice spacing ≫ in-plane spacing; match in-plane pitch so
+      // MPR matches the familiar 512×512-style square voxels on screen.
+      spacingX = p1;
+      spacingY = dInPlane;
+    } else {
+      // sagittal: horizontal = y, vertical = z
+      spacingX = p2;
+      spacingY = dInPlane;
+    }
+
+    return { width, height, spacingX, spacingY };
+  }, [header, plane]);
 
 
 
   // Get slice data based on orientation
   const getSliceData = useCallback(() => {
     const dims = header.dims;
-    const width = plane === 'sagittal' ? dims[2] : dims[1];
-    const height = plane === 'axial' ? dims[2] : dims[3];
+    const { width, height } = getPlaneGeometry();
     const sliceSize = width * height;
     const sliceData = new Uint8Array(sliceSize);
 
@@ -99,7 +149,7 @@ export function Viewport({
     }
 
     return { sliceData, width, height };
-  }, [imageData, header, plane, currentSlice]);
+  }, [imageData, header, plane, currentSlice, getPlaneGeometry]);
 
   // ResizeObserver to calculate fit-to-container display size while preserving aspect ratio
   useEffect(() => {
@@ -138,7 +188,9 @@ export function Viewport({
 
       // Rebuilt fit algorithm (aspect-preserving, deterministic)
       const paddingBuffer = 8;
-      const { width: imgW, height: imgH } = getSliceData();
+      const { width: imgW, height: imgH, spacingX, spacingY } = getPlaneGeometry();
+      const physicalW = imgW * spacingX;
+      const physicalH = imgH * spacingY;
 
       // Available area inside the container (subtract slider if present)
       const availW = Math.max(1, rect.width - sliderWidth - sliderMarginLeft - paddingBuffer * 2);
@@ -150,9 +202,11 @@ export function Viewport({
 
       // Compute scale so image fits into the available area using the smaller dimension
       // (allow upscaling so the image can fill the smaller container dimension)
-      const scale = Math.min(availW / safeImgW, availH / safeImgH);
-      const computedW = Math.max(1, Math.round(safeImgW * scale));
-      const computedH = Math.max(1, Math.round(safeImgH * scale));
+      const safePhysicalW = Math.max(1, physicalW || 1);
+      const safePhysicalH = Math.max(1, physicalH || 1);
+      const scale = Math.min(availW / safePhysicalW, availH / safePhysicalH);
+      const computedW = Math.max(1, Math.round(safePhysicalW * scale));
+      const computedH = Math.max(1, Math.round(safePhysicalH * scale));
 
       // Enforce sensible min / max so the wrapper never collapses
       const MIN_DISPLAY = 48; // absolute lower bound
@@ -170,7 +224,7 @@ export function Viewport({
       }
 
       // Debug trace (left intentionally minimal)
-      console.debug('fit', { rectW: rect.width, rectH: rect.height, availW, availH, imgW: safeImgW, imgH: safeImgH, finalW, finalH });
+      console.debug('fit', { rectW: rect.width, rectH: rect.height, availW, availH, imgW: safeImgW, imgH: safeImgH, physicalW: safePhysicalW, physicalH: safePhysicalH, finalW, finalH });
 
       displaySizeRef.current = { width: finalW, height: finalH };
       setDisplaySize({ width: finalW, height: finalH });
@@ -208,7 +262,7 @@ export function Viewport({
         rafId = null;
       }
     };
-  }, [getSliceData]);
+  }, [getPlaneGeometry]);
 
   // Apply window/level and weighting to image
   const applyWindowLevel = useCallback((value: number): number => {
@@ -225,6 +279,201 @@ export function Viewport({
     
     return Math.round(((weighted - min) / window) * 255);
   }, [windowLevel, applyWeighting]);
+
+  const drawTransformedImage = useCallback((
+    ctx: CanvasRenderingContext2D,
+    dpr: number,
+    centerX: number,
+    centerY: number,
+    drawW: number,
+    drawH: number,
+    drawImage: () => void
+  ) => {
+    const rotation = isAxial ? normalizeAngle(axialTransform.rotation) : 0;
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    ctx.translate(centerX, centerY);
+    ctx.rotate((rotation * Math.PI) / 180);
+    ctx.translate(-drawW / 2, -drawH / 2);
+    drawImage();
+    ctx.restore();
+  }, [isAxial, axialTransform, normalizeAngle]);
+
+  const rotateAxialBy = useCallback((delta: number) => {
+    setAxialTransform(prev => ({ rotation: normalizeAngle(prev.rotation + delta) }));
+  }, [normalizeAngle]);
+
+  const getPointerAngleFromCenter = useCallback((clientX: number, clientY: number) => {
+    const canvas = overlayCanvasRef.current;
+    if (!canvas) return 0;
+    const rect = canvas.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    return Math.atan2(clientY - centerY, clientX - centerX) * (180 / Math.PI);
+  }, []);
+
+  const startRotateDrag = useCallback((clientX: number, clientY: number) => {
+    rotateDragRef.current = {
+      dragging: true,
+      startAngle: getPointerAngleFromCenter(clientX, clientY),
+      startRotation: axialTransform.rotation,
+    };
+  }, [axialTransform.rotation, getPointerAngleFromCenter]);
+
+  const moveRotateDrag = useCallback((clientX: number, clientY: number) => {
+    const drag = rotateDragRef.current;
+    if (!drag.dragging) return;
+    const currentAngle = getPointerAngleFromCenter(clientX, clientY);
+    let delta = currentAngle - drag.startAngle;
+    if (delta > 180) delta -= 360;
+    if (delta < -180) delta += 360;
+    const nextRotation = normalizeAngle(drag.startRotation + delta);
+    setAxialTransform({ rotation: nextRotation });
+  }, [normalizeAngle, getPointerAngleFromCenter]);
+
+  const stopRotateDrag = useCallback(() => {
+    rotateDragRef.current.dragging = false;
+  }, []);
+
+  /** Map screen position to slice image pixel (continuous) for current zoom/pan/rotation. */
+  const clientToImagePixel = useCallback(
+    (clientX: number, clientY: number): { imgX: number; imgY: number } | null => {
+      const main = canvasRef.current;
+      if (!main) return null;
+      const rect = main.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const displayW_css = main.width / dpr;
+      const displayH_css = main.height / dpr;
+      if (displayW_css < 1 || displayH_css < 1) return null;
+      const lx = ((clientX - rect.left) / Math.max(rect.width, 1)) * displayW_css;
+      const ly = ((clientY - rect.top) / Math.max(rect.height, 1)) * displayH_css;
+
+      const iw = sliceDimsRef.current.w;
+      const ih = sliceDimsRef.current.h;
+      if (iw < 1 || ih < 1) return null;
+
+      const { spacingX, spacingY } = getPlaneGeometry();
+      const physicalW = iw * spacingX;
+      const physicalH = ih * spacingY;
+      const sx = displayW_css / physicalW || 1;
+      const sy = displayH_css / physicalH || 1;
+      const scaleFit = Math.min(sx, sy);
+      const drawW = Math.max(1, Math.round(physicalW * scaleFit));
+      const drawH = Math.max(1, Math.round(physicalH * scaleFit));
+
+      const cx = displayW_css / 2;
+      const cy = displayH_css / 2;
+      const θ = (normalizeAngle(axialTransform.rotation) * Math.PI) / 180;
+      const rx = lx - cx;
+      const ry = ly - cy;
+      const ix = Math.cos(-θ) * rx - Math.sin(-θ) * ry;
+      const iy = Math.sin(-θ) * rx + Math.cos(-θ) * ry;
+      let u = ix + drawW / 2;
+      let v = iy + drawH / 2;
+      u = Math.max(0, Math.min(drawW, u));
+      v = Math.max(0, Math.min(drawH, v));
+      const uFrac = drawW > 0 ? u / drawW : 0.5;
+      const vFrac = drawH > 0 ? v / drawH : 0.5;
+
+      const z = zoomScaleRef.current;
+      const cropW = Math.max(1, Math.floor(iw / z));
+      const cropH = Math.max(1, Math.floor(ih / z));
+      const px = Math.max(0, Math.min(iw - cropW, Math.round(panSrcRef.current.x)));
+      const py = Math.max(0, Math.min(ih - cropH, Math.round(panSrcRef.current.y)));
+      return {
+        imgX: px + uFrac * cropW,
+        imgY: py + vFrac * cropH,
+      };
+    },
+    [getPlaneGeometry, normalizeAngle, axialTransform.rotation]
+  );
+
+  /** Axial zoom mode: zoom toward whatever is under the pointer (hover + scroll). */
+  const applyAxialWheelZoomAtPointer = useCallback(
+    (clientX: number, clientY: number, deltaY: number, deltaMode: number) => {
+      const iw = sliceDimsRef.current.w;
+      const ih = sliceDimsRef.current.h;
+      if (iw < 1 || ih < 1) return;
+
+      const main = canvasRef.current;
+      if (main) {
+        const r = main.getBoundingClientRect();
+        const inside =
+          clientX >= r.left &&
+          clientX <= r.right &&
+          clientY >= r.top &&
+          clientY <= r.bottom;
+        if (!inside && lastPointerClientRef.current) {
+          clientX = lastPointerClientRef.current.x;
+          clientY = lastPointerClientRef.current.y;
+        }
+      }
+
+      let focal = clientToImagePixel(clientX, clientY);
+      if (!focal && lastPointerClientRef.current) {
+        focal = clientToImagePixel(lastPointerClientRef.current.x, lastPointerClientRef.current.y);
+      }
+
+      const prevZ = zoomScaleRef.current;
+      let step = deltaY;
+      if (deltaMode === 1) step *= 16;
+      if (deltaMode === 2) step *= 800;
+      const factor = Math.exp(-step * 0.0012);
+      const newZ = Math.min(20, Math.max(1, prevZ * factor));
+      if (Math.abs(newZ - prevZ) < 1e-6) return;
+
+      if (newZ <= 1) {
+        zoomScaleRef.current = 1;
+        panSrcRef.current = { x: 0, y: 0 };
+        setZoomScale(1);
+        setPanSrc({ x: 0, y: 0 });
+        return;
+      }
+
+      const cropW = Math.max(1, Math.floor(iw / prevZ));
+      const cropH = Math.max(1, Math.floor(ih / prevZ));
+      const px = Math.max(0, Math.min(iw - cropW, Math.round(panSrcRef.current.x)));
+      const py = Math.max(0, Math.min(ih - cropH, Math.round(panSrcRef.current.y)));
+
+      let uFrac = 0.5;
+      let vFrac = 0.5;
+      if (focal) {
+        uFrac = cropW > 0 ? (focal.imgX - px) / cropW : 0.5;
+        vFrac = cropH > 0 ? (focal.imgY - py) / cropH : 0.5;
+        uFrac = Math.max(0, Math.min(1, uFrac));
+        vFrac = Math.max(0, Math.min(1, vFrac));
+      }
+
+      const imgX = px + uFrac * cropW;
+      const imgY = py + vFrac * cropH;
+
+      const newCropW = Math.max(1, Math.floor(iw / newZ));
+      const newCropH = Math.max(1, Math.floor(ih / newZ));
+      let npx = Math.round(imgX - uFrac * newCropW);
+      let npy = Math.round(imgY - vFrac * newCropH);
+      npx = Math.max(0, Math.min(iw - newCropW, npx));
+      npy = Math.max(0, Math.min(ih - newCropH, npy));
+
+      zoomScaleRef.current = newZ;
+      panSrcRef.current = { x: npx, y: npy };
+      setZoomScale(newZ);
+      setPanSrc({ x: npx, y: npy });
+    },
+    [clientToImagePixel]
+  );
+
+  // Keep axial starting orientation neutral and centered when loading new image data.
+  useEffect(() => {
+    if (!isAxial) return;
+    setAxialTransform({ rotation: 0 });
+    zoomScaleRef.current = 1;
+    panSrcRef.current = { x: 0, y: 0 };
+    setZoomScale(1);
+    setPanSrc({ x: 0, y: 0 });
+    setIsRotateMode(false);
+    setIsZoomMode(false);
+    lastPointerClientRef.current = null;
+  }, [imageData, isAxial]);
 
   // Heavy rendering effect: builds source canvas and caches ImageBitmap when slice/WL/weighting changes
   const bitmapRef = useRef<ImageBitmap | null>(null);
@@ -295,7 +544,8 @@ export function Viewport({
 
       // Draw immediately from source canvas (synchronous and fast)
       ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.imageSmoothingEnabled = false;
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
       // Compute CSS display sizes (canvas backing divided by DPR)
@@ -303,13 +553,16 @@ export function Viewport({
       const displayH_css = canvas.height / dpr;
 
       // compute scaled draw size preserving aspect and centering
-      const sx = displayW_css / imgW || 1;
-      const sy = displayH_css / imgH || 1;
+      const { spacingX, spacingY } = getPlaneGeometry();
+      const physicalW = width * spacingX;
+      const physicalH = height * spacingY;
+      const sx = displayW_css / physicalW || 1;
+      const sy = displayH_css / physicalH || 1;
       const scale = Math.min(sx, sy);
-      const drawW = Math.max(1, Math.round(imgW * scale));
-      const drawH = Math.max(1, Math.round(imgH * scale));
-      const offsetX = Math.round((displayW_css - drawW) / 2);
-      const offsetY = Math.round((displayH_css - drawH) / 2);
+      const drawW = Math.max(1, Math.round(physicalW * scale));
+      const drawH = Math.max(1, Math.round(physicalH * scale));
+      const centerX = displayW_css / 2;
+      const centerY = displayH_css / 2;
 
       if (zoomScale > 1) {
         const cropW = Math.max(1, Math.floor(width / zoomScale));
@@ -318,12 +571,19 @@ export function Viewport({
 
         const px = Math.max(0, Math.min(sliceDimsRef.current.w - cropW, Math.round(panSrc.x || 0)));
         const py = Math.max(0, Math.min(sliceDimsRef.current.h - cropH, Math.round(panSrc.y || 0)));
-        if (panSrc.x !== px || panSrc.y !== py) setPanSrc({ x: px, y: py });
+        if (panSrc.x !== px || panSrc.y !== py) {
+          panSrcRef.current = { x: px, y: py };
+          setPanSrc({ x: px, y: py });
+        }
 
-        ctx.drawImage(src, px, py, cropW, cropH, offsetX * dpr, offsetY * dpr, drawW * dpr, drawH * dpr);
+        drawTransformedImage(ctx, dpr, centerX, centerY, drawW, drawH, () => {
+          ctx.drawImage(src, px, py, cropW, cropH, 0, 0, drawW, drawH);
+        });
       } else {
         // draw full image centered and scaled
-        ctx.drawImage(src, 0, 0, width, height, offsetX * dpr, offsetY * dpr, drawW * dpr, drawH * dpr);
+        drawTransformedImage(ctx, dpr, centerX, centerY, drawW, drawH, () => {
+          ctx.drawImage(src, 0, 0, width, height, 0, 0, drawW, drawH);
+        });
       }
 
       // Asynchronously build and cache an ImageBitmap for faster subsequent draws
@@ -352,7 +612,7 @@ export function Viewport({
     })();
 
     return () => { cancelled = true; };
-  }, [imageData, currentSlice, plane, windowLevel, applyWindowLevel, getSliceData, displaySize]);
+  }, [imageData, currentSlice, plane, windowLevel, applyWindowLevel, getSliceData, getPlaneGeometry, displaySize, zoomScale, panSrc, drawTransformedImage]);
 
   // Fast pan/zoom draw effect: responds to panSrc and zoomScale without rebuilding pixels
   useEffect(() => {
@@ -365,7 +625,8 @@ export function Viewport({
     if (!src) return;
 
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.imageSmoothingEnabled = false;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     const width = src.width;
@@ -374,13 +635,16 @@ export function Viewport({
     const dpr = window.devicePixelRatio || 1;
     const displayW_css = canvas.width / dpr;
     const displayH_css = canvas.height / dpr;
-    const sx = displayW_css / width || 1;
-    const sy = displayH_css / height || 1;
+    const { spacingX, spacingY } = getPlaneGeometry();
+    const physicalW = width * spacingX;
+    const physicalH = height * spacingY;
+    const sx = displayW_css / physicalW || 1;
+    const sy = displayH_css / physicalH || 1;
     const scale = Math.min(sx, sy);
-    const drawW = Math.max(1, Math.round(width * scale));
-    const drawH = Math.max(1, Math.round(height * scale));
-    const offsetX = Math.round((displayW_css - drawW) / 2);
-    const offsetY = Math.round((displayH_css - drawH) / 2);
+    const drawW = Math.max(1, Math.round(physicalW * scale));
+    const drawH = Math.max(1, Math.round(physicalH * scale));
+    const centerX = displayW_css / 2;
+    const centerY = displayH_css / 2;
 
     if (zoomScale > 1) {
       const cropW = Math.max(1, Math.floor(width / zoomScale));
@@ -390,11 +654,15 @@ export function Viewport({
       const px = Math.max(0, Math.min(sliceDimsRef.current.w - cropW, Math.round(panSrc.x || 0)));
       const py = Math.max(0, Math.min(sliceDimsRef.current.h - cropH, Math.round(panSrc.y || 0)));
 
-      ctx.drawImage(src, px, py, cropW, cropH, offsetX * dpr, offsetY * dpr, drawW * dpr, drawH * dpr);
+      drawTransformedImage(ctx, dpr, centerX, centerY, drawW, drawH, () => {
+        ctx.drawImage(src, px, py, cropW, cropH, 0, 0, drawW, drawH);
+      });
     } else {
-      ctx.drawImage(src, 0, 0, width, height, offsetX * dpr, offsetY * dpr, drawW * dpr, drawH * dpr);
+      drawTransformedImage(ctx, dpr, centerX, centerY, drawW, drawH, () => {
+        ctx.drawImage(src, 0, 0, width, height, 0, 0, drawW, drawH);
+      });
     }
-  }, [panSrc, zoomScale, displaySize]);
+  }, [panSrc, zoomScale, displaySize, getPlaneGeometry, drawTransformedImage, axialTransform.rotation]);
 
   // Render measurements overlay
   useEffect(() => {
@@ -605,13 +873,12 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    if (activeTool === 'pan') {
+    if (isAxial && isRotateMode) {
+      startRotateDrag(e.clientX, e.clientY);
+    } else if (activeTool === 'pan') {
       // start panning
       setIsPanning(true);
       panStartRef.current = { clientX: e.clientX, clientY: e.clientY, startX: panSrc.x, startY: panSrc.y };
-    } else if (activeTool === 'none') {
-      setIsDragging(true);
-      setDragStart({ x: e.clientX, y: e.clientY });
     } else if (activeTool === 'point') {
       // Single-click point primitive — emit immediately, no drag phase.
       onMeasurementAdd({
@@ -642,33 +909,43 @@ export function Viewport({
 
     const displayW_css = canvas.width / dpr;
     const displayH_css = canvas.height / dpr;
-    const sx = displayW_css / width || 1;
-    const sy = displayH_css / height || 1;
+    const { spacingX, spacingY } = getPlaneGeometry();
+    const physicalW = width * spacingX;
+    const physicalH = height * spacingY;
+    const sx = displayW_css / physicalW || 1;
+    const sy = displayH_css / physicalH || 1;
     const scale = Math.min(sx, sy);
-    const drawW = Math.max(1, Math.round(width * scale));
-    const drawH = Math.max(1, Math.round(height * scale));
-    const offsetX = Math.round((displayW_css - drawW) / 2);
-    const offsetY = Math.round((displayH_css - drawH) / 2);
+    const drawW = Math.max(1, Math.round(physicalW * scale));
+    const drawH = Math.max(1, Math.round(physicalH * scale));
+    const centerX = displayW_css / 2;
+    const centerY = displayH_css / 2;
 
     const cropW = Math.max(1, Math.floor(width / zoomScale));
     const cropH = Math.max(1, Math.floor(height / zoomScale));
 
     // clear then draw
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.imageSmoothingEnabled = false;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    ctx.drawImage(src, newX, newY, cropW, cropH, offsetX * dpr, offsetY * dpr, drawW * dpr, drawH * dpr);
+    drawTransformedImage(ctx, dpr, centerX, centerY, drawW, drawH, () => {
+      ctx.drawImage(src, newX, newY, cropW, cropH, 0, 0, drawW, drawH);
+    });
   };
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const rect = overlayCanvasRef.current?.getBoundingClientRect();
     if (!rect) return;
 
+    lastPointerClientRef.current = { x: e.clientX, y: e.clientY };
+
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    if (activeTool === 'pan' && isPanning && panStartRef.current) {
+    if (isAxial && isRotateMode && rotateDragRef.current.dragging) {
+      moveRotateDrag(e.clientX, e.clientY);
+    } else if (activeTool === 'pan' && isPanning && panStartRef.current) {
       // Calculate image crop size
       const cropW = Math.max(1, Math.floor(sliceDimsRef.current.w / zoomScale));
       const cropH = Math.max(1, Math.floor(sliceDimsRef.current.h / zoomScale));
@@ -689,17 +966,8 @@ export function Viewport({
       panRafRef.current = requestAnimationFrame(() => drawPanImmediate(newX, newY));
 
       // Still update state for persistence and other effects
+      panSrcRef.current = { x: newX, y: newY };
       setPanSrc({ x: newX, y: newY });
-    } else if (isDragging && dragStart) {
-      // Window/Level adjustment
-      const dx = e.clientX - dragStart.x;
-      const dy = e.clientY - dragStart.y;
-      
-      const newWindow = Math.max(1, windowLevel.window + dx);
-      const newLevel = windowLevel.level - dy;
-      
-      onWindowLevelChange({ window: newWindow, level: newLevel });
-      setDragStart({ x: e.clientX, y: e.clientY });
     } else if (isDrawing) {
       if (activeTool === 'freehand') {
         setDrawingPoints(prev => [...prev, { x, y }]);
@@ -719,12 +987,12 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
+    if (isAxial && isRotateMode && rotateDragRef.current.dragging) {
+      stopRotateDrag();
+    }
     if (activeTool === 'pan' && isPanning) {
       setIsPanning(false);
       panStartRef.current = null;
-    } else if (isDragging) {
-      setIsDragging(false);
-      setDragStart(null);
     } else if (isDrawing) {
       if (activeTool === 'distance' || activeTool === 'line') {
         if (drawingPoints.length === 1) {
@@ -819,40 +1087,38 @@ export function Viewport({
 
   const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
     e.preventDefault();
+    if (isAxial && isZoomMode) {
+      applyAxialWheelZoomAtPointer(e.clientX, e.clientY, e.deltaY, e.deltaMode);
+      return;
+    }
     const delta = e.deltaY > 0 ? 1 : -1;
     const maxSlice = plane === 'axial' ? header.dims[3] : plane === 'sagittal' ? header.dims[1] : header.dims[2];
     const newSlice = Math.max(0, Math.min(maxSlice - 1, currentSlice + delta));
     onSliceChange(newSlice);
   };
 
-  // When entering pan mode, initialize panSrc to center the zoomed crop
+  // When entering pan mode, only clamp pan to valid range (do not reset zoom).
   useEffect(() => {
     if (activeTool !== 'pan') return;
 
-    // Decide a sensible initial zoom for pan (do not force via a separate effect)
-    const initialZoom = 2;
-
     const dims = sliceDimsRef.current;
-    const w = Math.max(1, dims.w || getSliceData().width);
-    const h = Math.max(1, dims.h || getSliceData().height);
-
-    const cropW = Math.max(1, Math.floor(w / initialZoom));
-    const cropH = Math.max(1, Math.floor(h / initialZoom));
-
-    const centerX = Math.max(0, Math.floor((w - cropW) / 2));
-    const centerY = Math.max(0, Math.floor((h - cropH) / 2));
-
-    // Only initialize if user hasn't panned yet (avoid overwriting manual pan)
-    if ((panSrc.x === 0 && panSrc.y === 0) || (panSrc.x <= 1 && panSrc.y <= 1)) {
-      setZoomScale(initialZoom);
-      setPanSrc({ x: centerX, y: centerY });
-    }
+    const w = Math.max(1, dims.w || 1);
+    const h = Math.max(1, dims.h || 1);
+    setPanSrc(prev => ({
+      x: Math.max(0, Math.min(w - 1, prev.x)),
+      y: Math.max(0, Math.min(h - 1, prev.y)),
+    }));
   }, [activeTool]);
 
-  // Reset zoom when leaving pan tool so other tools use 1:1 fit
+  // Reset zoom when leaving pan tool unless axial zoom mode is active (preserve zoom).
   useEffect(() => {
-    if (activeTool !== 'pan') setZoomScale(1);
-  }, [activeTool]);
+    if (activeTool === 'pan') return;
+    if (isAxial && isZoomMode) return;
+    zoomScaleRef.current = 1;
+    panSrcRef.current = { x: 0, y: 0 };
+    setZoomScale(1);
+    setPanSrc({ x: 0, y: 0 });
+  }, [activeTool, isAxial, isZoomMode]);
 
   const dims = header.dims;
   const maxSlice = plane === 'axial' ? dims[3] : plane === 'sagittal' ? dims[1] : dims[2];
@@ -874,6 +1140,66 @@ export function Viewport({
           W: {Math.round(windowLevel.window)} L: {Math.round(windowLevel.level)}
         </div>
       </div>
+      {isAxial && (
+        <div className="absolute top-2 right-2 z-10 flex items-center gap-1 bg-black bg-opacity-50 p-1 rounded text-xs text-white">
+          <button
+            className={`px-2 py-1 rounded ${isRotateMode ? 'bg-blue-600 text-white' : 'bg-gray-700 hover:bg-gray-600'}`}
+            onClick={() => {
+              setIsRotateMode(v => {
+                const next = !v;
+                if (next) setIsZoomMode(false);
+                return next;
+              });
+              stopRotateDrag();
+            }}
+          >
+            Rotate
+          </button>
+          <button
+            className={`px-2 py-1 rounded ${isZoomMode ? 'bg-blue-600 text-white' : 'bg-gray-700 hover:bg-gray-600'}`}
+            onClick={() => {
+              setIsZoomMode(v => {
+                const next = !v;
+                if (next) {
+                  setIsRotateMode(false);
+                  stopRotateDrag();
+                  lastPointerClientRef.current = null;
+                }
+                return next;
+              });
+            }}
+          >
+            Zoom
+          </button>
+          <button
+            className="px-2 py-1 bg-gray-700 rounded hover:bg-gray-600"
+            onClick={() => setAxialTransform({ rotation: 0 })}
+          >
+            0 deg
+          </button>
+          <button
+            className="px-2 py-1 bg-gray-700 rounded hover:bg-gray-600"
+            onClick={() => {
+              setAxialTransform({ rotation: 0 });
+              zoomScaleRef.current = 1;
+              panSrcRef.current = { x: 0, y: 0 };
+              setZoomScale(1);
+              setPanSrc({ x: 0, y: 0 });
+              setIsRotateMode(false);
+              setIsZoomMode(false);
+              lastPointerClientRef.current = null;
+              stopRotateDrag();
+            }}
+          >
+            Reset
+          </button>
+          {isZoomMode && (
+            <span className="text-[10px] text-gray-400 max-w-[140px] leading-tight pl-1">
+              Hover and scroll — zooms toward cursor
+            </span>
+          )}
+        </div>
+      )}
 
 
       {/* Auto WL flash */}
@@ -893,12 +1219,20 @@ export function Viewport({
               <canvas
                 ref={canvasRef}
                 className="absolute inset-0 w-full h-full"
-                style={{ imageRendering: 'pixelated' }}
+                style={{ imageRendering: 'auto' }}
               />
               <canvas
                 ref={overlayCanvasRef}
                 className="absolute inset-0 w-full h-full"
-                style={{ cursor: activeTool === 'pan' ? (isPanning ? 'grabbing' : 'grab') : 'crosshair' }}
+                style={{
+                  cursor: isAxial && isZoomMode
+                    ? 'zoom-in'
+                    : isAxial && isRotateMode
+                      ? 'ew-resize'
+                      : activeTool === 'pan'
+                        ? (isPanning ? 'grabbing' : 'grab')
+                        : 'crosshair',
+                }}
                 onMouseDown={handleMouseDown}
                 onMouseMove={handleMouseMove}
                 onMouseUp={handleMouseUp}
