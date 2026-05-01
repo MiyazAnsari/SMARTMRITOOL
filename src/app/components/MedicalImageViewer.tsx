@@ -115,6 +115,7 @@ export function MedicalImageViewer({
   const [workflow, setWorkflow] = useState<WorkflowState>(initialWorkflowState);
   /** Which DICOM series is loaded (native acquisition). Independent from Open Planes (MPR view). */
   const [activeStudyPlane, setActiveStudyPlane] = useState<Plane>('axial');
+  const [hiddenStudyPlanes, setHiddenStudyPlanes] = useState<Set<Plane>>(new Set());
   const prevStudyDataRef = useRef<DicomStudy | null>(null);
 
   const protocol = useMemo(() => getProtocol(workflow.protocolId), [workflow.protocolId]);
@@ -235,15 +236,22 @@ export function MedicalImageViewer({
     setActiveStudyPlane('axial');
   }, [studyData]);
 
-  // Load pixels from the active DICOM series. Viewer is axial-only until plane view controls return.
+  // Load pixels from the active DICOM series. Viewer behavior stays axial-like for all sequences.
   useEffect(() => {
     if (!studyData) {
       prevStudyDataRef.current = null;
+      setHiddenStudyPlanes(new Set());
       return;
     }
 
     if (prevStudyDataRef.current !== studyData) {
       prevStudyDataRef.current = studyData;
+      setHiddenStudyPlanes(new Set());
+      setCurrentSlice({
+        axial: studyData.volumes.axial ? Math.floor(studyData.volumes.axial.sliceCount / 2) : 0,
+        sagittal: studyData.volumes.sagittal ? Math.floor(studyData.volumes.sagittal.sliceCount / 2) : 0,
+        coronal: studyData.volumes.coronal ? Math.floor(studyData.volumes.coronal.sliceCount / 2) : 0,
+      });
     }
 
     let plane: Plane = activeStudyPlane;
@@ -260,12 +268,6 @@ export function MedicalImageViewer({
     setImageData(vol.imageData);
     setDataRange(vol.dataRange);
     setWindowLevel(vol.defaultWindowLevel);
-    setCurrentSlice({
-      axial: 0,
-      sagittal: 0,
-      coronal: 0,
-      [plane]: Math.floor(vol.sliceCount / 2),
-    } as { axial: number; sagittal: number; coronal: number });
   }, [studyData, activeStudyPlane]);
 
   const selectStudyPlane = useCallback(
@@ -280,8 +282,33 @@ export function MedicalImageViewer({
         return;
       }
       setActiveStudyPlane(plane);
+      setHiddenStudyPlanes((prev) => {
+        if (!prev.has(plane)) return prev;
+        const next = new Set(prev);
+        next.delete(plane);
+        return next;
+      });
     },
     [studyData],
+  );
+
+  const hideStudyPlane = useCallback(
+    (plane: Plane) => {
+      if (!studyData?.volumes[plane]) return;
+      setHiddenStudyPlanes((prev) => {
+        if (prev.has(plane)) return prev;
+        const next = new Set(prev);
+        next.add(plane);
+        return next;
+      });
+
+      if (activeStudyPlane === plane) {
+        const order: Plane[] = ['axial', 'sagittal', 'coronal'];
+        const replacement = order.find((p) => p !== plane && studyData.volumes[p] && !hiddenStudyPlanes.has(p));
+        if (replacement) setActiveStudyPlane(replacement);
+      }
+    },
+    [studyData, activeStudyPlane, hiddenStudyPlanes],
   );
 
   const handleSliceChange = useCallback((plane: 'axial' | 'sagittal' | 'coronal', slice: number) => {
@@ -453,6 +480,21 @@ export function MedicalImageViewer({
   }, [weighting, customWeighting]);
 
   const loaded = Boolean(imageData && header);
+  const sequenceWindows = useMemo(() => {
+    if (!studyData) return undefined;
+    const order: Plane[] = ['axial', 'sagittal', 'coronal'];
+    return order
+      .filter((p) => Boolean(studyData.volumes[p]) && !hiddenStudyPlanes.has(p))
+      .map((p) => {
+        const v = studyData.volumes[p]!;
+        return {
+          id: p,
+          label: p,
+          imageData: v.imageData,
+          header: v.header,
+        };
+      });
+  }, [studyData, hiddenStudyPlanes]);
 
   return (
     <div className="h-full flex">
@@ -471,6 +513,9 @@ export function MedicalImageViewer({
             onMeasurementAdd={handleMeasurementAdd}
             applyWeighting={applyWeighting}
             showCrosshair={showCrosshair}
+            sequenceWindows={sequenceWindows}
+            onWindowFocus={(plane) => setActiveStudyPlane(plane)}
+            onHideWindow={hideStudyPlane}
           />
         ) : (
           <div className="h-full flex items-center justify-center">
