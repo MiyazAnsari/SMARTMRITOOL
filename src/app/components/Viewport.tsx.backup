@@ -54,7 +54,6 @@ export function Viewport({
   const [isDragging, setIsDragging] = useState(false);
   const [isDrawing, setIsDrawing] = useState(false);
   const [drawingPoints, setDrawingPoints] = useState<{ x: number; y: number }[]>([]);
-  const [cursorPos, setCursorPos] = useState<{ x: number; y: number } | null>(null);
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
 
   // Pan state
@@ -445,28 +444,48 @@ export function Viewport({
 
       const points = measurement.points;
 
-      if (measurement.type === 'distance' && points.length >= 2) {
+      if ((measurement.type === 'distance' || measurement.type === 'line') && points.length >= 2) {
+        if (measurement.type === 'line') {
+          // Visualize the line as extending across the canvas to make tangent
+          // placement obvious.
+          const dx = points[1].x - points[0].x;
+          const dy = points[1].y - points[0].y;
+          const len = Math.hypot(dx, dy) || 1;
+          const ux = dx / len;
+          const uy = dy / len;
+          const big = (canvas.width + canvas.height) / dpr;
+          const a = { x: points[0].x - ux * big, y: points[0].y - uy * big };
+          const b = { x: points[1].x + ux * big, y: points[1].y + uy * big };
+          ctx.save();
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.stroke();
+          ctx.restore();
+        }
         ctx.beginPath();
         ctx.moveTo(points[0].x, points[0].y);
         ctx.lineTo(points[1].x, points[1].y);
         ctx.stroke();
-        
-        // Draw endpoints
+
         points.forEach(p => {
           ctx.beginPath();
           ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
           ctx.fill();
         });
-
-
-        const midX = (points[0].x + points[1].x) / 2;
-        const midY = (points[0].y + points[1].y) / 2;
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '12px sans-serif';
-        ctx.fillText(measurement.value || '', midX + 5, midY - 5);
-        ctx.fillStyle = '#3b82f6';
-
-
+      } else if (measurement.type === 'point' && points.length >= 1) {
+        const p = points[0];
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1;
+        ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.strokeStyle = '#3b82f6';
+        ctx.lineWidth = 2;
       } else if (measurement.type === 'angle' && points.length >= 3) {
         ctx.beginPath();
         ctx.moveTo(points[0].x, points[0].y);
@@ -479,14 +498,6 @@ export function Viewport({
           ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
           ctx.fill();
         });
-
-
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '12px sans-serif';
-        ctx.fillText(measurement.value || '', points[1].x + 8, points[1].y - 8);
-        ctx.fillStyle = '#3b82f6';
-
-        
       } else if (measurement.type === 'ellipse' && points.length >= 2) {
         const cx = (points[0].x + points[1].x) / 2;
         const cy = (points[0].y + points[1].y) / 2;
@@ -526,7 +537,6 @@ export function Viewport({
         ctx.beginPath();
         ctx.moveTo(drawingPoints[0].x, drawingPoints[0].y);
         drawingPoints.forEach(p => ctx.lineTo(p.x, p.y));
-        if (cursorPos) ctx.lineTo(cursorPos.x, cursorPos.y);
         ctx.stroke();
         
         drawingPoints.forEach(p => {
@@ -561,7 +571,7 @@ export function Viewport({
         ctx.stroke();
       }
     }
-  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool, cursorPos, showCrosshair]);
+  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool]);
 
   // Calculate measurement value
   const calculateMeasurementValue = (type: MeasurementTool, points: { x: number; y: number }[]): string => {
@@ -602,6 +612,15 @@ export function Viewport({
     } else if (activeTool === 'none') {
       setIsDragging(true);
       setDragStart({ x: e.clientX, y: e.clientY });
+    } else if (activeTool === 'point') {
+      // Single-click point primitive — emit immediately, no drag phase.
+      onMeasurementAdd({
+        id: Date.now().toString(),
+        type: 'point',
+        points: [{ x, y }],
+        slice: currentSlice,
+        plane,
+      });
     } else {
       setIsDrawing(true);
       setDrawingPoints([{ x, y }]);
@@ -684,13 +703,13 @@ export function Viewport({
     } else if (isDrawing) {
       if (activeTool === 'freehand') {
         setDrawingPoints(prev => [...prev, { x, y }]);
-      } else if (activeTool === 'ellipse') {
-        setDrawingPoints([drawingPoints[0], { x, y }]);
-      } else if (activeTool === 'distance' || activeTool === 'line') {
+      } else if (
+        activeTool === 'ellipse' ||
+        ((activeTool === 'distance' || activeTool === 'line') && drawingPoints.length === 1)
+      ) {
         setDrawingPoints([drawingPoints[0], { x, y }]);
       }
     }
-    setCursorPos({ x, y });
   };
 
   const handleMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -708,9 +727,38 @@ export function Viewport({
       setDragStart(null);
     } else if (isDrawing) {
       if (activeTool === 'distance' || activeTool === 'line') {
-        // handled by click
+        if (drawingPoints.length === 1) {
+          const points = [...drawingPoints, { x, y }];
+          const value = calculateMeasurementValue('distance', points);
+          onMeasurementAdd({
+            id: Date.now().toString(),
+            type: activeTool,
+            points,
+            slice: currentSlice,
+            plane,
+            value,
+          });
+          setIsDrawing(false);
+          setDrawingPoints([]);
+        }
       } else if (activeTool === 'angle') {
-        // handled by click
+        if (drawingPoints.length < 3) {
+          setDrawingPoints(prev => [...prev, { x, y }]);
+        }
+        if (drawingPoints.length === 2) {
+          const points = [...drawingPoints, { x, y }];
+          const value = calculateMeasurementValue('angle', points);
+          onMeasurementAdd({
+            id: Date.now().toString(),
+            type: 'angle',
+            points,
+            slice: currentSlice,
+            plane,
+            value,
+          });
+          setIsDrawing(false);
+          setDrawingPoints([]);
+        }
       } else if (activeTool === 'ellipse') {
         const points = [drawingPoints[0], { x, y }];
         const value = calculateMeasurementValue('ellipse', points);
@@ -741,53 +789,19 @@ export function Viewport({
   };
 
   const handleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const rect = overlayCanvasRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    if (activeTool === 'closedCurve' && isDrawing) {
+      const rect = overlayCanvasRef.current?.getBoundingClientRect();
+      if (!rect) return;
 
-    if (activeTool === 'distance' || activeTool === 'line') {
-      if (!isDrawing) {
-        setIsDrawing(true);
-        setDrawingPoints([{ x, y }]);
-      } else {
-        const points = [...drawingPoints, { x, y }];
-        const value = calculateMeasurementValue('distance', points);
-        onMeasurementAdd({
-          id: Date.now().toString(),
-          type: activeTool,
-          points,
-          slice: currentSlice,
-          plane,
-          value,
-        });
-        setIsDrawing(false);
-        setDrawingPoints([]);
-      }
-    } else if (activeTool === 'angle') {
-      if (!isDrawing) {
-        setIsDrawing(true);
-        setDrawingPoints([{ x, y }]);
-      } else if (drawingPoints.length === 1) {
-        setDrawingPoints(prev => [...prev, { x, y }]);
-      } else if (drawingPoints.length === 2) {
-        const points = [...drawingPoints, { x, y }];
-        const value = calculateMeasurementValue('angle', points);
-        onMeasurementAdd({
-          id: Date.now().toString(),
-          type: 'angle',
-          points,
-          slice: currentSlice,
-          plane,
-          value,
-        });
-        setIsDrawing(false);
-        setDrawingPoints([]);
-      }
-    } else if (activeTool === 'closedCurve' && isDrawing) {
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+
+      // Check if clicking near first point to close
       const firstPoint = drawingPoints[0];
       const dist = Math.sqrt((x - firstPoint.x) ** 2 + (y - firstPoint.y) ** 2);
+      
       if (dist < 10 && drawingPoints.length > 2) {
+        // Close the curve
         onMeasurementAdd({
           id: Date.now().toString(),
           type: 'closedCurve',
