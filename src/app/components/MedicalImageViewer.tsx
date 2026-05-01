@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import * as nifti from 'nifti-reader-js';
 import { ViewportGrid } from './ViewportGrid';
+import { Toolbar } from './Toolbar';
 import { WeightingPanel } from './WeightingPanel';
 import { Button } from './ui/button';
 import { RadioGroup, RadioGroupItem } from './ui/radio-group';
@@ -434,6 +435,15 @@ export function MedicalImageViewer({
 
   return (
     <div className="h-full flex">
+    <Toolbar
+        activeTool={activeTool}
+        onToolChange={setActiveTool}
+        measurements={measurements}
+        onMeasurementDelete={handleMeasurementDelete}
+        showCrosshair={showCrosshair}
+        onToggleCrosshair={() => setShowCrosshair(v => !v)}
+        onAutoWindowLevel={handleAutoWindowLevel}
+      />
       <div className="flex-1 flex flex-col min-h-0 relative">
         {loaded ? (
           <ViewportGrid

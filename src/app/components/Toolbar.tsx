@@ -35,7 +35,7 @@ export function Toolbar({ activeTool, onToolChange, measurements, onMeasurementD
   ];
 
   return (
-    <div className="bg-gray-900 border-r border-gray-800 flex flex-col">
+    <div className="bg-gray-900 border-r border-gray-800 flex flex-col w-48">
       <div className="p-4">
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-sm font-semibold text-gray-300">Measurement Tools</h2>
