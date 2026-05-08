@@ -708,9 +708,9 @@ export function Viewport({
     measurements.forEach((measurement) => {
       if (measurement.slice !== currentSlice) return;
 
-      ctx.strokeStyle = '#3b82f6';
-      ctx.fillStyle = '#3b82f6';
-      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#FFD700';
+      ctx.fillStyle = '#FFD700';
+      ctx.lineWidth = 1;
 
       const points = measurement.points;
 
@@ -787,9 +787,9 @@ export function Viewport({
 
     // Draw current drawing
     if (isDrawing && drawingPoints.length > 0) {
-      ctx.strokeStyle = '#60a5fa';
-      ctx.fillStyle = '#60a5fa';
-      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#FFD700';
+      ctx.fillStyle = '#FFD700';
+      ctx.lineWidth = 1;
 
       if (activeTool === 'distance' || activeTool === 'line' || activeTool === 'angle') {
         ctx.beginPath();
