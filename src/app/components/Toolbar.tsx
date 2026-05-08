@@ -3,9 +3,6 @@ import { Separator } from '@/app/components/ui/separator';
 import { 
   Ruler, 
   Triangle, 
-  Circle, 
-  Pentagon, 
-  Pencil,
   Trash2,
   MousePointer
 } from 'lucide-react';
@@ -29,9 +26,6 @@ export function Toolbar({ activeTool, onToolChange, measurements, onMeasurementD
     { id: 'none', icon: MousePointer, label: 'Select' },
     { id: 'distance', icon: Ruler, label: 'Distance' },
     { id: 'angle', icon: Triangle, label: 'Angle' },
-    { id: 'ellipse', icon: Circle, label: 'Ellipse' },
-    { id: 'closedCurve', icon: Pentagon, label: 'Polygon' },
-    { id: 'freehand', icon: Pencil, label: 'Freehand' },
   ];
 
   return (

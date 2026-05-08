@@ -570,26 +570,6 @@ export function MedicalImageViewer({
 
           <Button
             size="sm"
-            variant={activeTool === 'ellipse' ? 'default' : 'ghost'}
-            className={activeTool === 'ellipse' ? 'bg-blue-600 text-white' : 'text-gray-300'}
-            onClick={() => setActiveTool('ellipse')}
-            aria-label="Ellipse tool"
-          >
-            <CircleIcon className="h-4 w-4" />
-          </Button>
-
-          <Button
-            size="sm"
-            variant={activeTool === 'freehand' ? 'default' : 'ghost'}
-            className={activeTool === 'freehand' ? 'bg-blue-600 text-white' : 'text-gray-300'}
-            onClick={() => setActiveTool('freehand')}
-            aria-label="Freehand tool"
-          >
-            <Pencil className="h-4 w-4" />
-          </Button>
-
-          <Button
-            size="sm"
             variant={activeTool === 'pan' ? 'default' : 'ghost'}
             className={activeTool === 'pan' ? 'bg-blue-600 text-white' : 'text-gray-300'}
             onClick={() => setActiveTool(v => v === 'pan' ? 'none' : 'pan')}
