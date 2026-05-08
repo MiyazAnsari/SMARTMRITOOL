@@ -1,34 +1,44 @@
 import { useEffect, useRef, useState } from 'react';
 import { Viewport } from './Viewport';
 import type { WindowLevel, MeasurementTool, Measurement } from './MedicalImageViewer';
+import type { Plane } from './dicom/DicomLoader';
+
+export type ViewPlane = 'axial' | 'sagittal' | 'coronal';
+
+interface SequenceWindow {
+  id: Plane;
+  label: string;
+  imageData: Uint8Array;
+  header: any;
+}
 
 interface ViewportGridProps {
   imageData: Uint8Array;
   header: any;
   currentSlice: { axial: number; sagittal: number; coronal: number };
-  /** which planes are open in the center (multi-window) */
-  selectedPlanes?: Array<'axial' | 'sagittal' | 'coronal'>;
-  onClosePlane?: (plane: 'axial' | 'sagittal' | 'coronal') => void;
-  onSliceChange: (plane: 'axial' | 'sagittal' | 'coronal', slice: number) => void;
+  /** Single-view mode */
+  viewPlane: ViewPlane;
+  onSliceChange: (plane: Plane, slice: number) => void;
   windowLevel: WindowLevel;
   onWindowLevelChange: (wl: WindowLevel) => void;
   activeTool: MeasurementTool;
   measurements: Measurement[];
   onMeasurementAdd: (measurement: Measurement) => void;
   applyWeighting: (pixelValue: number) => number;
-  /** Show crosshair lines */
   showCrosshair?: boolean;
-  /** Signal to trigger tiling layout (increment to re-tile) */
-  tileSignal?: number;
-  layoutPreference?: 'auto' | 'row' | 'column' | 'grid';
+  /** Multi-sequence mode (study): one draggable window per sequence. */
+  sequenceWindows?: SequenceWindow[];
+  onWindowFocus?: (plane: Plane) => void;
+  onHideWindow?: (plane: Plane) => void;
 }
+
+type Rect = { top: number; left: number; width: number; height: number; z?: number };
 
 export function ViewportGrid({
   imageData,
   header,
   currentSlice,
-  selectedPlanes = ['axial'],
-  onClosePlane,
+  viewPlane,
   onSliceChange,
   windowLevel,
   onWindowLevelChange,
@@ -37,82 +47,79 @@ export function ViewportGrid({
   onMeasurementAdd,
   applyWeighting,
   showCrosshair = false,
-  tileSignal = 0,
-  layoutPreference = 'auto',
-}: ViewportGridProps & { tileSignal?: number }) {
-  // track positions and sizes for draggable & resizable windows
+  sequenceWindows,
+  onWindowFocus,
+  onHideWindow,
+}: ViewportGridProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const [positions, setPositions] = useState<Record<string, { top: number; left: number; width: number; height: number }>>({});
-  const draggingRef = useRef<{ id: string | null; startX: number; startY: number; origLeft: number; origTop: number } | null>(null);
-  const resizingRef = useRef<{ id: string | null; startX: number; startY: number; origW: number; origH: number } | null>(null);
-
-  // z-order counter for bringing windows to front
+  const [positions, setPositions] = useState<Record<string, Rect>>({});
   const zCounterRef = useRef<number>(100);
-
-  // Initialize positions for planes with size and z
-  useEffect(() => {
-    const defaults: Record<string, { top: number; left: number; width: number; height: number; z: number }> = {
-      axial: { top: 12, left: 12, width: 360, height: 360, z: 100 },
-      sagittal: { top: 12, left: 400, width: 360, height: 360, z: 101 },
-      coronal: { top: 12, left: 788, width: 360, height: 360, z: 102 },
-    };
-    setPositions(prev => {
-      const next = { ...prev };
-      selectedPlanes.forEach(p => {
-        if (!next[p]) next[p] = defaults[p];
-      });
-      return next;
-    });
-  }, [selectedPlanes]);
-
-  const GRID = 12; // snap grid in pixels
-  const MIN_W = 220;
-  const MIN_H = 180;
+  const draggingRef = useRef<{ id: string | null; startX: number; startY: number; left: number; top: number } | null>(null);
+  const resizingRef = useRef<{ id: string | null; startX: number; startY: number; width: number; height: number } | null>(null);
+  const GRID = 12;
+  const MIN_W = 260;
+  const MIN_H = 220;
 
   const snap = (n: number) => Math.round(n / GRID) * GRID;
 
+  const sequenceMode = sequenceWindows !== undefined;
+
+  useEffect(() => {
+    if (!sequenceWindows?.length) return;
+    const defaults: Record<Plane, Rect> = {
+      axial: { top: 12, left: 12, width: 420, height: 420, z: 100 },
+      sagittal: { top: 12, left: 460, width: 420, height: 420, z: 101 },
+      coronal: { top: 460, left: 12, width: 420, height: 420, z: 102 },
+    };
+    setPositions((prev) => {
+      const next = { ...prev };
+      sequenceWindows.forEach((w) => {
+        if (!next[w.id]) next[w.id] = defaults[w.id];
+      });
+      return next;
+    });
+  }, [sequenceWindows]);
+
   const bringToFront = (id: string) => {
     zCounterRef.current += 1;
-    setPositions(prev => ({ ...prev, [id]: { ...(prev[id] || {}), z: zCounterRef.current } }));
+    setPositions((prev) => ({ ...prev, [id]: { ...(prev[id] || {}), z: zCounterRef.current } }));
   };
 
-  const onHeaderMouseDown = (id: string, e: React.MouseEvent) => {
+  const startDrag = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
     bringToFront(id);
-    const containerRect = containerRef.current?.getBoundingClientRect();
-    if (!containerRect) return;
     const pos = positions[id];
     if (!pos) return;
-    draggingRef.current = { id, startX: e.clientX, startY: e.clientY, origLeft: pos.left, origTop: pos.top };
-
+    draggingRef.current = { id, startX: e.clientX, startY: e.clientY, left: pos.left, top: pos.top };
     const onMove = (ev: MouseEvent) => {
       if (!draggingRef.current) return;
       const d = draggingRef.current;
-      const dx = ev.clientX - d.startX;
-      const dy = ev.clientY - d.startY;
       const container = containerRef.current?.getBoundingClientRect();
       if (!container) return;
-      // clamp into container bounds and snap
-      const newLeft = Math.max(0, Math.min(container.width - (positions[id]?.width || MIN_W), d.origLeft + dx));
-      const newTop = Math.max(0, Math.min(container.height - (positions[id]?.height || MIN_H), d.origTop + dy));
-      setPositions(prev => ({ ...prev, [id]: { ...(prev[id] || {}), left: snap(newLeft), top: snap(newTop) } }));
+      const dx = ev.clientX - d.startX;
+      const dy = ev.clientY - d.startY;
+      const w = positions[d.id!]?.width || MIN_W;
+      const h = positions[d.id!]?.height || MIN_H;
+      const left = Math.max(0, Math.min(container.width - w, d.left + dx));
+      const top = Math.max(0, Math.min(container.height - h, d.top + dy));
+      setPositions((prev) => ({ ...prev, [d.id!]: { ...(prev[d.id!] || {}), left: snap(left), top: snap(top) } }));
     };
-
     const onUp = () => {
       draggingRef.current = null;
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
     };
-
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
   };
 
-  const onResizeMouseDown = (id: string, e: React.MouseEvent, direction: 'se' | 'e' | 's' = 'se') => {
+  const startResize = (id: string, e: React.MouseEvent) => {
+    e.preventDefault();
     e.stopPropagation();
+    bringToFront(id);
     const pos = positions[id];
     if (!pos) return;
-    resizingRef.current = { id, startX: e.clientX, startY: e.clientY, origW: pos.width, origH: pos.height };
-
+    resizingRef.current = { id, startX: e.clientX, startY: e.clientY, width: pos.width, height: pos.height };
     const onMove = (ev: MouseEvent) => {
       if (!resizingRef.current) return;
       const r = resizingRef.current;
@@ -120,190 +127,119 @@ export function ViewportGrid({
       if (!container) return;
       const dx = ev.clientX - r.startX;
       const dy = ev.clientY - r.startY;
-
-      let newW = r.origW;
-      let newH = r.origH;
-
-      if (direction === 'se' || direction === 'e') {
-        newW = Math.max(MIN_W, Math.min(container.width - (positions[r.id!]?.left || 0), r.origW + dx));
-      }
-      if (direction === 'se' || direction === 's') {
-        newH = Math.max(MIN_H, Math.min(container.height - (positions[r.id!]?.top || 0), r.origH + dy));
-      }
-
-      setPositions(prev => {
-        const cur = prev[r.id!] || { top: 0, left: 0, width: r.origW, height: r.origH };
-        if (direction === 'e') {
-          // Horizontal-only resize: update width only, preserve current height exactly
-          return { ...prev, [r.id!]: { ...cur, width: snap(newW) } };
-        }
-        if (direction === 's') {
-          // Vertical-only resize: update height only
-          return { ...prev, [r.id!]: { ...cur, height: snap(newH) } };
-        }
-        // 'se' diagonal: update both
-        return { ...prev, [r.id!]: { ...cur, width: snap(newW), height: snap(newH) } };
-      });
+      const left = positions[r.id!]?.left || 0;
+      const top = positions[r.id!]?.top || 0;
+      const width = Math.max(MIN_W, Math.min(container.width - left, r.width + dx));
+      const height = Math.max(MIN_H, Math.min(container.height - top, r.height + dy));
+      setPositions((prev) => ({ ...prev, [r.id!]: { ...(prev[r.id!] || {}), width: snap(width), height: snap(height) } }));
     };
-
     const onUp = () => {
       resizingRef.current = null;
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
     };
-
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
   };
 
-  const closePlane = (p: 'axial' | 'sagittal' | 'coronal') => {
-    onClosePlane?.(p);
-  };
+  if (!sequenceMode) {
+    const planeSlice =
+      viewPlane === 'axial' ? currentSlice.axial : viewPlane === 'sagittal' ? currentSlice.sagittal : currentSlice.coronal;
+    const planeMeasurements = measurements.filter((m) => m.plane === viewPlane);
 
-  // Tile windows when signaled: arrange in grid to fill container
-  useEffect(() => {
-    if (!containerRef.current) return;
-    const c = containerRef.current.getBoundingClientRect();
-    const open = selectedPlanes.length;
-    if (open === 0) return;
+    return (
+      <div ref={containerRef} className="flex-1 min-h-0 min-w-0 flex flex-col bg-gray-950 relative">
+        <div className="flex-1 min-h-0 p-2 flex flex-col">
+          <div className="flex-1 min-h-0 relative rounded-lg border border-gray-800 bg-gray-900 overflow-hidden shadow-lg">
+            <Viewport
+              imageData={imageData}
+              header={header}
+              plane={viewPlane}
+              currentSlice={planeSlice}
+              onSliceChange={(slice) => onSliceChange(viewPlane, slice)}
+              windowLevel={windowLevel}
+              onWindowLevelChange={onWindowLevelChange}
+              activeTool={activeTool}
+              measurements={planeMeasurements}
+              onMeasurementAdd={onMeasurementAdd}
+              applyWeighting={applyWeighting}
+              showCrosshair={showCrosshair}
+            />
+          </div>
+        </div>
+      </div>
+    );
+  }
 
-    let cols: number;
-    let rows: number;
-
-    // honor explicit user preference
-    if (layoutPreference === 'row') {
-      cols = open;
-      rows = 1;
-    } else if (layoutPreference === 'column') {
-      cols = 1;
-      rows = open;
-    } else if (layoutPreference === 'grid') {
-      cols = Math.ceil(Math.sqrt(open));
-      rows = Math.ceil(open / cols);
-    } else {
-      // auto: pick the grid (cols x rows) that minimizes wasted/free area
-      // between the fitted image (preserving aspect) and the tile rectangle.
-      // Enumerate candidate column counts from 1..open and pick the best.
-      const dims = header?.dims || [];
-
-      const planeImgSize = (plane: string) => {
-        // match logic in Viewport.getSliceData
-        const imgW = plane === 'sagittal' ? dims[2] : dims[1];
-        const imgH = plane === 'axial' ? dims[2] : dims[3];
-        return { imgW: Math.max(1, imgW || 1), imgH: Math.max(1, imgH || 1) };
-      };
-
-      let best: { cols: number; rows: number; free: number } | null = null;
-      const padding = 12;
-      const containerW = c.width;
-      const containerH = c.height;
-
-      for (let candidateCols = 1; candidateCols <= open; candidateCols++) {
-        const r = Math.ceil(open / candidateCols);
-
-        const candidateTileW = Math.max(MIN_W, Math.floor((containerW - (candidateCols + 1) * padding) / candidateCols));
-        const candidateTileH = Math.max(MIN_H, Math.floor((containerH - (r + 1) * padding) / r));
-
-        // sum wasted area across all selected planes
-        let totalFree = 0;
-        for (let i = 0; i < selectedPlanes.length; i++) {
-          const plane = selectedPlanes[i];
-          const { imgW, imgH } = planeImgSize(plane);
-          const scale = Math.min(candidateTileW / imgW, candidateTileH / imgH);
-          const displayW = imgW * scale;
-          const displayH = imgH * scale;
-          const free = Math.max(0, candidateTileW * candidateTileH - displayW * displayH);
-          totalFree += free;
-        }
-
-        if (!best || totalFree < best.free) best = { cols: candidateCols, rows: r, free: totalFree };
-      }
-
-      cols = best?.cols || 1;
-      rows = best?.rows || open;
-    }
-
-    const padding = 12;
-    const tileW = Math.max(MIN_W, Math.floor((c.width - (cols + 1) * padding) / cols));
-    const tileH = Math.max(MIN_H, Math.floor((c.height - (rows + 1) * padding) / rows));
-
-    const next: Record<string, { top: number; left: number; width: number; height: number }> = {};
-    // debug trace to help diagnose layout preference issues
-    console.debug('tiling:', { layoutPreference, open, cols, rows, containerW: c.width, containerH: c.height });
-    selectedPlanes.forEach((p, i) => {
-      const r = Math.floor(i / cols);
-      const col = i % cols;
-      const left = padding + col * (tileW + padding);
-      const top = padding + r * (tileH + padding);
-      next[p] = { top: snap(top), left: snap(left), width: snap(tileW), height: snap(tileH) };
-    });
-    setPositions(prev => ({ ...prev, ...next }));
-  }, [selectedPlanes, tileSignal, layoutPreference]);
+  if (!sequenceWindows.length) {
+    return (
+      <div ref={containerRef} className="flex-1 p-2 bg-gray-950 relative min-h-0 min-w-0 overflow-hidden">
+        <div className="w-full h-full rounded-lg border border-gray-800 bg-gray-900 flex items-center justify-center text-sm text-gray-400">
+          All sequences hidden. Click axial/sagittal/coronal on the right panel to show one again.
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div ref={containerRef} className="flex-1 p-2 bg-gray-950 flex items-stretch min-h-0 min-w-0 relative">
-      {selectedPlanes.map((plane) => {
-        const planeSlice = plane === 'axial' ? currentSlice.axial : plane === 'sagittal' ? currentSlice.sagittal : currentSlice.coronal;
-        const planeMeasurements = measurements.filter(m => m.plane === plane);
-        const pos = positions[plane] || { top: 12, left: 12, width: 360, height: 360 };
+    <div ref={containerRef} className="flex-1 p-2 bg-gray-950 relative min-h-0 min-w-0 overflow-hidden">
+      {sequenceWindows.map((w) => {
+        const pos = positions[w.id] || { top: 12, left: 12, width: 420, height: 420, z: 100 };
+        const sequenceSlice = currentSlice[w.id];
         return (
           <div
-            key={plane}
+            key={w.id}
             className="absolute bg-gray-900 border border-gray-800 rounded-lg shadow-lg overflow-hidden"
             style={{ top: pos.top, left: pos.left, width: pos.width, height: pos.height, zIndex: pos.z || 100 }}
-            onMouseDown={() => bringToFront(plane)}
+            onMouseDown={() => {
+              bringToFront(w.id);
+              onWindowFocus?.(w.id);
+            }}
           >
-            <div className="flex items-center justify-between px-2 py-1 bg-gray-800 border-b border-gray-700 cursor-move" onMouseDown={(e) => onHeaderMouseDown(plane, e)}>
-              <div className="text-xs text-gray-200 font-semibold capitalize">{plane}</div>
-              <div className="flex items-center space-x-2">
-                <button onClick={() => closePlane(plane)} className="text-xs text-gray-400 hover:text-red-400">✕</button>
+            <div
+              className="flex items-center justify-between px-2 py-1 bg-gray-800 border-b border-gray-700 cursor-move"
+              onMouseDown={(e) => startDrag(w.id, e)}
+            >
+              <div className="text-xs text-gray-200 font-semibold capitalize">{w.label}</div>
+              <div className="flex items-center gap-2">
+                <div className="text-[10px] text-gray-400">{w.header?.dims?.[3] || 0} slices</div>
+                <button
+                  type="button"
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onHideWindow?.(w.id);
+                  }}
+                  className="text-[11px] leading-none text-gray-300 hover:text-red-400"
+                  aria-label={`Hide ${w.label} sequence`}
+                  title={`Hide ${w.label}`}
+                >
+                  x
+                </button>
               </div>
             </div>
             <div className="w-full h-full relative">
-                <Viewport
-                imageData={imageData}
-                header={header}
-                plane={plane}
-                currentSlice={planeSlice}
-                onSliceChange={(slice) => onSliceChange(plane, slice)}
+              <Viewport
+                imageData={w.imageData}
+                header={w.header}
+                plane="axial"
+                currentSlice={sequenceSlice}
+                onSliceChange={(slice) => onSliceChange(w.id, slice)}
                 windowLevel={windowLevel}
                 onWindowLevelChange={onWindowLevelChange}
                 activeTool={activeTool}
-                measurements={planeMeasurements}
+                measurements={measurements.filter((m) => m.plane === 'axial')}
                 onMeasurementAdd={onMeasurementAdd}
                 applyWeighting={applyWeighting}
                 showCrosshair={showCrosshair}
-                  parentWindowHeight={pos.height}
+                parentWindowHeight={pos.height}
               />
-
-              {/* right resize handle */}
               <div
-                onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); onResizeMouseDown(plane, e, 'e'); }}
-                onTouchStart={(e) => { e.preventDefault(); e.stopPropagation(); onResizeMouseDown(plane, e as any, 'e'); }}
-                className="absolute right-0 top-1/2 -translate-y-1/2 w-6 h-12 cursor-ew-resize bg-transparent hover:bg-gray-700"
-                style={{ zIndex: (pos.z || 100) + 100, pointerEvents: 'auto' }}
-                aria-label={`Resize ${plane} window horizontally`}
+                onMouseDown={(e) => startResize(w.id, e)}
+                className="absolute w-10 h-10 cursor-se-resize bg-transparent hover:bg-gray-700"
+                style={{ right: -6, bottom: -6, zIndex: (pos.z || 100) + 10 }}
+                aria-label={`Resize ${w.label}`}
               />
-
-              {/* bottom resize handle */}
-              <div
-                onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); onResizeMouseDown(plane, e, 's'); }}
-                onTouchStart={(e) => { e.preventDefault(); e.stopPropagation(); onResizeMouseDown(plane, e as any, 's'); }}
-                className="absolute bottom-0 left-1/2 -translate-x-1/2 w-12 h-6 cursor-ns-resize bg-transparent hover:bg-gray-700"
-                style={{ zIndex: (pos.z || 100) + 100, pointerEvents: 'auto' }}
-                aria-label={`Resize ${plane} window vertically`}
-              />
-
-              {/* bottom-right diagonal handle (bigger and offset outside window edges for easier hit) */}
-              <div
-                onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); onResizeMouseDown(plane, e, 'se'); }}
-                onTouchStart={(e) => { e.preventDefault(); e.stopPropagation(); onResizeMouseDown(plane, e as any, 'se'); }}
-                className="absolute w-12 h-12 cursor-se-resize bg-transparent hover:bg-gray-700 flex items-center justify-center"
-                style={{ right: -8, bottom: -8, zIndex: (pos.z || 100) + 200, pointerEvents: 'auto' }}
-                aria-label={`Resize ${plane} window`}
-              >
-                <div className="w-3 h-3 rotate-45 bg-gray-400" />
-              </div>
             </div>
           </div>
         );

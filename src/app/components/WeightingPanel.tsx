@@ -20,9 +20,8 @@ interface WeightingPanelProps {
   /** Contrast mode: 'disk' (pregenerated) or 'gpu' (real-time) */
   contrastMode: 'disk' | 'gpu';
   onContrastModeChange: (mode: 'disk' | 'gpu') => void;
-  /** Selected planes (multi-select) */
-  selectedPlanes: Array<'axial' | 'sagittal' | 'coronal'>;
-  onPlanesChange: (planes: Array<'axial' | 'sagittal' | 'coronal'>) => void;
+  /** DICOM study: switch which native series is shown (click series badge). */
+  onStudyPlaneSelect?: (plane: Plane) => void;
   onFileLoad?: (data: ArrayBuffer, name: string) => void;
   onStudyLoad?: (study: DicomStudy) => void;
   studyData?: DicomStudy | null;
@@ -31,8 +30,6 @@ interface WeightingPanelProps {
   onWorkflowChange: (s: WorkflowState) => void;
   pixelSpacing: { x: number; y: number };
   onPlaneRequest?: (plane: Plane) => void;
-  layoutPreference?: 'auto' | 'row' | 'column' | 'grid';
-  onLayoutPreferenceChange?: (p: 'auto' | 'row' | 'column' | 'grid') => void;
   onOverflowChange?: (overflowing: boolean) => void;
 }
 
@@ -43,8 +40,7 @@ export function WeightingPanel({
   onCustomWeightingChange,
   contrastMode,
   onContrastModeChange,
-  selectedPlanes,
-  onPlanesChange,
+  onStudyPlaneSelect,
   onFileLoad,
   onStudyLoad,
   studyData,
@@ -53,14 +49,10 @@ export function WeightingPanel({
   onWorkflowChange,
   pixelSpacing,
   onPlaneRequest,
-  layoutPreference = 'auto',
-  onLayoutPreferenceChange,
   onOverflowChange,
 }: WeightingPanelProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const controlsRef = useRef<HTMLDivElement | null>(null);
-  const openPlanesRef = useRef<HTMLDivElement | null>(null);
-  const placementRef = useRef<HTMLDivElement | null>(null);
   const measureRef = useRef<HTMLDivElement | null>(null);
   const [isOverflowing, setIsOverflowing] = useState(false);
   const prevOverflowRef = useRef<boolean>(false);
@@ -98,8 +90,7 @@ export function WeightingPanel({
         // ignore
       }
 
-      // Use the off-screen clone's scrollHeight to determine the intrinsic
-      // height of the sections we may move (Open Planes + Window Placement).
+      // Off-screen measure node (reserved for future movable sections).
       // We want to decide whether to move those sections out of the sidebar
       // into the bottom toolbar. When computing the thresholds we compare the
       // full container height (when kept) against the available height, and
@@ -107,56 +98,21 @@ export function WeightingPanel({
       const movedSectionsH_offscreen = measure.scrollHeight || measure.getBoundingClientRect().height;
       const containerScrollH = el.scrollHeight || el.getBoundingClientRect().height;
 
-      // If the movable sections are currently present in the DOM, measure
-      // their actual combined height (openPlanes + placement). Use the larger
+      // If the movable section is currently present in the DOM, measure
+      // its actual height. Use the larger
       // of the measured-offscreen height and the live DOM height as a
       // conservative estimate for how much space they'd consume when kept
       // in the sidebar.
       // Prefer live DOM measurement when sections exist; otherwise fall back
       // to the off-screen template sections inside `measureRef` for a reliable
       // estimate that matches styling.
-      let openH = 0;
-      let placeH = 0;
-      if (openPlanesRef.current) {
-        openH = openPlanesRef.current.scrollHeight || openPlanesRef.current.getBoundingClientRect().height;
-      } else if (measure) {
-        const node = measure.querySelector('[data-section="openPlanes"]') as HTMLElement | null;
-        openH = node ? (node.scrollHeight || node.getBoundingClientRect().height) : 0;
-      }
-      if (placementRef.current) {
-        placeH = placementRef.current.scrollHeight || placementRef.current.getBoundingClientRect().height;
-      } else if (measure) {
-        const node = measure.querySelector('[data-section="placement"]') as HTMLElement | null;
-        placeH = node ? (node.scrollHeight || node.getBoundingClientRect().height) : 0;
-      }
-      const movedSectionsH_live = Math.max(0, openH + placeH);
+      const movedSectionsH_live = 0;
       const movedSectionsH = Math.max(movedSectionsH_offscreen, movedSectionsH_live);
 
       // Determine whether the movable sections are currently visible (not moved)
-      const openVisible = openPlanesRef.current ? window.getComputedStyle(openPlanesRef.current).display !== 'none' : false;
-      const placeVisible = placementRef.current ? window.getComputedStyle(placementRef.current).display !== 'none' : false;
-      const movableVisible = openVisible || placeVisible;
+      const movableVisible = false;
 
-      // Robust measurement strategy:
-      // - Prefer live measurements for the movable sections (including margins)
-      // - Fall back to the off-screen template's scrollHeight as a conservative
-      //   upper-bound if live nodes aren't present
-      const measureWithMargins = (node: HTMLElement | null) => {
-        if (!node) return 0;
-        try {
-          const rectH = node.getBoundingClientRect().height || 0;
-          const style = window.getComputedStyle(node);
-          const mt = parseFloat(style.marginTop || '0') || 0;
-          const mb = parseFloat(style.marginBottom || '0') || 0;
-          return Math.ceil(rectH + mt + mb);
-        } catch (e) {
-          return Math.ceil(node.getBoundingClientRect().height || 0);
-        }
-      };
-
-      const openLiveH = openPlanesRef.current ? measureWithMargins(openPlanesRef.current) : 0;
-      const placeLiveH = placementRef.current ? measureWithMargins(placementRef.current) : 0;
-      const movedSectionsH_live_measure = Math.max(0, openLiveH + placeLiveH);
+      const movedSectionsH_live_measure = 0;
 
       // offscreen template conservative estimate (includes spacing in template)
       const movedSectionsH_offscreen_measure = measure ? (measure.scrollHeight || measure.getBoundingClientRect().height) : 0;
@@ -329,16 +285,6 @@ export function WeightingPanel({
       window.removeEventListener('orientationchange', check);
     };
   }, [onOverflowChange, weighting, customWeighting.psi]);
-  const togglePlane = (p: 'axial' | 'sagittal' | 'coronal') => {
-    if (selectedPlanes.includes(p)) {
-      onPlanesChange(selectedPlanes.filter(x => x !== p));
-    } else {
-      onPlanesChange([...selectedPlanes, p]);
-    }
-  };
-
-  const isPlaneSelected = (p: 'axial' | 'sagittal' | 'coronal') => selectedPlanes.includes(p);
-
   return (
     <div ref={containerRef} className="bg-gray-900 border-l border-gray-800 p-4 overflow-y-auto h-full">
       <div className="mb-4">
@@ -352,20 +298,31 @@ export function WeightingPanel({
         {studyData && (
           <div className="mt-2 text-[10px] text-gray-400">
             Loaded study: <span className="text-gray-200">{studyData.studyName}</span>
-            <div className="mt-0.5">
-              Series:{' '}
-              {(['axial', 'sagittal', 'coronal'] as Plane[])
-                .filter((p) => studyData.volumes[p])
-                .map((p) => (
-                  <span
-                    key={p}
-                    className={`inline-block mr-1 px-1.5 py-0.5 rounded ${
-                      activeStudyPlane === p ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'
-                    }`}
-                  >
-                    {p}
-                  </span>
-                ))}
+            <div className="mt-1">
+              <div className="mb-1 text-gray-500">Select sequence to view:</div>
+              <div className="flex flex-wrap gap-1">
+                {(['axial', 'sagittal', 'coronal'] as Plane[]).map((p) => {
+                  const exists = Boolean(studyData.volumes[p]);
+                  const active = activeStudyPlane === p;
+                  return (
+                    <button
+                      key={p}
+                      type="button"
+                      onClick={() => onStudyPlaneSelect?.(p)}
+                      className={`px-2 py-0.5 rounded capitalize border ${
+                        active
+                          ? 'bg-blue-600 text-white border-blue-500'
+                          : exists
+                            ? 'bg-gray-800 text-gray-200 border-gray-700 hover:bg-gray-700'
+                            : 'bg-gray-900 text-gray-500 border-gray-800'
+                      }`}
+                      title={exists ? `Load ${p} sequence` : `${p} sequence not loaded`}
+                    >
+                      {p}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           </div>
         )}
@@ -393,29 +350,6 @@ export function WeightingPanel({
           </div>
         </RadioGroup>
       </div>
-
-      {!isOverflowing && (
-        <div className="mb-4" ref={openPlanesRef}>
-          <h3 className="text-sm font-semibold text-gray-300 mb-2">Open Planes</h3>
-          <div className="flex flex-wrap gap-2">
-            <button onClick={() => togglePlane('axial')} className={`px-3 py-1 rounded ${isPlaneSelected('axial') ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Axial</button>
-            <button onClick={() => togglePlane('sagittal')} className={`px-3 py-1 rounded ${isPlaneSelected('sagittal') ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Sagittal</button>
-            <button onClick={() => togglePlane('coronal')} className={`px-3 py-1 rounded ${isPlaneSelected('coronal') ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Coronal</button>
-          </div>
-        </div>
-      )}
-
-      {!isOverflowing && (
-        <div className="mb-4" ref={placementRef}>
-          <h3 className="text-sm font-semibold text-gray-300 mb-2">Window Placement</h3>
-          <div className="flex flex-wrap gap-2">
-            <button type="button" onClick={() => onLayoutPreferenceChange?.('auto')} className={`px-2 py-1 rounded ${layoutPreference === 'auto' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Auto</button>
-            <button type="button" onClick={() => onLayoutPreferenceChange?.('row')} className={`px-2 py-1 rounded ${layoutPreference === 'row' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Row</button>
-            <button type="button" onClick={() => onLayoutPreferenceChange?.('column')} className={`px-2 py-1 rounded ${layoutPreference === 'column' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Column</button>
-            <button type="button" onClick={() => onLayoutPreferenceChange?.('grid')} className={`px-2 py-1 rounded ${layoutPreference === 'grid' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300'}`}>Grid</button>
-          </div>
-        </div>
-      )}
 
       <div className="space-y-4">
       <div ref={controlsRef}>
@@ -446,25 +380,7 @@ export function WeightingPanel({
             </RadioGroup>
           </div>
         </div>
-        {/* Off-screen clone used for accurate measurement of the sections we may move (Open Planes + Window Placement) */}
-        <div ref={measureRef} style={{ position: 'absolute', left: -9999, top: -9999, visibility: 'hidden', pointerEvents: 'none', width: '200px' }} aria-hidden>
-          <div data-section="openPlanes" className="bg-gray-800 p-3 rounded-lg border border-gray-700">
-            <div className="flex flex-wrap gap-2">
-              <div className="px-3 py-1 rounded bg-gray-800 text-gray-300">Axial</div>
-              <div className="px-3 py-1 rounded bg-gray-800 text-gray-300">Sagittal</div>
-              <div className="px-3 py-1 rounded bg-gray-800 text-gray-300">Coronal</div>
-            </div>
-          </div>
-          <div style={{ height: 8 }} />
-          <div data-section="placement" className="bg-gray-800 p-3 rounded-lg border border-gray-700">
-            <div className="flex flex-wrap gap-2">
-              <div className="px-2 py-1 rounded bg-gray-800 text-gray-300">Auto</div>
-              <div className="px-2 py-1 rounded bg-gray-800 text-gray-300">Row</div>
-              <div className="px-2 py-1 rounded bg-gray-800 text-gray-300">Column</div>
-              <div className="px-2 py-1 rounded bg-gray-800 text-gray-300">Grid</div>
-            </div>
-          </div>
-        </div>
+        <div ref={measureRef} style={{ position: 'absolute', left: -9999, top: -9999, visibility: 'hidden', pointerEvents: 'none', width: '200px' }} aria-hidden />
 
         {weighting === 'Custom' && (
           <>

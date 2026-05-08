@@ -7,9 +7,9 @@ import { Button } from './ui/button';
 import { RadioGroup, RadioGroupItem } from './ui/radio-group';
 import { Slider } from './ui/slider';
 import { Label } from './ui/label';
-import { MousePointer, Circle as CircleIcon, Pencil, Layout, Move } from 'lucide-react';
+import { MousePointer, Circle as CircleIcon, Pencil, Move } from 'lucide-react';
 import type { DicomStudy } from './dicom/DicomStudy';
-import type { Plane } from './dicom/DicomLoader';
+import type { DicomVolume, Plane } from './dicom/DicomLoader';
 import {
   initialWorkflowState,
   recordStepResult,
@@ -19,6 +19,15 @@ import {
   getProtocol,
   Primitive,
 } from './measurement/MeasurementProtocols';
+
+function preferredAvailablePlane(volumes: Partial<Record<Plane, DicomVolume>>): Plane | null {
+  const order: Plane[] = ['axial', 'sagittal', 'coronal'];
+  for (const p of order) {
+    if (volumes[p]) return p;
+  }
+  const keys = Object.keys(volumes) as Plane[];
+  return keys[0] ?? null;
+}
 
 export interface MedicalImageViewerProps {
   niftiData?: ArrayBuffer | null;
@@ -91,13 +100,11 @@ export function MedicalImageViewer({
   const [dataRange, setDataRange] = useState<{ min: number; max: number }>({ min: 0, max: 255 });
   const [currentSlice, setCurrentSlice] = useState({ axial: 0, sagittal: 0, coronal: 0 });
   const [windowLevel, setWindowLevel] = useState<WindowLevel>({ window: 400, level: 40 });
-  const [activeTool, setActiveTool] = useState<MeasurementTool>('none');
+  const [activeTool, setActiveTool] = useState<MeasurementTool>('pan');
   const [measurements, setMeasurements] = useState<Measurement[]>([]);
   const [weighting, setWeighting] = useState<WeightingType>('T1');
   // single psi slider for custom weighting (0-180 degrees)
   const [customWeighting, setCustomWeighting] = useState({ psi: 90 });
-  // Which planes are currently open in the center (multi-window)
-  const [selectedPlanes, setSelectedPlanes] = useState<Array<'axial' | 'sagittal' | 'coronal'>>(['axial']);
   // Processing mode for contrasts
   const [contrastMode, setContrastMode] = useState<'disk' | 'gpu'>('disk');
   // UI helpers
@@ -105,15 +112,12 @@ export function MedicalImageViewer({
   // resizable right panel width (px)
   const [rightWidth, setRightWidth] = useState<number>(288); // default w-72 (18rem)
   const rightResizing = useRef(false);
-  // tiling signal for ViewportGrid
-  const [tileSignal, setTileSignal] = useState<number>(0);
-  const [layoutPreference, setLayoutPreference] = useState<'auto' | 'row' | 'column' | 'grid'>('auto');
-  const [rightPanelOverflow, setRightPanelOverflow] = useState(false);
   // Measurement workflow (TT-TG, Insall–Salvati, etc.)
   const [workflow, setWorkflow] = useState<WorkflowState>(initialWorkflowState);
-  // In study mode we drive `imageData/header` from the volume that matches the
-  // currently-active plane so each measurement uses its native acquisition.
+  /** Which DICOM series is loaded (native acquisition). Independent from Open Planes (MPR view). */
   const [activeStudyPlane, setActiveStudyPlane] = useState<Plane>('axial');
+  const [hiddenStudyPlanes, setHiddenStudyPlanes] = useState<Set<Plane>>(new Set());
+  const prevStudyDataRef = useRef<DicomStudy | null>(null);
 
   const protocol = useMemo(() => getProtocol(workflow.protocolId), [workflow.protocolId]);
   const activeStep = protocol?.steps[workflow.activeStepIndex] ?? null;
@@ -228,33 +232,85 @@ export function MedicalImageViewer({
     }
   }, [niftiData]);
 
-  // Load a DICOM volume from the study into the viewer when:
-  //   a) a study is loaded, and
-  //   b) the active study plane changes (e.g. the user picked a measurement
-  //      whose required plane differs from the one currently shown).
   useEffect(() => {
-    if (!studyData) return;
-    const vol = studyData.volumes[activeStudyPlane];
-    if (!vol) {
-      // Fallback: show whichever plane the study DOES have
-      const fallbackPlane = (Object.keys(studyData.volumes) as Plane[])[0];
-      if (fallbackPlane) setActiveStudyPlane(fallbackPlane);
+    if (studyData != null) return;
+    setActiveStudyPlane('axial');
+  }, [studyData]);
+
+  // Load pixels from the active DICOM series. Viewer behavior stays axial-like for all sequences.
+  useEffect(() => {
+    if (!studyData) {
+      prevStudyDataRef.current = null;
+      setHiddenStudyPlanes(new Set());
       return;
     }
+
+    if (prevStudyDataRef.current !== studyData) {
+      prevStudyDataRef.current = studyData;
+      setHiddenStudyPlanes(new Set());
+      setCurrentSlice({
+        axial: studyData.volumes.axial ? Math.floor(studyData.volumes.axial.sliceCount / 2) : 0,
+        sagittal: studyData.volumes.sagittal ? Math.floor(studyData.volumes.sagittal.sliceCount / 2) : 0,
+        coronal: studyData.volumes.coronal ? Math.floor(studyData.volumes.coronal.sliceCount / 2) : 0,
+      });
+    }
+
+    let plane: Plane = activeStudyPlane;
+    let vol = studyData.volumes[plane];
+    if (!vol) {
+      const p = preferredAvailablePlane(studyData.volumes);
+      if (!p) return;
+      plane = p;
+      vol = studyData.volumes[p]!;
+      setActiveStudyPlane(plane);
+    }
+
     setHeader(vol.header);
     setImageData(vol.imageData);
     setDataRange(vol.dataRange);
     setWindowLevel(vol.defaultWindowLevel);
-    setCurrentSlice({
-      axial: 0,
-      sagittal: 0,
-      coronal: 0,
-      [activeStudyPlane]: Math.floor(vol.sliceCount / 2),
-    } as { axial: number; sagittal: number; coronal: number });
-    // In study mode, only the active plane is shown — each plane has its own
-    // native acquisition and we don't reformat across volumes.
-    setSelectedPlanes([activeStudyPlane]);
   }, [studyData, activeStudyPlane]);
+
+  const selectStudyPlane = useCallback(
+    (plane: Plane) => {
+      if (!studyData) return;
+      if (!studyData.volumes[plane]) {
+        alert(
+          `This study does not contain a ${plane} series. Available: ${Object.keys(
+            studyData.volumes,
+          ).join(', ') || 'none'}.`,
+        );
+        return;
+      }
+      setActiveStudyPlane(plane);
+      setHiddenStudyPlanes((prev) => {
+        if (!prev.has(plane)) return prev;
+        const next = new Set(prev);
+        next.delete(plane);
+        return next;
+      });
+    },
+    [studyData],
+  );
+
+  const hideStudyPlane = useCallback(
+    (plane: Plane) => {
+      if (!studyData?.volumes[plane]) return;
+      setHiddenStudyPlanes((prev) => {
+        if (prev.has(plane)) return prev;
+        const next = new Set(prev);
+        next.add(plane);
+        return next;
+      });
+
+      if (activeStudyPlane === plane) {
+        const order: Plane[] = ['axial', 'sagittal', 'coronal'];
+        const replacement = order.find((p) => p !== plane && studyData.volumes[p] && !hiddenStudyPlanes.has(p));
+        if (replacement) setActiveStudyPlane(replacement);
+      }
+    },
+    [studyData, activeStudyPlane, hiddenStudyPlanes],
+  );
 
   const handleSliceChange = useCallback((plane: 'axial' | 'sagittal' | 'coronal', slice: number) => {
     setCurrentSlice(prev => ({ ...prev, [plane]: slice }));
@@ -273,21 +329,10 @@ export function MedicalImageViewer({
   /** Switch the active plane (and DICOM volume) the workflow is asking for. */
   const handlePlaneRequest = useCallback(
     (plane: Plane) => {
-      if (studyData) {
-        if (studyData.volumes[plane]) {
-          setActiveStudyPlane(plane);
-        } else {
-          alert(
-            `This study does not contain a ${plane} series. Available: ${Object.keys(
-              studyData.volumes,
-            ).join(', ') || 'none'}.`,
-          );
-        }
-      } else {
-        setSelectedPlanes([plane]);
-      }
+      if (studyData) selectStudyPlane(plane);
+      // NIfTI / axial-only viewer: ignore sagittal/coronal view requests until plane switching is restored.
     },
-    [studyData],
+    [studyData, selectStudyPlane],
   );
 
   const handleWindowLevelChange = useCallback((wl: WindowLevel) => {
@@ -353,12 +398,16 @@ export function MedicalImageViewer({
     setMeasurements(prev => prev.filter(m => m.id !== id));
   }, []);
 
+  // Always render with axial interaction/view behavior regardless of which
+  // sequence (A/S/C) is loaded. Sequence identity is shown in metadata labels.
+  const currentViewPlane: Plane = 'axial';
+  const activeVolumeMeta = studyData ? studyData.volumes[activeStudyPlane] : null;
+
   const handleAutoWindowLevel = useCallback(() => {
     if (!imageData || !header) return;
     const dims = header.dims;
 
-    // Use the first selected plane as the primary context for Auto WL
-    const plane = selectedPlanes.length > 0 ? selectedPlanes[0] : 'axial';
+    const plane = currentViewPlane;
     const sliceIndex = plane === 'axial' ? currentSlice.axial : plane === 'sagittal' ? currentSlice.sagittal : currentSlice.coronal;
 
     let min = Infinity;
@@ -404,7 +453,7 @@ export function MedicalImageViewer({
     const level = Math.round((min + max) / 2);
 
     setWindowLevel({ window, level });
-  }, [imageData, header, selectedPlanes, currentSlice]);
+  }, [imageData, header, currentSlice, currentViewPlane]);
 
   const applyWeighting = useCallback((pixelValue: number): number => {
     // DREAMER algorithm simulation - in reality this would be much more complex
@@ -432,6 +481,21 @@ export function MedicalImageViewer({
   }, [weighting, customWeighting]);
 
   const loaded = Boolean(imageData && header);
+  const sequenceWindows = useMemo(() => {
+    if (!studyData) return undefined;
+    const order: Plane[] = ['axial', 'sagittal', 'coronal'];
+    return order
+      .filter((p) => Boolean(studyData.volumes[p]) && !hiddenStudyPlanes.has(p))
+      .map((p) => {
+        const v = studyData.volumes[p]!;
+        return {
+          id: p,
+          label: p,
+          imageData: v.imageData,
+          header: v.header,
+        };
+      });
+  }, [studyData, hiddenStudyPlanes]);
 
   return (
     <div className="h-full flex">
@@ -450,10 +514,7 @@ export function MedicalImageViewer({
             imageData={imageData!}
             header={header!}
             currentSlice={currentSlice}
-            selectedPlanes={selectedPlanes}
-            tileSignal={tileSignal}
-            layoutPreference={layoutPreference}
-            onClosePlane={(p) => setSelectedPlanes(prev => prev.filter(x => x !== p))}
+            viewPlane={currentViewPlane}
             onSliceChange={handleSliceChange}
             windowLevel={windowLevel}
             onWindowLevelChange={handleWindowLevelChange}
@@ -462,6 +523,9 @@ export function MedicalImageViewer({
             onMeasurementAdd={handleMeasurementAdd}
             applyWeighting={applyWeighting}
             showCrosshair={showCrosshair}
+            sequenceWindows={sequenceWindows}
+            onWindowFocus={(plane) => setActiveStudyPlane(plane)}
+            onHideWindow={hideStudyPlane}
           />
         ) : (
           <div className="h-full flex items-center justify-center">
@@ -475,7 +539,24 @@ export function MedicalImageViewer({
           </div>
         )}
 
-        {/* Floating bottom-right tool bar (select, ellipse, freehand, auto WL, tile) */}
+        {studyData && (
+          <div className="absolute top-2 left-2 z-20 bg-black/60 border border-gray-700 rounded px-2 py-1 text-[10px] text-gray-200">
+            <div>
+              Patient: <span className="text-gray-100">{studyData.patientId || 'unknown-patient'}</span>
+              {' · '}
+              {studyData.patientName || 'Unknown Patient'}
+            </div>
+            <div>
+              Study: <span className="text-gray-100">{studyData.studyName}</span>
+            </div>
+            <div>
+              Sequence: <span className="text-gray-100 capitalize">{activeStudyPlane}</span>
+              {activeVolumeMeta?.seriesDescription ? ` (${activeVolumeMeta.seriesDescription})` : ''}
+            </div>
+          </div>
+        )}
+
+        {/* Floating bottom-right tool bar (select, ellipse, freehand, auto WL) */}
         <div className="absolute bottom-4 right-4 flex items-center space-x-2" style={{ zIndex: 9999 }}>
           <Button
             size="sm"
@@ -527,33 +608,6 @@ export function MedicalImageViewer({
             Auto WL
           </Button>
 
-          {/* If right panel overflowed, render Open Planes + Window Placement into the bottom menu */}
-          {rightPanelOverflow && (
-            <div className="flex items-center space-x-4">
-              <div className="flex items-center space-x-2">
-                <Button size="sm" variant={selectedPlanes.includes('axial') ? 'default' : 'ghost'} className={selectedPlanes.includes('axial') ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => setSelectedPlanes(prev => prev.includes('axial') ? prev.filter(p => p !== 'axial') : [...prev, 'axial'])}>Axial</Button>
-                <Button size="sm" variant={selectedPlanes.includes('sagittal') ? 'default' : 'ghost'} className={selectedPlanes.includes('sagittal') ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => setSelectedPlanes(prev => prev.includes('sagittal') ? prev.filter(p => p !== 'sagittal') : [...prev, 'sagittal'])}>Sagittal</Button>
-                <Button size="sm" variant={selectedPlanes.includes('coronal') ? 'default' : 'ghost'} className={selectedPlanes.includes('coronal') ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => setSelectedPlanes(prev => prev.includes('coronal') ? prev.filter(p => p !== 'coronal') : [...prev, 'coronal'])}>Coronal</Button>
-              </div>
-
-              <div className="flex items-center space-x-2">
-                <Button size="sm" variant={layoutPreference === 'auto' ? 'default' : 'ghost'} className={layoutPreference === 'auto' ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => { setLayoutPreference('auto'); setTileSignal(s => s + 1); }}>Auto</Button>
-                <Button size="sm" variant={layoutPreference === 'row' ? 'default' : 'ghost'} className={layoutPreference === 'row' ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => { setLayoutPreference('row'); setTileSignal(s => s + 1); }}>Row</Button>
-                <Button size="sm" variant={layoutPreference === 'column' ? 'default' : 'ghost'} className={layoutPreference === 'column' ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => { setLayoutPreference('column'); setTileSignal(s => s + 1); }}>Column</Button>
-                <Button size="sm" variant={layoutPreference === 'grid' ? 'default' : 'ghost'} className={layoutPreference === 'grid' ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => { setLayoutPreference('grid'); setTileSignal(s => s + 1); }}>Grid</Button>
-              </div>
-            </div>
-          )}
-
-          <Button
-            size="sm"
-            variant="ghost"
-            className="text-gray-300"
-            onClick={() => setTileSignal(s => s + 1)}
-            aria-label="Tile windows"
-          >
-            <Layout className="h-4 w-4" />
-          </Button>
         </div>
       </div>
       {/* right resizer: larger interactive hit area with thin visual line */}
@@ -578,8 +632,7 @@ export function MedicalImageViewer({
           onCustomWeightingChange={(p) => setCustomWeighting(p)}
           contrastMode={contrastMode}
           onContrastModeChange={(m) => setContrastMode(m)}
-          selectedPlanes={selectedPlanes}
-          onPlanesChange={(planes) => setSelectedPlanes(planes)}
+          onStudyPlaneSelect={selectStudyPlane}
           onFileLoad={onFileLoad}
           onStudyLoad={onStudyLoad}
           studyData={studyData}
@@ -588,13 +641,6 @@ export function MedicalImageViewer({
           onWorkflowChange={setWorkflow}
           pixelSpacing={pixelSpacing}
           onPlaneRequest={handlePlaneRequest}
-          layoutPreference={layoutPreference}
-          onLayoutPreferenceChange={(p) => {
-            setLayoutPreference(p);
-            // ensure layoutPreference state updates propagate before tiling runs
-            setTimeout(() => setTileSignal(s => s + 1), 0);
-          }}
-          onOverflowChange={(v) => setRightPanelOverflow(v)}
         />
       </div>
     </div>
