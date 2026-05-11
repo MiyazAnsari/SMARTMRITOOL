@@ -20,11 +20,9 @@ interface ToolbarProps {
   /** show/hide crosshair in viewport */
   showCrosshair: boolean;
   onToggleCrosshair: () => void;
-  /** compute auto window/level for current slice */
-  onAutoWindowLevel: () => void;
 }
 
-export function Toolbar({ activeTool, onToolChange, measurements, onMeasurementDelete, showCrosshair, onToggleCrosshair, onAutoWindowLevel }: ToolbarProps) {
+export function Toolbar({ activeTool, onToolChange, measurements, onMeasurementDelete, showCrosshair, onToggleCrosshair }: ToolbarProps) {
   const tools: { id: MeasurementTool; icon: any; label: string }[] = [
     { id: 'none', icon: MousePointer, label: 'Select' },
     { id: 'distance', icon: Ruler, label: 'Distance' },
@@ -47,14 +45,6 @@ export function Toolbar({ activeTool, onToolChange, measurements, onMeasurementD
               onClick={() => onToggleCrosshair()}
             >
               Crosshair
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              className="text-gray-300"
-              onClick={() => onAutoWindowLevel()}
-            >
-              Auto WL
             </Button>
           </div>
         </div>

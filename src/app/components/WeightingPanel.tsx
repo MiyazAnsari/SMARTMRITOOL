@@ -20,8 +20,10 @@ interface WeightingPanelProps {
   /** Contrast mode: 'disk' (pregenerated) or 'gpu' (real-time) */
   contrastMode: 'disk' | 'gpu';
   onContrastModeChange: (mode: 'disk' | 'gpu') => void;
-  /** DICOM study: switch which native series is shown (click series badge). */
-  onStudyPlaneSelect?: (plane: Plane) => void;
+  /** DICOM: which viewers are open (must match `MedicalImageViewer` studyViewport.open). */
+  openStudyPlanes?: Plane[];
+  /** DICOM: toggle viewer open/closed (same behavior as viewer “x”). */
+  onStudyPlaneToggle?: (plane: Plane) => void;
   onFileLoad?: (data: ArrayBuffer, name: string) => void;
   onStudyLoad?: (study: DicomStudy) => void;
   studyData?: DicomStudy | null;
@@ -40,7 +42,8 @@ export function WeightingPanel({
   onCustomWeightingChange,
   contrastMode,
   onContrastModeChange,
-  onStudyPlaneSelect,
+  openStudyPlanes,
+  onStudyPlaneToggle,
   onFileLoad,
   onStudyLoad,
   studyData,
@@ -299,24 +302,38 @@ export function WeightingPanel({
           <div className="mt-2 text-[10px] text-gray-400">
             Loaded study: <span className="text-gray-200">{studyData.studyName}</span>
             <div className="mt-1">
-              <div className="mb-1 text-gray-500">Select sequence to view:</div>
+              <div className="mb-1 text-gray-500">Viewers (click to show / hide):</div>
               <div className="flex flex-wrap gap-1">
                 {(['axial', 'sagittal', 'coronal'] as Plane[]).map((p) => {
                   const exists = Boolean(studyData.volumes[p]);
-                  const active = activeStudyPlane === p;
+                  const isOpen = openStudyPlanes?.includes(p) ?? false;
+                  const isFocused = activeStudyPlane === p;
                   return (
                     <button
                       key={p}
                       type="button"
-                      onClick={() => onStudyPlaneSelect?.(p)}
-                      className={`px-2 py-0.5 rounded capitalize border ${
-                        active
-                          ? 'bg-blue-600 text-white border-blue-500'
-                          : exists
-                            ? 'bg-gray-800 text-gray-200 border-gray-700 hover:bg-gray-700'
-                            : 'bg-gray-900 text-gray-500 border-gray-800'
+                      aria-pressed={exists ? isOpen : undefined}
+                      disabled={!exists}
+                      onClick={() => {
+                        if (!exists) return;
+                        onStudyPlaneToggle?.(p);
+                      }}
+                      className={`px-2 py-0.5 rounded capitalize border transition-colors ${
+                        !exists
+                          ? 'bg-gray-900 text-gray-500 border-gray-800 cursor-not-allowed'
+                          : isOpen && isFocused
+                            ? 'bg-blue-600 text-white border-blue-500 ring-2 ring-blue-400/80'
+                            : isOpen
+                              ? 'bg-blue-800/90 text-gray-100 border-blue-600 hover:bg-blue-700'
+                              : 'bg-gray-800 text-gray-400 border-gray-700 hover:bg-gray-700 hover:text-gray-200'
                       }`}
-                      title={exists ? `Load ${p} sequence` : `${p} sequence not loaded`}
+                      title={
+                        !exists
+                          ? `${p} sequence not loaded`
+                          : isOpen
+                            ? `Hide ${p} viewer (same as window close)`
+                            : `Show ${p} viewer`
+                      }
                     >
                       {p}
                     </button>
