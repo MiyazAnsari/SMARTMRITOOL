@@ -193,7 +193,7 @@ export function ViewportGrid({
         return (
           <div
             key={w.id}
-            className="absolute bg-gray-900 border border-gray-800 rounded-lg shadow-lg overflow-hidden"
+            className="absolute bg-gray-900 border border-gray-800 rounded-lg shadow-lg overflow-hidden flex flex-col"
             style={{ top: pos.top, left: pos.left, width: pos.width, height: pos.height, zIndex: pos.z || 100 }}
             onMouseDown={() => {
               bringToFront(w.id);
@@ -201,7 +201,7 @@ export function ViewportGrid({
             }}
           >
             <div
-              className="flex items-center justify-between px-2 py-1 bg-gray-800 border-b border-gray-700 cursor-move"
+              className="shrink-0 flex items-center justify-between px-2 py-1 bg-gray-800 border-b border-gray-700 cursor-move"
               onMouseDown={(e) => startDrag(w.id, e)}
             >
               <div className="text-xs text-gray-200 font-semibold capitalize">{w.label}</div>
@@ -222,7 +222,7 @@ export function ViewportGrid({
                 </button>
               </div>
             </div>
-            <div className="w-full h-full relative">
+            <div className="flex-1 min-h-0 min-w-0 relative flex flex-col">
               <Viewport
                 imageData={w.imageData}
                 header={w.header}
@@ -239,6 +239,7 @@ export function ViewportGrid({
                 showCrosshair={showCrosshair}
                 parentWindowHeight={pos.height}
                 onViewportReset={() => onResetViewport?.(w.id)}
+                onClose={() => onHideWindow?.(w.id)}
               />
               <div
                 onMouseDown={(e) => startResize(w.id, e)}

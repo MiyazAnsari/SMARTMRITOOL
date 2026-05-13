@@ -17,9 +17,6 @@ interface WeightingPanelProps {
   onWeightingChange: (weighting: WeightingType) => void;
   customWeighting: { psi: number };
   onCustomWeightingChange: (params: { psi: number }) => void;
-  /** Contrast mode: 'disk' (pregenerated) or 'gpu' (real-time) */
-  contrastMode: 'disk' | 'gpu';
-  onContrastModeChange: (mode: 'disk' | 'gpu') => void;
   /** DICOM: which viewers are open (must match `MedicalImageViewer` studyViewport.open). */
   openStudyPlanes?: Plane[];
   /** DICOM: toggle viewer open/closed (same behavior as viewer “x”). */
@@ -40,8 +37,6 @@ export function WeightingPanel({
   onWeightingChange, 
   customWeighting, 
   onCustomWeightingChange,
-  contrastMode,
-  onContrastModeChange,
   openStudyPlanes,
   onStudyPlaneToggle,
   onFileLoad,
@@ -352,21 +347,11 @@ export function WeightingPanel({
         onPlaneRequest={onPlaneRequest}
       />
 
-      <div className="mb-4">
-        <h3 className="text-sm font-semibold text-gray-300 mb-2">Processing Mode</h3>
-        <RadioGroup value={contrastMode} onValueChange={(v) => onContrastModeChange(v as 'disk' | 'gpu')}>
-          <div className="space-y-2">
-            <div className="flex items-center space-x-2">
-              <RadioGroupItem value="disk" id="disk" className="border-gray-600" />
-              <Label htmlFor="disk" className="text-sm text-gray-300 cursor-pointer">Pregenerated contrast mode (Disk)</Label>
-            </div>
-            <div className="flex items-center space-x-2">
-              <RadioGroupItem value="gpu" id="gpu" className="border-gray-600" />
-              <Label htmlFor="gpu" className="text-sm text-gray-300 cursor-pointer">Real time contrast mode (GPU)</Label>
-            </div>
-          </div>
-        </RadioGroup>
-      </div>
+      <p className="mb-3 text-[10px] leading-snug text-gray-500 border border-gray-800 rounded px-2 py-1.5 bg-gray-950/60">
+        Per-viewport tools are docked in each viewer: <span className="text-gray-300">WL/WW</span>,{' '}
+        <span className="text-gray-300">Bright</span>, <span className="text-gray-300">Reset</span>,{' '}
+        <span className="text-gray-300">Close</span> (multi-view). Zoom uses the viewer Zoom toggle + wheel.
+      </p>
 
       <div className="space-y-4">
       <div ref={controlsRef}>

@@ -2,6 +2,13 @@ import { useRef, useEffect, useState, useCallback } from 'react';
 import type { WindowLevel, MeasurementTool, Measurement } from './MedicalImageViewer';
 import { Slider } from './ui/slider';
 
+/** Keep WW/WL in a stable range to reduce blown-out (all-white) display after aggressive leveling. */
+function clampWindowLevel(windowWidth: number, windowCenter: number): WindowLevel {
+  const window = Math.max(8, Math.min(4096, Math.round(windowWidth)));
+  const level = Math.max(-1024, Math.min(3072, Math.round(windowCenter)));
+  return { window, level };
+}
+
 interface ViewportProps {
   imageData: Uint8Array;
   header: any;
@@ -22,6 +29,8 @@ interface ViewportProps {
   parentWindowHeight?: number;
   /** Restore upload defaults for this viewer only (slice/WL/measurements handled in parent). */
   onViewportReset?: () => void;
+  /** Multi-viewer: hide this viewer (same as window chrome close). */
+  onClose?: () => void;
 }
 
 export function Viewport({
@@ -40,12 +49,17 @@ export function Viewport({
   showCrosshair = false,
   parentWindowHeight,
   onViewportReset,
+  onClose,
 }: ViewportProps) {
   const [wl, setWl] = useState<WindowLevel>(defaultWindowLevel);
   /** Linear gain after weighting, before W/L — isolated per viewer instance. */
   const [brightness, setBrightness] = useState(1);
   /** When true, brightness slider row is shown (like rotate mode). */
   const [isBrightnessMode, setIsBrightnessMode] = useState(false);
+  /** Dedicated window/level: left-drag horizontal → width, vertical → level (this viewer only). */
+  const [isWlwwMode, setIsWlwwMode] = useState(false);
+  const wlwwDragRef = useRef<{ startX: number; startY: number; baseW: number; baseL: number } | null>(null);
+  const wlDefaultsRef = useRef<WindowLevel>(defaultWindowLevel);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
   // container for responsive sizing
@@ -274,9 +288,12 @@ export function Viewport({
   useEffect(() => {
     if (prevImageDataRef.current === imageData) return;
     prevImageDataRef.current = imageData;
-    setWl(defaultWindowLevel);
+    wlDefaultsRef.current = { ...defaultWindowLevel };
+    setWl({ ...defaultWindowLevel });
     setBrightness(1);
     setIsBrightnessMode(false);
+    setIsWlwwMode(false);
+    wlwwDragRef.current = null;
   }, [imageData, defaultWindowLevel]);
 
   // Apply weighting, per-viewport brightness, then window/level
@@ -360,6 +377,8 @@ export function Viewport({
     setIsRotateMode(false);
     setIsZoomMode(false);
     setIsBrightnessMode(false);
+    setIsWlwwMode(false);
+    wlwwDragRef.current = null;
     lastPointerClientRef.current = null;
     setIsDrawing(false);
     setDrawingPoints([]);
@@ -369,10 +388,10 @@ export function Viewport({
 
   const handleViewerReset = useCallback(() => {
     resetViewportInteractionState();
-    setWl(defaultWindowLevel);
+    setWl({ ...wlDefaultsRef.current });
     setBrightness(1);
     onViewportReset?.();
-  }, [defaultWindowLevel, onViewportReset, resetViewportInteractionState]);
+  }, [onViewportReset, resetViewportInteractionState]);
 
   /** Map screen position to slice image pixel (continuous) for current zoom/pan/rotation. */
   const clientToImagePixel = useCallback(
@@ -911,25 +930,6 @@ export function Viewport({
 
     if (e.button === 2) {
       e.preventDefault();
-      if (isAxial && isRotateMode) return;
-      const startX = e.clientX;
-      const startY = e.clientY;
-      const baseW = wl.window;
-      const baseL = wl.level;
-      const onMove = (ev: MouseEvent) => {
-        const dx = ev.clientX - startX;
-        const dy = ev.clientY - startY;
-        setWl({
-          window: Math.max(1, Math.min(2048, baseW + dx * 2)),
-          level: Math.min(4095, Math.max(-2048, Math.round(baseL - dy * 1.5))),
-        });
-      };
-      const onUp = () => {
-        window.removeEventListener('mousemove', onMove);
-        window.removeEventListener('mouseup', onUp);
-      };
-      window.addEventListener('mousemove', onMove);
-      window.addEventListener('mouseup', onUp);
       return;
     }
 
@@ -938,10 +938,38 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
+    if (isWlwwMode) {
+      wlwwDragRef.current = {
+        startX: e.clientX,
+        startY: e.clientY,
+        baseW: wl.window,
+        baseL: wl.level,
+      };
+      const onMove = (ev: MouseEvent) => {
+        const d = wlwwDragRef.current;
+        if (!d) return;
+        const dx = ev.clientX - d.startX;
+        const dy = ev.clientY - d.startY;
+        setWl(
+          clampWindowLevel(
+            d.baseW + dx * 2.2,
+            d.baseL - dy * 1.6,
+          ),
+        );
+      };
+      const onUp = () => {
+        wlwwDragRef.current = null;
+        window.removeEventListener('mousemove', onMove);
+        window.removeEventListener('mouseup', onUp);
+      };
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onUp);
+      return;
+    }
+
     if (isAxial && isRotateMode) {
       startRotateDrag(e.clientX, e.clientY);
     } else if (activeTool === 'pan') {
-      // start panning
       setIsPanning(true);
       panStartRef.current = { clientX: e.clientX, clientY: e.clientY, startX: panSrc.x, startY: panSrc.y };
     } else if (activeTool === 'point') {
@@ -1152,7 +1180,7 @@ export function Viewport({
 
   const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
     e.preventDefault();
-    if (isAxial && isZoomMode) {
+    if (isZoomMode) {
       applyAxialWheelZoomAtPointer(e.clientX, e.clientY, e.deltaY, e.deltaMode);
       return;
     }
@@ -1174,16 +1202,6 @@ export function Viewport({
       y: Math.max(0, Math.min(h - 1, prev.y)),
     }));
   }, [activeTool]);
-
-  // Reset zoom when leaving pan tool unless axial zoom mode is active (preserve zoom).
-  useEffect(() => {
-    if (activeTool === 'pan') return;
-    if (isAxial && isZoomMode) return;
-    zoomScaleRef.current = 1;
-    panSrcRef.current = { x: 0, y: 0 };
-    setZoomScale(1);
-    setPanSrc({ x: 0, y: 0 });
-  }, [activeTool, isAxial, isZoomMode]);
 
   const dims = header.dims;
   const maxSlice = plane === 'axial' ? dims[3] : plane === 'sagittal' ? dims[1] : dims[2];
@@ -1209,33 +1227,41 @@ export function Viewport({
             <span className="text-gray-600 shrink-0" aria-hidden>
               |
             </span>
-            <span className="tabular-nums shrink-0 whitespace-nowrap">
-              W{Math.round(wl.window)} L{Math.round(wl.level)}
+            <span className="tabular-nums shrink-0 whitespace-nowrap" title="Window width / window center (this viewer)">
+              WW {Math.round(wl.window)} · WC {Math.round(wl.level)}
             </span>
             <span className="text-gray-600 shrink-0" aria-hidden>
               |
             </span>
-            <span className="tabular-nums shrink-0 whitespace-nowrap text-gray-200" title="Brightness for this viewer only">
+            <span className="tabular-nums shrink-0 whitespace-nowrap text-gray-200" title="Brightness (this viewer only)">
               Br {Math.round(brightness * 100)}%
-            </span>
-            <span
-              className="text-gray-500 truncate min-w-0 max-w-[5.5rem] sm:max-w-[10rem]"
-              title="Right-drag on the image to adjust window/level for this viewer only"
-            >
-              R-drag W/L
             </span>
           </div>
           <div className="flex flex-wrap items-center justify-end gap-0.5 shrink-0">
             <button
               type="button"
-              className="px-1.5 py-0.5 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-[10px] text-gray-100"
+              className={`px-1.5 py-0.5 rounded border text-[10px] ${
+                isWlwwMode
+                  ? 'bg-amber-600 border-amber-500 text-white'
+                  : 'bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700'
+              }`}
               onClick={(e) => {
                 e.stopPropagation();
-                handleViewerReset();
+                setIsWlwwMode((v) => {
+                  const next = !v;
+                  if (next) {
+                    setIsRotateMode(false);
+                    setIsZoomMode(false);
+                    setIsBrightnessMode(false);
+                    stopRotateDrag();
+                    lastPointerClientRef.current = null;
+                  }
+                  return next;
+                });
               }}
-              title="Reset this viewer to defaults when the sequence was loaded (slice, contrast, zoom, marks on this viewer only)"
+              title="Window/level: drag horizontally for width, vertically for center (this viewer only)"
             >
-              Reset
+              WL/WW
             </button>
             <button
               type="button"
@@ -1248,21 +1274,49 @@ export function Viewport({
                 e.stopPropagation();
                 setIsBrightnessMode((v) => {
                   const next = !v;
-                  if (next && isAxial) {
+                  if (next) {
                     setIsRotateMode(false);
                     setIsZoomMode(false);
+                    setIsWlwwMode(false);
                     stopRotateDrag();
                     lastPointerClientRef.current = null;
                   }
                   return next;
                 });
               }}
-              title="Show or hide the brightness slider for this viewer only"
+              title="Brightness gain (this viewer only)"
             >
               Bright
             </button>
-            {isAxial && (
+            <button
+              type="button"
+              className="px-1.5 py-0.5 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-[10px] text-gray-100"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleViewerReset();
+              }}
+              title="Reset viewer to state right after this sequence was loaded (zoom, pan, WL, brightness, slice, in-view marks)"
+            >
+              Reset
+            </button>
+            {onClose ? (
+              <button
+                type="button"
+                className="px-1.5 py-0.5 rounded bg-gray-800 border border-red-900/60 text-red-300 hover:bg-red-950/40 text-[10px]"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onClose();
+                }}
+                title="Close this viewer"
+              >
+                Close
+              </button>
+            ) : null}
+            {isAxial ? (
               <>
+                <span className="text-gray-600 px-0.5" aria-hidden>
+                  |
+                </span>
                 <button
                   type="button"
                   className={`px-1.5 py-0.5 rounded border text-[10px] ${
@@ -1271,16 +1325,18 @@ export function Viewport({
                       : 'bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700'
                   }`}
                   onClick={() => {
-                    setIsRotateMode(v => {
+                    setIsRotateMode((v) => {
                       const next = !v;
                       if (next) {
                         setIsZoomMode(false);
                         setIsBrightnessMode(false);
+                        setIsWlwwMode(false);
                       }
                       return next;
                     });
                     stopRotateDrag();
                   }}
+                  title="Rotate (axial)"
                 >
                   Rot
                 </button>
@@ -1291,13 +1347,14 @@ export function Viewport({
                       ? 'bg-blue-600 border-blue-500 text-white'
                       : 'bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700'
                   }`}
-                  title="Hover over the image and scroll to zoom toward the cursor"
+                  title="Scroll wheel zooms toward cursor (this viewer only)"
                   onClick={() => {
-                    setIsZoomMode(v => {
+                    setIsZoomMode((v) => {
                       const next = !v;
                       if (next) {
                         setIsRotateMode(false);
                         setIsBrightnessMode(false);
+                        setIsWlwwMode(false);
                         stopRotateDrag();
                         lastPointerClientRef.current = null;
                       }
@@ -1311,12 +1368,12 @@ export function Viewport({
                   type="button"
                   className="px-1.5 py-0.5 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-[10px] text-gray-200"
                   onClick={() => setAxialTransform({ rotation: 0 })}
-                  title="Set rotation to 0°"
+                  title="Rotation 0°"
                 >
                   0°
                 </button>
               </>
-            )}
+            ) : null}
           </div>
         </div>
         {isBrightnessMode && (
@@ -1356,13 +1413,15 @@ export function Viewport({
                 ref={overlayCanvasRef}
                 className="absolute inset-0 w-full h-full"
                 style={{
-                  cursor: isAxial && isZoomMode
-                    ? 'zoom-in'
-                    : isAxial && isRotateMode
-                      ? 'ew-resize'
-                      : activeTool === 'pan'
-                        ? (isPanning ? 'grabbing' : 'grab')
-                        : 'crosshair',
+                  cursor: isWlwwMode
+                    ? 'crosshair'
+                    : isZoomMode
+                      ? 'zoom-in'
+                      : isAxial && isRotateMode
+                        ? 'ew-resize'
+                        : activeTool === 'pan'
+                          ? (isPanning ? 'grabbing' : 'grab')
+                          : 'crosshair',
                 }}
                 onMouseDown={handleMouseDown}
                 onMouseMove={handleMouseMove}

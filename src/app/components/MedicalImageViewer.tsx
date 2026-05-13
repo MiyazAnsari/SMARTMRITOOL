@@ -109,8 +109,6 @@ interface MedicalImageViewerExtras {
   sessionAnnotator?: SessionAnnotator | null;
   onCommitSessionAnnotation?: (row: SessionAnnotationRow) => void;
   onDeleteSessionAnnotation?: (annotationId: string) => void;
-  /** Remove all session rows for the given acquisition plane for the active patient (viewer reset). */
-  onResetSessionAnnotationsForPlane?: (plane: Plane) => void;
 }
 
 /** Map a protocol primitive to one of the existing viewport tools. */
@@ -175,7 +173,6 @@ export function MedicalImageViewer({
   sessionAnnotator = null,
   onCommitSessionAnnotation,
   onDeleteSessionAnnotation,
-  onResetSessionAnnotationsForPlane,
 }: MedicalImageViewerProps & MedicalImageViewerExtras) {
   const [imageData, setImageData] = useState<Uint8Array | null>(null);
   const [header, setHeader] = useState<any>(null);
@@ -198,8 +195,6 @@ export function MedicalImageViewer({
   const [weighting, setWeighting] = useState<WeightingType>('T1');
   // single psi slider for custom weighting (0-180 degrees)
   const [customWeighting, setCustomWeighting] = useState({ psi: 90 });
-  // Processing mode for contrasts
-  const [contrastMode, setContrastMode] = useState<'disk' | 'gpu'>('disk');
   // UI helpers
   const [showCrosshair, setShowCrosshair] = useState<boolean>(false);
   // resizable right panel width (px)
@@ -559,28 +554,11 @@ export function MedicalImageViewer({
     ],
   );
 
-  /** Restore one acquisition viewer to its post-upload defaults (does not touch other planes). */
-  const handleResetViewport = useCallback(
-    (plane: Plane) => {
-      const mid = initialSliceIndex.current[plane];
-      setCurrentSlice((prev) => ({ ...prev, [plane]: mid }));
-
-      if (sessionMeasurementMode && onResetSessionAnnotationsForPlane) {
-        onResetSessionAnnotationsForPlane(plane);
-      } else if (archiveMeasurementMode && onPatientMeasurementsUpdate) {
-        onPatientMeasurementsUpdate((prev) => prev.filter((m) => m.plane !== plane));
-      } else {
-        setLocalMeasurements((prev) => prev.filter((m) => m.plane !== plane));
-      }
-    },
-    [
-      studyData,
-      sessionMeasurementMode,
-      archiveMeasurementMode,
-      onPatientMeasurementsUpdate,
-      onResetSessionAnnotationsForPlane,
-    ],
-  );
+  /** Restore slice index to middle for one plane; viewport clears zoom/pan/WL/brightness/drafts via `Viewport` reset. */
+  const handleResetViewport = useCallback((plane: Plane) => {
+    const mid = initialSliceIndex.current[plane];
+    setCurrentSlice((prev) => ({ ...prev, [plane]: mid }));
+  }, []);
 
   // Always render with axial interaction/view behavior regardless of which
   // sequence (A/S/C) is loaded. Sequence identity is shown in metadata labels.
@@ -746,8 +724,6 @@ export function MedicalImageViewer({
           onWeightingChange={setWeighting}
           customWeighting={customWeighting}
           onCustomWeightingChange={(p) => setCustomWeighting(p)}
-          contrastMode={contrastMode}
-          onContrastModeChange={(m) => setContrastMode(m)}
           onFileLoad={onFileLoad}
           onStudyLoad={onStudyLoad}
           studyData={studyData}

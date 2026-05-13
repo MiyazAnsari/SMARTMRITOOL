@@ -139,6 +139,7 @@ function App() {
   /** Session-only: cleared when the tab is closed or the page is refreshed. */
   const [annotator, setAnnotator] = useState<SessionAnnotator | null>(null);
   const [sessionAnnotations, setSessionAnnotations] = useState<SessionAnnotationRow[]>([]);
+  const [expandedPatientKeys, setExpandedPatientKeys] = useState<Record<string, boolean>>({});
   const importInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -203,16 +204,6 @@ function App() {
     setSessionAnnotations((prev) => prev.filter((r) => r.annotationId !== annotationId));
   }, []);
 
-  const resetSessionAnnotationsForPlane = useCallback(
-    (plane: Plane) => {
-      if (!activePatientKey) return;
-      setSessionAnnotations((prev) =>
-        prev.filter((r) => !(r.sourcePatientKey === activePatientKey && r.plane === plane)),
-      );
-    },
-    [activePatientKey],
-  );
-
   const deleteSidebarMeasurement = useCallback(
     (id: string) => {
       if (annotator) {
@@ -240,15 +231,25 @@ function App() {
     setFileName(name);
   };
 
+  const patientStudiesRef = useRef(patientStudies);
+  patientStudiesRef.current = patientStudies;
+
   const handleStudyLoad = (study: DicomStudy) => {
-    const identity = study.studyInstanceUID || study.patientId || study.studyName;
-    const key = identity.trim() || `study-${Date.now()}`;
-    setPatientStudies((prev) => {
-      const idx = prev.findIndex((r) => r.key === key);
+    const uid = study.studyInstanceUID?.trim();
+    const baseKey =
+      uid ||
+      `${study.patientId || 'unknown'}::${(study.studyName || 'Study').replace(/[|]+/g, '_')}`;
+    const prev = patientStudiesRef.current;
+    let key = baseKey;
+    if (!uid && prev.some((r) => r.key === key)) {
+      key = `${baseKey}__${Date.now()}`;
+    }
+    setPatientStudies((p) => {
+      const idx = p.findIndex((r) => r.key === key);
       if (idx < 0) {
-        return [...prev, { key, study, loadedAt: Date.now() }];
+        return [...p, { key, study, loadedAt: Date.now() }];
       }
-      const next = [...prev];
+      const next = [...p];
       next[idx] = {
         ...next[idx],
         loadedAt: Date.now(),
@@ -340,26 +341,73 @@ function App() {
                     const count = annotator
                       ? sessionAnnotations.filter((r) => r.sourcePatientKey === key).length
                       : measurementArchive[key]?.length ?? 0;
+                    const expanded = Boolean(expandedPatientKeys[key]);
                     return (
-                      <button
+                      <div
                         key={key}
-                        type="button"
-                        onClick={() => {
-                          setActivePatientKey(key);
-                          setNiftiData(null);
-                        }}
-                        className={`w-full text-left rounded px-2 py-2 border ${
-                          active
-                            ? 'bg-blue-700 border-blue-500 text-white'
-                            : 'bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700'
+                        className={`rounded border text-left ${
+                          active ? 'border-blue-500 bg-blue-900/30' : 'border-gray-700 bg-gray-800/80'
                         }`}
                       >
-                        <div className="text-xs font-semibold truncate">{study.patientId || 'unknown-patient'}</div>
-                        <div className="text-[11px] opacity-90 truncate">{study.patientName || 'Unknown Patient'}</div>
-                        <div className="text-[10px] opacity-80 truncate">{study.studyName}</div>
-                        <div className="text-[10px] opacity-80 mt-1">Views: {loadedPlanes.join(', ') || 'none'}</div>
-                        <div className="text-[10px] opacity-90 mt-0.5">{count} measurement(s)</div>
-                      </button>
+                        <div className="flex items-stretch gap-0">
+                          <button
+                            type="button"
+                            className="shrink-0 px-1.5 text-[10px] text-gray-400 hover:text-gray-200 border-r border-gray-700/80"
+                            aria-expanded={expanded}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setExpandedPatientKeys((m) => ({ ...m, [key]: !expanded }));
+                            }}
+                            title={expanded ? 'Collapse' : 'Expand'}
+                          >
+                            {expanded ? '▼' : '▶'}
+                          </button>
+                          <button
+                            type="button"
+                            className="flex-1 min-w-0 text-left px-2 py-2 hover:bg-gray-700/50 rounded-r"
+                            onClick={() => {
+                              setActivePatientKey(key);
+                              setNiftiData(null);
+                            }}
+                          >
+                            <div className="text-xs font-semibold truncate">{study.patientId || 'unknown-patient'}</div>
+                            <div className="text-[11px] text-gray-300 truncate">{study.patientName || 'Unknown Patient'}</div>
+                            <div className="text-[10px] text-gray-500 truncate">{study.studyName}</div>
+                            <div className="text-[10px] text-gray-400 mt-1">{count} measurement(s)</div>
+                          </button>
+                        </div>
+                        {expanded ? (
+                          <div className="border-t border-gray-700/80 px-2 py-2 text-[10px] text-gray-400 space-y-1.5 bg-gray-900/40">
+                            <div>
+                              <span className="text-gray-500">Key: </span>
+                              <span className="font-mono text-gray-300 break-all">{key}</span>
+                            </div>
+                            <div>
+                              <span className="text-gray-500">Study UID: </span>
+                              <span className="text-gray-300">{study.studyInstanceUID || '—'}</span>
+                            </div>
+                            <div>
+                              <span className="text-gray-500 font-medium text-gray-400">Planes / sequences</span>
+                              <ul className="mt-1 space-y-0.5">
+                                {loadedPlanes.length === 0 ? (
+                                  <li className="italic">No volumes</li>
+                                ) : (
+                                  loadedPlanes.map((p) => {
+                                    const v = study.volumes[p];
+                                    const desc = v?.seriesDescription?.trim();
+                                    return (
+                                      <li key={p} className="text-gray-300 capitalize">
+                                        {p}
+                                        {desc ? <span className="text-gray-500"> — {desc}</span> : null}
+                                      </li>
+                                    );
+                                  })
+                                )}
+                              </ul>
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
                     );
                   })}
               </div>
@@ -526,9 +574,6 @@ function App() {
             sessionAnnotator={annotator}
             onCommitSessionAnnotation={activePatientKey && annotator ? commitSessionAnnotation : undefined}
             onDeleteSessionAnnotation={activePatientKey && annotator ? deleteSessionAnnotation : undefined}
-            onResetSessionAnnotationsForPlane={
-              activePatientKey && annotator ? resetSessionAnnotationsForPlane : undefined
-            }
           />
         </div>
       </main>
