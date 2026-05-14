@@ -13,6 +13,7 @@ interface ViewportProps {
   activeTool: MeasurementTool;
   measurements: Measurement[];
   onMeasurementAdd: (measurement: Measurement) => void;
+  onMeasurementUpdate: (id: string, newPoints: { x: number; y: number }[]) => void;
   applyWeighting: (pixelValue: number) => number;
   showCrosshair?: boolean;
   parentWindowHeight?: number;
@@ -29,11 +30,16 @@ export function Viewport({
   activeTool,
   measurements,
   onMeasurementAdd,
+  onMeasurementUpdate,
   applyWeighting,
   showCrosshair = false,
   parentWindowHeight,
 }: ViewportProps) {
   const [autoFlash, setAutoFlash] = useState<{ window: number; level: number } | null>(null);
+  const [draggingPoint, setDraggingPoint] = useState<{ measurementId: string; pointIndex: number } | null>(null);
+  const draggingPointRef = useRef<{ measurementId: string; pointIndex: number } | null>(null);
+  const measurementsRef = useRef(measurements);
+  useEffect(() => { measurementsRef.current = measurements; }, [measurements]);
 
   useEffect(() => {
     if (!windowLevel) return;
@@ -705,7 +711,7 @@ export function Viewport({
     }
 
     // Draw completed measurements
-    measurements.forEach((measurement) => {
+    measurementsRef.current.forEach((measurement) => {
       if (measurement.slice !== currentSlice) return;
 
       ctx.strokeStyle = '#FFD700';
@@ -733,7 +739,7 @@ export function Viewport({
         ctx.fillStyle = '#ffffff';
         ctx.font = '12px sans-serif';
         ctx.fillText(measurement.value || '', midX + 5, midY - 5);
-        ctx.fillStyle = '#3b82f6';
+        ctx.fillStyle = '#FFD700';
 
 
       } else if (measurement.type === 'angle' && points.length >= 3) {
@@ -753,7 +759,7 @@ export function Viewport({
         ctx.fillStyle = '#ffffff';
         ctx.font = '12px sans-serif';
         ctx.fillText(measurement.value || '', points[1].x + 8, points[1].y - 8);
-        ctx.fillStyle = '#3b82f6';
+        ctx.fillStyle = '#FFD700';
 
         
       } else if (measurement.type === 'ellipse' && points.length >= 2) {
@@ -864,6 +870,25 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
+    // Check if clicking near an existing measurement point
+if (activeTool  === 'none') {
+  for (const m of measurements) {
+    if (m.slice !== currentSlice) continue;
+    for (let i = 0; i < m.points.length; i++) {
+      const p = m.points[i];
+      const dist = Math.sqrt((x - p.x) ** 2 + (y - p.y) ** 2);
+      if (dist < 10) {
+        draggingPointRef.current = { measurementId: m.id, pointIndex: i };
+        setDraggingPoint({ measurementId: m.id, pointIndex: i });
+        setIsDrawing(false);
+        setDrawingPoints([]);
+        console.log('set dragging point:', draggingPointRef.current);
+        return;
+      }
+    }
+  }
+}
+
     if (isAxial && isRotateMode) {
       startRotateDrag(e.clientX, e.clientY);
     } else if (activeTool === 'pan') {
@@ -871,8 +896,6 @@ export function Viewport({
       setIsPanning(true);
       panStartRef.current = { clientX: e.clientX, clientY: e.clientY, startX: panSrc.x, startY: panSrc.y };
     } else if (activeTool === 'none') {
-      setIsDragging(true);
-      setDragStart({ x: e.clientX, y: e.clientY });
     } else if (activeTool === 'point') {
       // Single-click point primitive — emit immediately, no drag phase.
       onMeasurementAdd({
@@ -937,6 +960,19 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
+    if (draggingPointRef.current) {
+      console.log('dragging point:', draggingPointRef.current, 'x:', x, 'y:', y);
+    const newMeasurements = measurementsRef.current.map(m => {
+      if (m.id !== draggingPointRef.current!.measurementId) return m;
+      const newPoints = [...m.points];
+      newPoints[draggingPointRef.current!.pointIndex] = { x, y };
+      return { ...m, points: newPoints };
+    });
+    const updated = newMeasurements.find(m => m.id === draggingPointRef.current!.measurementId);
+    if (updated) onMeasurementUpdate(updated.id, updated.points);
+    return;
+}
+
     if (isAxial && isRotateMode && rotateDragRef.current.dragging) {
       moveRotateDrag(e.clientX, e.clientY);
     } else if (activeTool === 'pan' && isPanning && panStartRef.current) {
@@ -980,6 +1016,12 @@ export function Viewport({
 
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
+
+    if (draggingPointRef.current) {
+      draggingPointRef.current = null;
+      setDraggingPoint(null);
+      return;
+}
 
     if (isAxial && isRotateMode && rotateDragRef.current.dragging) {
       stopRotateDrag();

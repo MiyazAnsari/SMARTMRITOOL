@@ -398,6 +398,10 @@ export function MedicalImageViewer({
     setMeasurements(prev => prev.filter(m => m.id !== id));
   }, []);
 
+  const handleMeasurementUpdate = useCallback((id: string, newPoints: { x: number; y: number }[]) => {
+  setMeasurements(prev => prev.map(m => m.id === id ? { ...m, points: newPoints } : m));
+}, []);
+
   // Always render with axial interaction/view behavior regardless of which
   // sequence (A/S/C) is loaded. Sequence identity is shown in metadata labels.
   const currentViewPlane: Plane = 'axial';
@@ -521,6 +525,7 @@ export function MedicalImageViewer({
             activeTool={effectiveTool}
             measurements={measurements}
             onMeasurementAdd={handleMeasurementAdd}
+            onMeasurementUpdate={handleMeasurementUpdate}
             applyWeighting={applyWeighting}
             showCrosshair={showCrosshair}
             sequenceWindows={sequenceWindows}
