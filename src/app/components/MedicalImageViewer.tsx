@@ -37,9 +37,7 @@ export type MeasurementTool =
   | 'none'
   | 'distance'
   | 'angle'
-  | 'ellipse'
-  | 'closedCurve'
-  | 'freehand'
+    'perpendicular'
   | 'pan'
   | 'line'
   | 'point';
@@ -57,6 +55,7 @@ export interface Measurement {
   slice: number;
   plane: 'axial' | 'sagittal' | 'coronal';
   value?: string;
+  baseLineId?: string;
 }
 
 interface MedicalImageViewerExtras {
@@ -399,7 +398,50 @@ export function MedicalImageViewer({
   }, []);
 
   const handleMeasurementUpdate = useCallback((id: string, newPoints: { x: number; y: number }[]) => {
-  setMeasurements(prev => prev.map(m => m.id === id ? { ...m, points: newPoints } : m));
+  setMeasurements(prev => {
+    const updated = prev.map(m => {
+      if (m.id === id) return { ...m, points: newPoints, value: (() => {
+        if (m.type === 'distance' && newPoints.length === 2) {
+          const dx = newPoints[1].x - newPoints[0].x;
+          const dy = newPoints[1].y - newPoints[0].y;
+          return `${Math.sqrt(dx*dx + dy*dy).toFixed(2)} px`;
+        }
+        return m.value;
+      })()};
+      return m;
+    });
+
+    // Also update any perpendicular lines attached to this base line
+    return updated.map(m => {
+      if (m.type !== 'perpendicular' || m.baseLineId !== id) return m;
+      const baseLine = updated.find(b => b.id === id);
+      if (!baseLine || baseLine.points.length < 2) return m;
+      const p0 = baseLine.points[0];
+      const p1 = baseLine.points[1];
+      const midX = (p0.x + p1.x) / 2;
+      const midY = (p0.y + p1.y) / 2;
+      const dx = p1.x - p0.x;
+      const dy = p1.y - p0.y;
+      const len = Math.sqrt(dx*dx + dy*dy);
+      const perpX = -dy / len;
+      const perpY = dx / len;
+      // Keep the same stub length, just update direction and anchor
+      const stubLen = Math.sqrt(
+        (m.points[1].x - m.points[0].x) ** 2 +
+        (m.points[1].y - m.points[0].y) ** 2
+      );
+      // Preserve the sign of the stub direction
+      const oldT = (m.points[1].x - m.points[0].x) * perpX + (m.points[1].y - m.points[0].y) * perpY;
+      const sign = oldT >= 0 ? 1 : -1;
+      return {
+        ...m,
+        points: [
+          { x: midX, y: midY },
+          { x: midX + perpX * stubLen * sign, y: midY + perpY * stubLen * sign },
+        ],
+      };
+    });
+  });
 }, []);
 
   // Always render with axial interaction/view behavior regardless of which
@@ -561,7 +603,7 @@ export function MedicalImageViewer({
           </div>
         )}
 
-        {/* Floating bottom-right tool bar (select, ellipse, freehand, auto WL) */}
+        {/* Floating bottom-right tool bar (select, auto WL) */}
         <div className="absolute bottom-4 right-4 flex items-center space-x-2" style={{ zIndex: 9999 }}>
           <Button
             size="sm"
