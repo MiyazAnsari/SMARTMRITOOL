@@ -713,8 +713,6 @@ export function Viewport({
 
     // Draw completed measurements
     measurementsRef.current.forEach((measurement) => {
-      if (measurement.slice !== currentSlice) return;
-
       ctx.strokeStyle = '#FFD700';
       ctx.fillStyle = '#FFD700';
       ctx.lineWidth = 1;
@@ -782,6 +780,13 @@ export function Viewport({
           ctx.stroke();
   
           // Draw draggable tip
+          ctx.fillStyle = '#00FF7F';
+          ctx.beginPath();
+          ctx.arc(points[0].x, points[0].y, 4, 0, Math.PI * 2);
+          ctx.fill();
+
+          // Draw draggable tip
+          ctx.fillStyle = '#FFD700';
           ctx.beginPath();
           ctx.arc(points[1].x, points[1].y, 4, 0, Math.PI * 2);
           ctx.fill();
@@ -840,7 +845,6 @@ export function Viewport({
     // Check if clicking near an existing measurement point
 if (activeTool  === 'none') {
   for (const m of measurements) {
-    if (m.slice !== currentSlice) continue;
     for (let i = 0; i < m.points.length; i++) {
       const p = m.points[i];
       const dist = Math.sqrt((x - p.x) ** 2 + (y - p.y) ** 2);
@@ -855,7 +859,6 @@ if (activeTool  === 'none') {
     }
   }
   for (const m of measurements) {
-  if (m.slice !== currentSlice) continue;
   if (m.type !== 'distance') continue;
   if (m.points.length < 2) continue;
   const p0 = m.points[0];
@@ -959,14 +962,31 @@ setSelectedLineId(null);
       const len = Math.sqrt(dx * dx + dy * dy);
       const perpX = -dy / len;
       const perpY = dx / len;
-      const midX = (p0.x + p1.x) / 2;
-      const midY = (p0.y + p1.y) / 2;
-      const t = (x - midX) * perpX + (y - midY) * perpY;
-      const newPoints = [
-        { x: midX, y: midY },
-        { x: midX + perpX * t, y: midY + perpY * t },
-      ];
-      onMeasurementUpdate(m.id, newPoints);
+
+      if (draggingPointRef.current!.pointIndex === 0) {
+        // Drag anchor along the base line
+        const t = Math.max(0, Math.min(1, ((x - p0.x) * dx + (y - p0.y) * dy) / (len * len)));
+        const anchorX = p0.x + t * dx;
+        const anchorY = p0.y + t * dy;
+        // Keep stub length and direction
+        const stubDx = m.points[1].x - m.points[0].x;
+        const stubDy = m.points[1].y - m.points[0].y;
+        const stubLen = Math.sqrt(stubDx * stubDx + stubDy * stubDy);
+        const sign = (stubDx * perpX + stubDy * perpY) >= 0 ? 1 : -1;
+        onMeasurementUpdate(m.id, [
+          { x: anchorX, y: anchorY },
+          { x: anchorX + perpX * stubLen * sign, y: anchorY + perpY * stubLen * sign },
+        ]);
+      } else {
+        // Drag tip along perpendicular axis from anchor
+        const anchorX = m.points[0].x;
+        const anchorY = m.points[0].y;
+        const t = (x - anchorX) * perpX + (y - anchorY) * perpY;
+        onMeasurementUpdate(m.id, [
+          { x: anchorX, y: anchorY },
+          { x: anchorX + perpX * t, y: anchorY + perpY * t },
+        ]);
+      }
       return;
     }
   }
@@ -1077,7 +1097,7 @@ setSelectedLineId(null);
             plane,
             baseLineId: selectedLineId,
           });
-          setSelectedLineId(null);
+          setSelectedLineId(null)
           return;
         }
       }

@@ -37,7 +37,7 @@ export type MeasurementTool =
   | 'none'
   | 'distance'
   | 'angle'
-    'perpendicular'
+  | 'perpendicular'
   | 'pan'
   | 'line'
   | 'point';
@@ -413,34 +413,42 @@ export function MedicalImageViewer({
 
     // Also update any perpendicular lines attached to this base line
     return updated.map(m => {
-      if (m.type !== 'perpendicular' || m.baseLineId !== id) return m;
-      const baseLine = updated.find(b => b.id === id);
-      if (!baseLine || baseLine.points.length < 2) return m;
-      const p0 = baseLine.points[0];
-      const p1 = baseLine.points[1];
-      const midX = (p0.x + p1.x) / 2;
-      const midY = (p0.y + p1.y) / 2;
-      const dx = p1.x - p0.x;
-      const dy = p1.y - p0.y;
-      const len = Math.sqrt(dx*dx + dy*dy);
-      const perpX = -dy / len;
-      const perpY = dx / len;
-      // Keep the same stub length, just update direction and anchor
-      const stubLen = Math.sqrt(
-        (m.points[1].x - m.points[0].x) ** 2 +
-        (m.points[1].y - m.points[0].y) ** 2
-      );
-      // Preserve the sign of the stub direction
-      const oldT = (m.points[1].x - m.points[0].x) * perpX + (m.points[1].y - m.points[0].y) * perpY;
-      const sign = oldT >= 0 ? 1 : -1;
-      return {
-        ...m,
-        points: [
-          { x: midX, y: midY },
-          { x: midX + perpX * stubLen * sign, y: midY + perpY * stubLen * sign },
-        ],
-      };
-    });
+    if (m.type !== 'perpendicular' || m.baseLineId !== id) return m;
+    const baseLine = updated.find(b => b.id === id);
+    if (!baseLine || baseLine.points.length < 2) return m;
+    const p0 = baseLine.points[0];
+    const p1 = baseLine.points[1];
+    const dx = p1.x - p0.x;
+    const dy = p1.y - p0.y;
+    const len = Math.sqrt(dx*dx + dy*dy);
+    const lineX = dx / len;
+    const lineY = dy / len;
+    const perpX = -dy / len;
+    const perpY = dx / len;
+
+    // Find where the old anchor was along the OLD base line
+    // We need to store the t value — for now, project old anchor onto new base line
+    const oldAnchor = m.points[0];
+    const t = Math.max(0, Math.min(1, 
+      ((oldAnchor.x - p0.x) * lineX + (oldAnchor.y - p0.y) * lineY) / len
+    ));
+    const newAnchorX = p0.x + lineX * t * len;
+    const newAnchorY = p0.y + lineY * t * len;
+
+    // Keep stub length and direction
+    const stubDx = m.points[1].x - m.points[0].x;
+    const stubDy = m.points[1].y - m.points[0].y;
+    const stubLen = Math.sqrt(stubDx*stubDx + stubDy*stubDy);
+    const sign = (stubDx * perpX + stubDy * perpY) >= 0 ? 1 : -1;
+
+    return {
+      ...m,
+      points: [
+        { x: newAnchorX, y: newAnchorY },
+        { x: newAnchorX + perpX * stubLen * sign, y: newAnchorY + perpY * stubLen * sign },
+      ],
+    };
+  });
   });
 }, []);
 
