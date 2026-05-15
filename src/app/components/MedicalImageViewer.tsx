@@ -56,6 +56,7 @@ export interface Measurement {
   plane: 'axial' | 'sagittal' | 'coronal';
   value?: string;
   baseLineId?: string;
+  groupId?: string;
 }
 
 interface MedicalImageViewerExtras {
@@ -122,9 +123,10 @@ export function MedicalImageViewer({
   const activeStep = protocol?.steps[workflow.activeStepIndex] ?? null;
   // When a workflow step is active, override the user-selected tool so the
   // correct primitive is always armed.
-  const effectiveTool: MeasurementTool = activeStep
-    ? primitiveToTool(activeStep.primitive)
-    : activeTool;
+  const effectiveTool: MeasurementTool = activeTool;
+
+  const [currentGroupId, setCurrentGroupId] = useState<string | null>(null);
+  const currentGroupIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!niftiData) return;
@@ -373,9 +375,19 @@ export function MedicalImageViewer({
     };
   }, []);
 
-  const handleMeasurementAdd = useCallback(
-    (measurement: Measurement) => {
-      setMeasurements(prev => [...prev, measurement]);
+  useEffect(() => {
+    if (workflow.protocolId) {
+      const id = `${workflow.protocolId}-${Date.now()}`;
+      setCurrentGroupId(id);
+      currentGroupIdRef.current = id;
+    } else {
+      setCurrentGroupId(null);
+      currentGroupIdRef.current = null;
+    }
+  }, [workflow.protocolId]);
+
+  const handleMeasurementAdd = useCallback((measurement: Measurement) => {
+    setMeasurements(prev => [...prev, { ...measurement, groupId: currentGroupIdRef.current ?? undefined }]);
 
       // If a workflow step is active and the drawn primitive matches what the
       // step expects, fold it into workflow state so the checklist advances and
@@ -390,7 +402,7 @@ export function MedicalImageViewer({
         );
       }
     },
-    [protocol, activeStep],
+    [protocol, activeStep, currentGroupId],
   );
 
   const handleMeasurementDelete = useCallback((id: string) => {
