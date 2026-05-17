@@ -2,11 +2,24 @@ import { useRef, useEffect, useState, useCallback } from 'react';
 import type { WindowLevel, MeasurementTool, Measurement } from './MedicalImageViewer';
 import { Slider } from './ui/slider';
 
-/** Keep WW/WL in a stable range to reduce blown-out (all-white) display after aggressive leveling. */
-function clampWindowLevel(windowWidth: number, windowCenter: number): WindowLevel {
-  const window = Math.max(8, Math.min(4096, Math.round(windowWidth)));
-  const level = Math.max(-1024, Math.min(3072, Math.round(windowCenter)));
-  return { window, level };
+const WL_MIN_WIDTH = 8;
+const WL_MAX_WIDTH = 255;
+const WL_MIN_CENTER = 0;
+const WL_MAX_CENTER = 255;
+
+/** Clamp WW/WL to display-space limits (normalized 0–255 pixels). */
+function sanitizeWindowLevel(
+  windowWidth: number,
+  windowCenter: number,
+  fallback: WindowLevel,
+): WindowLevel {
+  let ww = Math.round(windowWidth);
+  let wc = Math.round(windowCenter);
+  if (!Number.isFinite(ww) || !Number.isFinite(wc)) return { ...fallback };
+  ww = Math.max(WL_MIN_WIDTH, Math.min(WL_MAX_WIDTH, ww));
+  wc = Math.max(WL_MIN_CENTER, Math.min(WL_MAX_CENTER, wc));
+  if (wc + ww / 2 <= wc - ww / 2) return { ...fallback };
+  return { window: ww, level: wc };
 }
 
 const VIEWPORT_ZOOM_MIN = 1;
@@ -56,15 +69,31 @@ export function Viewport({
   onViewportReset,
   onClose,
 }: ViewportProps) {
-  const [wl, setWl] = useState<WindowLevel>(defaultWindowLevel);
+  const [wl, setWl] = useState<WindowLevel>(() =>
+    sanitizeWindowLevel(defaultWindowLevel.window, defaultWindowLevel.level, defaultWindowLevel),
+  );
   /** Linear gain after weighting, before W/L — isolated per viewer instance. */
   const [brightness, setBrightness] = useState(1);
-  /** When true, brightness slider row is shown (like rotate mode). */
+  const brightnessRef = useRef(brightness);
+  brightnessRef.current = brightness;
+  /** When true, brightness slider row is shown. */
   const [isBrightnessMode, setIsBrightnessMode] = useState(false);
-  /** Dedicated window/level: left-drag horizontal → width, vertical → level (this viewer only). */
-  const [isWlwwMode, setIsWlwwMode] = useState(false);
-  const wlwwDragRef = useRef<{ startX: number; startY: number; baseW: number; baseL: number } | null>(null);
-  const wlDefaultsRef = useRef<WindowLevel>(defaultWindowLevel);
+  /** Per-viewer window center (level) slider panel. */
+  const [isWlMode, setIsWlMode] = useState(false);
+  /** Per-viewer window width slider panel. */
+  const [isWwMode, setIsWwMode] = useState(false);
+  const wlDefaultsRef = useRef<WindowLevel>(
+    sanitizeWindowLevel(defaultWindowLevel.window, defaultWindowLevel.level, defaultWindowLevel),
+  );
+
+  const setWlSafe = useCallback((next: WindowLevel | ((prev: WindowLevel) => WindowLevel)) => {
+    setWl((prev) => {
+      const raw = typeof next === 'function' ? next(prev) : next;
+      const sanitized = sanitizeWindowLevel(raw.window, raw.level, wlDefaultsRef.current);
+      if (sanitized.window === prev.window && sanitized.level === prev.level) return prev;
+      return sanitized;
+    });
+  }, []);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
   // container for responsive sizing
@@ -297,12 +326,17 @@ export function Viewport({
   useEffect(() => {
     if (prevImageDataRef.current === imageData) return;
     prevImageDataRef.current = imageData;
-    wlDefaultsRef.current = { ...defaultWindowLevel };
-    setWl({ ...defaultWindowLevel });
+    const safeDefaults = sanitizeWindowLevel(
+      defaultWindowLevel.window,
+      defaultWindowLevel.level,
+      defaultWindowLevel,
+    );
+    wlDefaultsRef.current = { ...safeDefaults };
+    setWl(safeDefaults);
     setBrightness(1);
     setIsBrightnessMode(false);
-    setIsWlwwMode(false);
-    wlwwDragRef.current = null;
+    setIsWlMode(false);
+    setIsWwMode(false);
   }, [imageData, defaultWindowLevel]);
 
   // Apply weighting, per-viewport brightness, then window/level
@@ -310,14 +344,16 @@ export function Viewport({
     const weighted = applyWeighting(value);
     const scaled = weighted * brightness;
 
-    const { window, level } = wl;
-    const min = level - window / 2;
-    const max = level + window / 2;
+    const { window: ww, level: wc } = wl;
+    const voiMin = wc - ww / 2;
+    const voiMax = wc + ww / 2;
+    const span = voiMax - voiMin;
+    if (span < 1) return 128;
 
-    if (scaled <= min) return 0;
-    if (scaled >= max) return 255;
+    if (scaled <= voiMin) return 0;
+    if (scaled >= voiMax) return 255;
 
-    return Math.round(((scaled - min) / window) * 255);
+    return Math.round(((scaled - voiMin) / span) * 255);
   }, [wl, brightness, applyWeighting]);
 
   const drawTransformedImage = useCallback((
@@ -375,6 +411,20 @@ export function Viewport({
     rotateDragRef.current.dragging = false;
   }, []);
 
+  const dismissCanvasToolModes = useCallback(() => {
+    setIsRotateMode(false);
+    stopRotateDrag();
+    setIsZoomMode(false);
+    lastPointerClientRef.current = null;
+  }, [stopRotateDrag]);
+
+  const dismissAllToolbarPanels = useCallback(() => {
+    dismissCanvasToolModes();
+    setIsWlMode(false);
+    setIsWwMode(false);
+    setIsBrightnessMode(false);
+  }, [dismissCanvasToolModes]);
+
   const cancelZoomAnimation = useCallback(() => {
     if (zoomAnimRafRef.current != null) {
       cancelAnimationFrame(zoomAnimRafRef.current);
@@ -391,24 +441,19 @@ export function Viewport({
     panSrcRef.current = { x: 0, y: 0 };
     setZoomScale(1);
     setPanSrc({ x: 0, y: 0 });
-    setIsRotateMode(false);
-    setIsZoomMode(false);
-    setIsBrightnessMode(false);
-    setIsWlwwMode(false);
-    wlwwDragRef.current = null;
-    lastPointerClientRef.current = null;
+    dismissAllToolbarPanels();
     setIsDrawing(false);
     setDrawingPoints([]);
     setIsPanning(false);
     panStartRef.current = null;
-  }, [stopRotateDrag, cancelZoomAnimation]);
+  }, [stopRotateDrag, cancelZoomAnimation, dismissAllToolbarPanels]);
 
   const handleViewerReset = useCallback(() => {
     resetViewportInteractionState();
-    setWl({ ...wlDefaultsRef.current });
+    setWlSafe({ ...wlDefaultsRef.current });
     setBrightness(1);
     onViewportReset?.();
-  }, [onViewportReset, resetViewportInteractionState]);
+  }, [onViewportReset, resetViewportInteractionState, setWlSafe]);
 
   /** Map screen position to slice image pixel (continuous) for current zoom/pan/rotation. */
   const clientToImagePixel = useCallback(
@@ -1006,35 +1051,6 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    if (isWlwwMode) {
-      wlwwDragRef.current = {
-        startX: e.clientX,
-        startY: e.clientY,
-        baseW: wl.window,
-        baseL: wl.level,
-      };
-      const onMove = (ev: MouseEvent) => {
-        const d = wlwwDragRef.current;
-        if (!d) return;
-        const dx = ev.clientX - d.startX;
-        const dy = ev.clientY - d.startY;
-        setWl(
-          clampWindowLevel(
-            d.baseW + dx * 2.2,
-            d.baseL - dy * 1.6,
-          ),
-        );
-      };
-      const onUp = () => {
-        wlwwDragRef.current = null;
-        window.removeEventListener('mousemove', onMove);
-        window.removeEventListener('mouseup', onUp);
-      };
-      window.addEventListener('mousemove', onMove);
-      window.addEventListener('mouseup', onUp);
-      return;
-    }
-
     if (isAxial && isRotateMode) {
       startRotateDrag(e.clientX, e.clientY);
     } else if (activeTool === 'pan') {
@@ -1315,27 +1331,42 @@ export function Viewport({
             <button
               type="button"
               className={`px-1.5 py-0.5 rounded border text-[10px] ${
-                isWlwwMode
+                isWlMode
                   ? 'bg-amber-600 border-amber-500 text-white'
                   : 'bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700'
               }`}
               onClick={(e) => {
                 e.stopPropagation();
-                setIsWlwwMode((v) => {
+                setIsWlMode((v) => {
                   const next = !v;
-                  if (next) {
-                    setIsRotateMode(false);
-                    setIsZoomMode(false);
-                    setIsBrightnessMode(false);
-                    stopRotateDrag();
-                    lastPointerClientRef.current = null;
-                  }
+                  if (next) dismissCanvasToolModes();
                   return next;
                 });
               }}
-              title="Window/level: drag horizontally for width, vertically for center (this viewer only)"
+              title="Window level (center) — slider (this viewer only)"
+              aria-expanded={isWlMode}
             >
-              WL/WW
+              WL
+            </button>
+            <button
+              type="button"
+              className={`px-1.5 py-0.5 rounded border text-[10px] ${
+                isWwMode
+                  ? 'bg-amber-600 border-amber-500 text-white'
+                  : 'bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700'
+              }`}
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsWwMode((v) => {
+                  const next = !v;
+                  if (next) dismissCanvasToolModes();
+                  return next;
+                });
+              }}
+              title="Window width — slider (this viewer only)"
+              aria-expanded={isWwMode}
+            >
+              WW
             </button>
             <button
               type="button"
@@ -1348,17 +1379,12 @@ export function Viewport({
                 e.stopPropagation();
                 setIsBrightnessMode((v) => {
                   const next = !v;
-                  if (next) {
-                    setIsRotateMode(false);
-                    setIsZoomMode(false);
-                    setIsWlwwMode(false);
-                    stopRotateDrag();
-                    lastPointerClientRef.current = null;
-                  }
+                  if (next) dismissCanvasToolModes();
                   return next;
                 });
               }}
               title="Brightness gain (this viewer only)"
+              aria-expanded={isBrightnessMode}
             >
               Bright
             </button>
@@ -1373,13 +1399,7 @@ export function Viewport({
                 e.stopPropagation();
                 setIsZoomMode((v) => {
                   const next = !v;
-                  if (next) {
-                    setIsRotateMode(false);
-                    setIsBrightnessMode(false);
-                    setIsWlwwMode(false);
-                    stopRotateDrag();
-                    lastPointerClientRef.current = null;
-                  }
+                  if (next) dismissCanvasToolModes();
                   return next;
                 });
               }}
@@ -1457,11 +1477,7 @@ export function Viewport({
                   onClick={() => {
                     setIsRotateMode((v) => {
                       const next = !v;
-                      if (next) {
-                        setIsZoomMode(false);
-                        setIsBrightnessMode(false);
-                        setIsWlwwMode(false);
-                      }
+                      if (next) dismissCanvasToolModes();
                       return next;
                     });
                     stopRotateDrag();
@@ -1482,23 +1498,65 @@ export function Viewport({
             ) : null}
           </div>
         </div>
-        {isBrightnessMode && (
+        {(isWlMode || isWwMode || isBrightnessMode) && (
           <div
-            className="mt-0.5 flex items-center gap-1.5 min-w-0 border-t border-gray-800/80 pt-0.5"
+            className="mt-0.5 space-y-0.5 min-w-0 border-t border-gray-800/80 pt-0.5"
             onMouseDown={(e) => e.stopPropagation()}
           >
-            <span className="text-[10px] text-gray-500 shrink-0" title="Brightness (this viewer only)">
-              Brightness
-            </span>
-            <Slider
-              className="min-w-0 flex-1 max-w-[10rem] sm:max-w-[14rem] h-4"
-              min={0.25}
-              max={2.5}
-              step={0.02}
-              value={[brightness]}
-              onValueChange={(v) => setBrightness(v[0] ?? 1)}
-              aria-label="Viewer brightness"
-            />
+            {isWlMode ? (
+              <div className="flex items-center gap-1.5 min-w-0">
+                <span className="text-[10px] text-gray-500 shrink-0 w-[4.5rem]" title="Window center (this viewer)">
+                  WL {Math.round(wl.level)}
+                </span>
+                <Slider
+                  className="min-w-0 flex-1 max-w-[10rem] sm:max-w-[14rem] h-4"
+                  min={WL_MIN_CENTER}
+                  max={WL_MAX_CENTER}
+                  step={1}
+                  value={[wl.level]}
+                  onValueChange={(v) => {
+                    const level = v[0] ?? wl.level;
+                    setWlSafe((prev) => ({ ...prev, level }));
+                  }}
+                  aria-label="Window level"
+                />
+              </div>
+            ) : null}
+            {isWwMode ? (
+              <div className="flex items-center gap-1.5 min-w-0">
+                <span className="text-[10px] text-gray-500 shrink-0 w-[4.5rem]" title="Window width (this viewer)">
+                  WW {Math.round(wl.window)}
+                </span>
+                <Slider
+                  className="min-w-0 flex-1 max-w-[10rem] sm:max-w-[14rem] h-4"
+                  min={WL_MIN_WIDTH}
+                  max={WL_MAX_WIDTH}
+                  step={1}
+                  value={[wl.window]}
+                  onValueChange={(v) => {
+                    const window = v[0] ?? wl.window;
+                    setWlSafe((prev) => ({ ...prev, window }));
+                  }}
+                  aria-label="Window width"
+                />
+              </div>
+            ) : null}
+            {isBrightnessMode ? (
+              <div className="flex items-center gap-1.5 min-w-0">
+                <span className="text-[10px] text-gray-500 shrink-0 w-[4.5rem]" title="Brightness (this viewer only)">
+                  Bright
+                </span>
+                <Slider
+                  className="min-w-0 flex-1 max-w-[10rem] sm:max-w-[14rem] h-4"
+                  min={0.25}
+                  max={2.5}
+                  step={0.02}
+                  value={[brightness]}
+                  onValueChange={(v) => setBrightness(v[0] ?? 1)}
+                  aria-label="Viewer brightness"
+                />
+              </div>
+            ) : null}
           </div>
         )}
       </div>
@@ -1519,9 +1577,7 @@ export function Viewport({
                 ref={overlayCanvasRef}
                 className="absolute inset-0 w-full h-full"
                 style={{
-                  cursor: isWlwwMode
-                    ? 'crosshair'
-                    : isZoomMode
+                  cursor: isZoomMode
                       ? 'zoom-in'
                       : isAxial && isRotateMode
                         ? 'ew-resize'

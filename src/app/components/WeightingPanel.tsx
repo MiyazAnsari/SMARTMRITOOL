@@ -350,7 +350,8 @@ export function WeightingPanel({
       />
 
       <p className="mb-3 text-[10px] leading-snug text-gray-500 border border-gray-800 rounded px-2 py-1.5 bg-gray-950/60">
-        Per-viewport tools: <span className="text-gray-300">WL/WW</span>, <span className="text-gray-300">Bright</span>,{' '}
+        Per-viewport tools: <span className="text-gray-300">WL</span>, <span className="text-gray-300">WW</span>,{' '}
+        <span className="text-gray-300">Bright</span>,{' '}
         <span className="text-gray-300">Zoom</span> (opens <span className="text-gray-300">+</span> /{' '}
         <span className="text-gray-300">−</span> for trackpads; wheel zoom unchanged), <span className="text-gray-300">Reset</span>,{' '}
         <span className="text-gray-300">Close</span>.
