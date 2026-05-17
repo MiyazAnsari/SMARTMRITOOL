@@ -15,9 +15,12 @@ export interface SessionAnnotator {
   email: string;
 }
 
+export type Laterality = 'left' | 'right';
+
 export interface SessionAnnotationRow {
   /** Internal: which loaded study key this row belongs to (not exported). */
   sourcePatientKey: string;
+  laterality: Laterality;
   annotationId: string;
   patientId: string;
   sequenceName: string;
@@ -35,6 +38,7 @@ export interface SessionAnnotationRow {
 const CSV_COLUMNS = [
   'annotationId',
   'patientId',
+  'laterality',
   'sequenceName',
   'plane',
   'measurementType',

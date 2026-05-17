@@ -5,7 +5,7 @@ import { Slider } from './ui/slider';
 import { Separator } from './ui/separator';
 import { WeightingType } from './MedicalImageViewer';
 import { StudyUpload } from './dicom/StudyUpload';
-import type { DicomStudy } from './dicom/DicomStudy';
+import type { DicomStudyView } from './dicom/patientStudy';
 import type { Plane } from './dicom/DicomLoader';
 import {
   MeasurementWorkflow,
@@ -22,8 +22,8 @@ interface WeightingPanelProps {
   /** DICOM: toggle viewer open/closed (same behavior as viewer “x”). */
   onStudyPlaneToggle?: (plane: Plane) => void;
   onFileLoad?: (data: ArrayBuffer, name: string) => void;
-  onStudyLoad?: (study: DicomStudy) => void;
-  studyData?: DicomStudy | null;
+  onStudyLoad?: (study: import('./dicom/DicomStudy').DicomStudy) => void;
+  studyData?: DicomStudyView | null;
   activeStudyPlane?: Plane;
   workflow: WorkflowState;
   onWorkflowChange: (s: WorkflowState) => void;
@@ -296,6 +296,8 @@ export function WeightingPanel({
         {studyData && (
           <div className="mt-2 text-[10px] text-gray-400">
             Loaded study: <span className="text-gray-200">{studyData.studyName}</span>
+            <span className="text-gray-500"> · </span>
+            <span className="text-gray-200 capitalize">{studyData.laterality} knee</span>
             <div className="mt-1">
               <div className="mb-1 text-gray-500">Viewers (click to show / hide):</div>
               <div className="flex flex-wrap gap-1">

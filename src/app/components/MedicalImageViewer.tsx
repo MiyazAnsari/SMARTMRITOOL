@@ -7,7 +7,7 @@ import { RadioGroup, RadioGroupItem } from './ui/radio-group';
 import { Slider } from './ui/slider';
 import { Label } from './ui/label';
 import { MousePointer, Circle as CircleIcon, Pencil, Move } from 'lucide-react';
-import type { DicomStudy } from './dicom/DicomStudy';
+import type { DicomStudyView } from './dicom/patientStudy';
 import type { DicomVolume, Plane } from './dicom/DicomLoader';
 import {
   initialWorkflowState,
@@ -96,8 +96,8 @@ export interface Measurement {
 
 interface MedicalImageViewerExtras {
   onFileLoad?: (data: ArrayBuffer, name: string) => void;
-  studyData?: DicomStudy | null;
-  onStudyLoad?: (study: DicomStudy) => void;
+  studyData?: DicomStudyView | null;
+  onStudyLoad?: (study: import('./dicom/DicomStudy').DicomStudy) => void;
   /** When set with `onPatientMeasurementsUpdate`, measurements are controlled by the parent (per-patient persistence). */
   patientStorageKey?: string | null;
   patientMeasurements?: Measurement[];
@@ -137,7 +137,7 @@ function measurementMatchesPrimitive(measurement: Measurement, primitive: Primit
 
 function buildSessionAnnotationRow(
   m: Measurement,
-  studyData: DicomStudy,
+  studyData: DicomStudyView,
   sourcePatientKey: string,
   annotator: SessionAnnotator,
 ): SessionAnnotationRow {
@@ -147,6 +147,7 @@ function buildSessionAnnotationRow(
   const ts = m.timestamp || new Date().toISOString();
   return {
     sourcePatientKey,
+    laterality: studyData.laterality,
     annotationId: crypto.randomUUID(),
     patientId: studyData.patientId || 'unknown',
     sequenceName,
@@ -204,7 +205,7 @@ export function MedicalImageViewer({
   const [workflow, setWorkflow] = useState<WorkflowState>(initialWorkflowState);
   /** DICOM: open floating viewers + focused series (single source of truth with `open`). */
   const [studyViewport, setStudyViewport] = useState<StudyViewportState>({ open: [], active: 'axial' });
-  const prevStudyDataRef = useRef<DicomStudy | null>(null);
+  const prevStudyDataRef = useRef<DicomStudyView | null>(null);
 
   const protocol = useMemo(() => getProtocol(workflow.protocolId), [workflow.protocolId]);
   const activeStep = protocol?.steps[workflow.activeStepIndex] ?? null;
@@ -652,6 +653,9 @@ export function MedicalImageViewer({
             </div>
             <div>
               Study: <span className="text-gray-100">{studyData.studyName}</span>
+            </div>
+            <div>
+              Knee: <span className="text-gray-100 capitalize">{studyData.laterality}</span>
             </div>
             <div>
               Sequence: <span className="text-gray-100 capitalize">{studyViewport.active}</span>

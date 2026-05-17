@@ -1,5 +1,6 @@
 // @ts-ignore - dicom-parser ships its own .d.ts but JS module shape varies
 import dicomParser from 'dicom-parser';
+import { lateralityFromDicomTag, type Laterality } from './laterality';
 
 export type Plane = 'axial' | 'sagittal' | 'coronal';
 
@@ -17,6 +18,7 @@ export interface DicomVolume {
   dataRange: { min: number; max: number };
   defaultWindowLevel: { window: number; level: number };
   plane: Plane;
+  laterality: Laterality;
   seriesDescription: string;
   patientId: string;
   patientName: string;
@@ -39,6 +41,7 @@ interface ParsedSlice {
   windowCenter?: number;
   windowWidth?: number;
   seriesDescription: string;
+  laterality?: string;
   patientId: string;
   patientName: string;
   studyInstanceUID: string;
@@ -66,6 +69,7 @@ const tag = {
   imagePositionPatient: 'x00200032',
   imageOrientationPatient: 'x00200037',
   seriesDescription: 'x0008103e',
+  laterality: 'x00200060',
   patientId: 'x00100020',
   patientName: 'x00100010',
   studyInstanceUID: 'x0020000d',
@@ -129,6 +133,7 @@ function parseDicomFile(buffer: ArrayBuffer): ParsedSlice | null {
     | [number, number, number, number, number, number]
     | undefined;
   const seriesDescription = dataSet.string(tag.seriesDescription) || '';
+  const laterality = dataSet.string(tag.laterality) || undefined;
   const patientId = (dataSet.string(tag.patientId) || '').trim();
   const patientName = (dataSet.string(tag.patientName) || '').replace(/\^/g, ' ').trim();
   const studyInstanceUID = (dataSet.string(tag.studyInstanceUID) || '').trim();
@@ -170,6 +175,7 @@ function parseDicomFile(buffer: ArrayBuffer): ParsedSlice | null {
     windowCenter,
     windowWidth,
     seriesDescription,
+    laterality,
     patientId,
     patientName,
     studyInstanceUID,
@@ -216,6 +222,7 @@ function detectPlane(slice: ParsedSlice, hint?: string): Plane {
 export async function loadDicomSeries(
   files: { name: string; buffer: ArrayBuffer }[],
   hint?: string,
+  laterality: Laterality = 'left',
 ): Promise<DicomVolume | null> {
   if (!files.length) return null;
 
@@ -233,6 +240,7 @@ export async function loadDicomSeries(
   if (!consistent.length) return null;
 
   const plane = detectPlane(consistent[0], hint);
+  const dicomLaterality = lateralityFromDicomTag(consistent[0].laterality);
 
   // Sort along the volume axis. For DICOM, the slice normal direction is most
   // reliable; otherwise SliceLocation; otherwise InstanceNumber.
@@ -314,6 +322,7 @@ export async function loadDicomSeries(
     dataRange: { min, max },
     defaultWindowLevel: { window: defaultWindow, level: defaultLevel },
     plane,
+    laterality: laterality ?? dicomLaterality ?? 'left',
     seriesDescription: consistent[0].seriesDescription || hint || plane,
     patientId: consistent[0].patientId || 'unknown-patient',
     patientName: consistent[0].patientName || 'Unknown Patient',
@@ -340,6 +349,12 @@ export function groupFilesByDirectory(files: File[]): Map<string, File[]> {
     groups.set(dir, arr);
   }
   return groups;
+}
+
+/** Read DICOM Laterality (0020,0060) from a single file without building a volume. */
+export function readLateralityFromDicomBuffer(buffer: ArrayBuffer): Laterality | null {
+  const slice = parseDicomFile(buffer);
+  return lateralityFromDicomTag(slice?.laterality);
 }
 
 /** Heuristic: only DICOM-looking files (no obvious extensions like .json/.txt). */

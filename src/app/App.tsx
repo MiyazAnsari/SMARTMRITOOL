@@ -1,8 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { MedicalImageViewer } from '@/app/components/MedicalImageViewer';
 import type { Measurement } from '@/app/components/MedicalImageViewer';
-import type { DicomStudy } from '@/app/components/dicom/DicomStudy';
+import { mergeStudies, type DicomStudy } from '@/app/components/dicom/DicomStudy';
 import type { Plane } from '@/app/components/dicom/DicomLoader';
+import type { Laterality } from '@/app/components/dicom/laterality';
+import { LATERALITIES, measurementStorageKey } from '@/app/components/dicom/laterality';
+import {
+  firstAvailableLaterality,
+  kneeHasVolumes,
+  loadedPlanesForKnee,
+  studyViewForLaterality,
+} from '@/app/components/dicom/patientStudy';
 import {
   downloadTextFile,
   exportArchiveToTsv,
@@ -29,25 +37,40 @@ interface PatientStudyRecord {
 
 const EMPTY_MEASUREMENTS: Measurement[] = [];
 
-function mergeStudies(existing: DicomStudy, incoming: DicomStudy): DicomStudy {
-  const volumes: DicomStudy['volumes'] = { ...existing.volumes };
-  (['axial', 'sagittal', 'coronal'] as Plane[]).forEach((p) => {
-    const next = incoming.volumes[p];
-    if (!next) return;
-    const prev = volumes[p];
-    if (!prev || next.sliceCount >= prev.sliceCount) {
-      volumes[p] = next;
-    }
-  });
-
-  return {
-    ...existing,
-    studyName: incoming.studyName || existing.studyName,
-    patientId: incoming.patientId || existing.patientId,
-    patientName: incoming.patientName || existing.patientName,
-    studyInstanceUID: incoming.studyInstanceUID || existing.studyInstanceUID,
-    volumes,
-  };
+function KneeLateralityToggle({
+  value,
+  onChange,
+  study,
+}: {
+  value: Laterality;
+  onChange: (lat: Laterality) => void;
+  study: DicomStudy;
+}) {
+  return (
+    <div className="flex gap-1 rounded-md bg-gray-950/80 p-0.5 border border-gray-700">
+      {LATERALITIES.map((lat) => {
+        const loaded = kneeHasVolumes(study, lat);
+        const active = value === lat;
+        return (
+          <button
+            key={lat}
+            type="button"
+            disabled={!loaded}
+            onClick={() => onChange(lat)}
+            className={`flex-1 rounded px-2 py-1 text-[10px] font-medium transition-colors ${
+              active
+                ? 'bg-blue-600 text-white'
+                : loaded
+                  ? 'text-gray-200 hover:bg-gray-700/80'
+                  : 'text-gray-600 cursor-not-allowed'
+            }`}
+          >
+            {lat === 'left' ? 'Left Knee' : 'Right Knee'}
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
 function AnnotatorSessionModal({
@@ -140,26 +163,47 @@ function App() {
   const [annotator, setAnnotator] = useState<SessionAnnotator | null>(null);
   const [sessionAnnotations, setSessionAnnotations] = useState<SessionAnnotationRow[]>([]);
   const [expandedPatientKeys, setExpandedPatientKeys] = useState<Record<string, boolean>>({});
+  const [activeLateralityByPatient, setActiveLateralityByPatient] = useState<Record<string, Laterality>>({});
   const importInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     savePatientMeasurementArchive(measurementArchive);
   }, [measurementArchive]);
 
-  const activeStudy = useMemo(
-    () => patientStudies.find((p) => p.key === activePatientKey)?.study || null,
+  const activePatientRecord = useMemo(
+    () => patientStudies.find((p) => p.key === activePatientKey) ?? null,
     [patientStudies, activePatientKey],
   );
 
+  const activeLaterality = useMemo((): Laterality => {
+    if (!activePatientKey || !activePatientRecord) return 'left';
+    return (
+      activeLateralityByPatient[activePatientKey] ??
+      firstAvailableLaterality(activePatientRecord.study)
+    );
+  }, [activePatientKey, activePatientRecord, activeLateralityByPatient]);
+
+  const activeStudy = useMemo(() => {
+    if (!activePatientRecord) return null;
+    return studyViewForLaterality(activePatientRecord.study, activeLaterality);
+  }, [activePatientRecord, activeLaterality]);
+
+  const activeMeasurementKey = useMemo(() => {
+    if (!activePatientKey) return null;
+    return measurementStorageKey(activePatientKey, activeLaterality);
+  }, [activePatientKey, activeLaterality]);
+
   const activePatientMeasurements = useMemo((): Measurement[] => {
-    if (!activePatientKey) return EMPTY_MEASUREMENTS;
-    return measurementArchive[activePatientKey] ?? EMPTY_MEASUREMENTS;
-  }, [measurementArchive, activePatientKey]);
+    if (!activeMeasurementKey) return EMPTY_MEASUREMENTS;
+    return measurementArchive[activeMeasurementKey] ?? EMPTY_MEASUREMENTS;
+  }, [measurementArchive, activeMeasurementKey]);
 
   const activeSessionRowsForPatient = useMemo(() => {
     if (!annotator || !activePatientKey) return [];
-    return sessionAnnotations.filter((r) => r.sourcePatientKey === activePatientKey);
-  }, [annotator, activePatientKey, sessionAnnotations]);
+    return sessionAnnotations.filter(
+      (r) => r.sourcePatientKey === activePatientKey && r.laterality === activeLaterality,
+    );
+  }, [annotator, activePatientKey, activeLaterality, sessionAnnotations]);
 
   const measurementsForActivePatientViewer = useMemo((): Measurement[] => {
     if (!annotator || !activePatientKey) return EMPTY_MEASUREMENTS;
@@ -176,24 +220,24 @@ function App() {
 
   const updateActivePatientMeasurements = useCallback(
     (updater: (prev: Measurement[]) => Measurement[]) => {
-      if (!activePatientKey) return;
+      if (!activeMeasurementKey) return;
       setMeasurementArchive((prev) => {
-        const cur = prev[activePatientKey] ?? [];
-        return { ...prev, [activePatientKey]: updater(cur) };
+        const cur = prev[activeMeasurementKey] ?? [];
+        return { ...prev, [activeMeasurementKey]: updater(cur) };
       });
     },
-    [activePatientKey],
+    [activeMeasurementKey],
   );
 
   const deleteActivePatientMeasurement = useCallback(
     (id: string) => {
-      if (!activePatientKey) return;
+      if (!activeMeasurementKey) return;
       setMeasurementArchive((prev) => ({
         ...prev,
-        [activePatientKey]: (prev[activePatientKey] ?? []).filter((m) => m.id !== id),
+        [activeMeasurementKey]: (prev[activeMeasurementKey] ?? []).filter((m) => m.id !== id),
       }));
     },
-    [activePatientKey],
+    [activeMeasurementKey],
   );
 
   const commitSessionAnnotation = useCallback((row: SessionAnnotationRow) => {
@@ -244,6 +288,7 @@ function App() {
     if (!uid && prev.some((r) => r.key === key)) {
       key = `${baseKey}__${Date.now()}`;
     }
+    const loadedKnee = firstAvailableLaterality(study);
     setPatientStudies((p) => {
       const idx = p.findIndex((r) => r.key === key);
       if (idx < 0) {
@@ -257,6 +302,7 @@ function App() {
       };
       return next;
     });
+    setActiveLateralityByPatient((m) => ({ ...m, [key]: loadedKnee }));
     setActivePatientKey(key);
     setNiftiData(null);
     setFileName(`${study.patientId || 'unknown'} - ${study.studyName}`);
@@ -265,7 +311,11 @@ function App() {
   const exportActivePatientTsv = () => {
     if (!activePatientKey) return;
     const study = activeStudy;
-    const tsv = exportPatientToTsv(activePatientKey, activePatientMeasurements, study?.patientId);
+    const tsv = exportPatientToTsv(
+      activeMeasurementKey ?? activePatientKey,
+      activePatientMeasurements,
+      study?.patientId,
+    );
     const safe = (study?.patientId || activePatientKey).replace(/[^\w.-]+/g, '_');
     downloadTextFile(`measurements-${safe}.tsv`, tsv);
   };
@@ -305,7 +355,11 @@ function App() {
   const copyActivePatientTsv = async () => {
     if (!activePatientKey) return;
     const study = activeStudy;
-    const tsv = exportPatientToTsv(activePatientKey, activePatientMeasurements, study?.patientId);
+    const tsv = exportPatientToTsv(
+      activeMeasurementKey ?? activePatientKey,
+      activePatientMeasurements,
+      study?.patientId,
+    );
     try {
       await navigator.clipboard.writeText(tsv);
       alert('TSV copied to clipboard — paste into a spreadsheet.');
@@ -336,11 +390,18 @@ function App() {
                   .slice()
                   .sort((a, b) => b.loadedAt - a.loadedAt)
                   .map(({ key, study }) => {
-                    const loadedPlanes = (['axial', 'sagittal', 'coronal'] as Plane[]).filter((p) => study.volumes[p]);
                     const active = activePatientKey === key;
+                    const kneeLat = active
+                      ? activeLaterality
+                      : activeLateralityByPatient[key] ?? firstAvailableLaterality(study);
+                    const loadedPlanes = loadedPlanesForKnee(study, kneeLat);
                     const count = annotator
                       ? sessionAnnotations.filter((r) => r.sourcePatientKey === key).length
-                      : measurementArchive[key]?.length ?? 0;
+                      : LATERALITIES.reduce(
+                          (n, lat) =>
+                            n + (measurementArchive[measurementStorageKey(key, lat)]?.length ?? 0),
+                          0,
+                        );
                     const expanded = Boolean(expandedPatientKeys[key]);
                     return (
                       <div
@@ -373,6 +434,12 @@ function App() {
                             <div className="text-xs font-semibold truncate">{study.patientId || 'unknown-patient'}</div>
                             <div className="text-[11px] text-gray-300 truncate">{study.patientName || 'Unknown Patient'}</div>
                             <div className="text-[10px] text-gray-500 truncate">{study.studyName}</div>
+                            <div className="text-[10px] text-gray-400 mt-0.5">
+                              {LATERALITIES.filter((lat) => kneeHasVolumes(study, lat))
+                                .map((lat) => (lat === 'left' ? 'L' : 'R'))
+                                .join(' · ') || '—'}{' '}
+                              knee
+                            </div>
                             <div className="text-[10px] text-gray-400 mt-1">{count} measurement(s)</div>
                           </button>
                         </div>
@@ -387,23 +454,60 @@ function App() {
                               <span className="text-gray-300">{study.studyInstanceUID || '—'}</span>
                             </div>
                             <div>
-                              <span className="text-gray-500 font-medium text-gray-400">Planes / sequences</span>
-                              <ul className="mt-1 space-y-0.5">
-                                {loadedPlanes.length === 0 ? (
-                                  <li className="italic">No volumes</li>
-                                ) : (
-                                  loadedPlanes.map((p) => {
-                                    const v = study.volumes[p];
-                                    const desc = v?.seriesDescription?.trim();
+                              <span className="text-gray-500 font-medium text-gray-400">
+                                {active
+                                  ? `${kneeLat === 'left' ? 'Left' : 'Right'} knee · sequences`
+                                  : 'Knees / sequences'}
+                              </span>
+                              {active ? (
+                                <ul className="mt-1 space-y-0.5">
+                                  {loadedPlanes.length === 0 ? (
+                                    <li className="italic">No volumes for this knee</li>
+                                  ) : (
+                                    loadedPlanes.map((p) => {
+                                      const v = study.knees[kneeLat].volumes[p];
+                                      const desc = v?.seriesDescription?.trim();
+                                      return (
+                                        <li key={p} className="text-gray-300 capitalize">
+                                          {p}
+                                          {desc ? <span className="text-gray-500"> — {desc}</span> : null}
+                                        </li>
+                                      );
+                                    })
+                                  )}
+                                </ul>
+                              ) : (
+                                <div className="mt-1 space-y-1.5">
+                                  {LATERALITIES.map((lat) => {
+                                    const planes = loadedPlanesForKnee(study, lat);
                                     return (
-                                      <li key={p} className="text-gray-300 capitalize">
-                                        {p}
-                                        {desc ? <span className="text-gray-500"> — {desc}</span> : null}
-                                      </li>
+                                      <div key={lat}>
+                                        <div className="text-gray-400 capitalize">
+                                          {lat === 'left' ? 'Left' : 'Right'} knee
+                                        </div>
+                                        {planes.length === 0 ? (
+                                          <div className="italic text-gray-500">No volumes</div>
+                                        ) : (
+                                          <ul className="space-y-0.5">
+                                            {planes.map((p) => {
+                                              const v = study.knees[lat].volumes[p];
+                                              const desc = v?.seriesDescription?.trim();
+                                              return (
+                                                <li key={p} className="text-gray-300 capitalize">
+                                                  {p}
+                                                  {desc ? (
+                                                    <span className="text-gray-500"> — {desc}</span>
+                                                  ) : null}
+                                                </li>
+                                              );
+                                            })}
+                                          </ul>
+                                        )}
+                                      </div>
                                     );
-                                  })
-                                )}
-                              </ul>
+                                  })}
+                                </div>
+                              )}
                             </div>
                           </div>
                         ) : null}
@@ -414,9 +518,21 @@ function App() {
             )}
           </div>
 
-          {activePatientKey && (
+          {activePatientKey && activePatientRecord && (
             <div className="border-t border-gray-800 pt-3 flex flex-col gap-2 min-h-0 flex-1">
-              <h3 className="text-xs font-semibold text-gray-300">Measurements (this patient)</h3>
+              <div>
+                <h3 className="text-xs font-semibold text-gray-300 mb-1.5">Knee</h3>
+                <KneeLateralityToggle
+                  value={activeLaterality}
+                  onChange={(lat) =>
+                    setActiveLateralityByPatient((m) => ({ ...m, [activePatientKey]: lat }))
+                  }
+                  study={activePatientRecord.study}
+                />
+              </div>
+              <h3 className="text-xs font-semibold text-gray-300">
+                Measurements ({activeLaterality} knee)
+              </h3>
               <p className="text-[10px] text-gray-500">
                 {annotator
                   ? 'Session list: kept until you close this tab. Separate from viewport pan/zoom/brightness.'
@@ -489,7 +605,7 @@ function App() {
                           <div className="min-w-0 flex-1">
                             <div className="font-medium text-gray-100 capitalize">{r.measurementType}</div>
                             <div className="text-gray-400">
-                              {r.sequenceName} · {r.plane} · slice {r.sliceIndex}
+                              {r.laterality} knee · {r.sequenceName} · {r.plane} · slice {r.sliceIndex}
                             </div>
                             {(r.value || r.units) && (
                               <div className="text-blue-300 mt-0.5">

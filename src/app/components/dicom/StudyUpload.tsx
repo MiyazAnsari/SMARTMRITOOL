@@ -2,7 +2,8 @@ import { useRef, useState } from 'react';
 import * as pako from 'pako';
 import { Upload, FolderOpen, Loader2 } from 'lucide-react';
 import { Button } from '../ui/button';
-import { DicomStudy, loadDicomStudy } from './DicomStudy';
+import { loadDicomStudy, type DicomStudy } from './DicomStudy';
+import { studyHasVolumes } from './patientStudy';
 
 interface StudyUploadProps {
   /** Called when a single NIfTI file finishes loading. */
@@ -49,8 +50,7 @@ export function StudyUpload({ onNiftiLoad, onStudyLoad }: StudyUploadProps) {
       setBusy(true);
       setProgress(`Parsing ${files.length} DICOM files…`);
       const study = await loadDicomStudy(files, (m) => setProgress(m));
-      const planes = Object.keys(study.volumes);
-      if (!planes.length) {
+      if (!studyHasVolumes(study)) {
         alert('No DICOM volumes could be loaded from that folder.');
       } else {
         onStudyLoad(study);
