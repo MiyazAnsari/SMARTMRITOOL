@@ -8,8 +8,8 @@ import {
 } from './DicomLoader';
 import {
   type Laterality,
-  lateralityFromDicomTag,
-  lateralityFromPath,
+  detectSeriesLaterality,
+  lateralityFromSeriesText,
   resolveLateralityForPlane,
 } from './laterality';
 
@@ -96,6 +96,29 @@ function assignVolume(
 }
 
 /**
+ * Move volumes that sit in the wrong knee bucket according to series metadata.
+ * Bilateral studies keep both left and right sequences (never delete the other side).
+ */
+function rebalanceKneesFromMetadata(knees: DicomStudy['knees']): void {
+  for (const plane of ['axial', 'sagittal', 'coronal'] as Plane[]) {
+    for (const lat of ['left', 'right'] as Laterality[]) {
+      const vol = knees[lat].volumes[plane];
+      if (!vol) continue;
+
+      const detected = lateralityFromSeriesText(vol.seriesDescription);
+      if (!detected || detected === lat) continue;
+
+      const dest = knees[detected].volumes[plane];
+      if (!dest || vol.sliceCount > dest.sliceCount) {
+        vol.laterality = detected;
+        knees[detected].volumes[plane] = vol;
+      }
+      delete knees[lat].volumes[plane];
+    }
+  }
+}
+
+/**
  * Load a full knee-MRI study (folder containing A_DICOM, S_DICOM, C_DICOM
  * subfolders, optionally under LeftKnee/RightKnee) by reading every file once
  * and grouping by parent directory.
@@ -124,7 +147,6 @@ export async function loadDicomStudy(
     const pathHint = planeHintFromRelativePath(firstRelPath);
     const seriesHint = dirHint ?? pathHint;
 
-    const pathLat = lateralityFromPath(`${dir}/${firstRelPath}`);
     const vol = await loadDicomSeries(buffers, seriesHint || undefined);
     if (!vol) continue;
 
@@ -132,7 +154,12 @@ export async function loadDicomStudy(
     vol.plane = finalPlane;
 
     const dicomLat = buffers[0] ? readLateralityFromDicomBuffer(buffers[0].buffer) : null;
-    const latHint = pathLat ?? dicomLat ?? lateralityFromPath(studyName);
+    const latHint = detectSeriesLaterality(
+      vol.seriesDescription,
+      `${dir}/${firstRelPath}`,
+      studyName,
+      dicomLat ?? undefined,
+    );
     const occupied = {
       left: Boolean(knees.left.volumes[finalPlane]),
       right: Boolean(knees.right.volumes[finalPlane]),
@@ -140,6 +167,8 @@ export async function loadDicomStudy(
     const laterality = resolveLateralityForPlane(latHint, finalPlane, occupied);
     assignVolume(knees, laterality, finalPlane, vol);
   }
+
+  rebalanceKneesFromMetadata(knees);
 
   const representative = (['left', 'right'] as Laterality[])
     .flatMap((lat) => (['axial', 'sagittal', 'coronal'] as Plane[]).map((p) => knees[lat].volumes[p]))

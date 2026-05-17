@@ -9,6 +9,7 @@ import {
   firstAvailableLaterality,
   kneeHasVolumes,
   loadedPlanesForKnee,
+  sequenceVolumeForKnee,
   studyViewForLaterality,
 } from '@/app/components/dicom/patientStudy';
 import {
@@ -465,7 +466,7 @@ function App() {
                                     <li className="italic">No volumes for this knee</li>
                                   ) : (
                                     loadedPlanes.map((p) => {
-                                      const v = study.knees[kneeLat].volumes[p];
+                                      const v = sequenceVolumeForKnee(study, kneeLat, p);
                                       const desc = v?.seriesDescription?.trim();
                                       return (
                                         <li key={p} className="text-gray-300 capitalize">
@@ -490,7 +491,7 @@ function App() {
                                         ) : (
                                           <ul className="space-y-0.5">
                                             {planes.map((p) => {
-                                              const v = study.knees[lat].volumes[p];
+                                              const v = sequenceVolumeForKnee(study, lat, p);
                                               const desc = v?.seriesDescription?.trim();
                                               return (
                                                 <li key={p} className="text-gray-300 capitalize">

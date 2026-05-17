@@ -1,6 +1,6 @@
 import type { DicomStudy } from './DicomStudy';
 import type { Laterality } from './laterality';
-import { LATERALITIES } from './laterality';
+import { LATERALITIES, lateralityForVolume } from './laterality';
 import type { DicomVolume, Plane } from './DicomLoader';
 
 /** Viewer-facing slice of a patient study for one knee. */
@@ -9,26 +9,62 @@ export interface DicomStudyView extends DicomStudy {
   volumes: Partial<Record<Plane, DicomVolume>>;
 }
 
+/** Resolve the volume for a plane on the requested knee (handles mis-bucketed series). */
+function volumeForKneePlane(
+  study: DicomStudy,
+  laterality: Laterality,
+  plane: Plane,
+): DicomVolume | undefined {
+  const candidates: DicomVolume[] = [];
+  for (const lat of LATERALITIES) {
+    const vol = study.knees[lat].volumes[plane];
+    if (vol) candidates.push(vol);
+  }
+  if (!candidates.length) return undefined;
+
+  const bySeries = candidates.find((vol) => lateralityForVolume(vol) === laterality);
+  if (bySeries) return bySeries;
+
+  const byAssignment = candidates.find((vol) => vol.laterality === laterality);
+  if (byAssignment) return byAssignment;
+
+  return study.knees[laterality].volumes[plane];
+}
+
+export function sequenceVolumeForKnee(
+  study: DicomStudy,
+  laterality: Laterality,
+  plane: Plane,
+): DicomVolume | undefined {
+  return volumeForKneePlane(study, laterality, plane);
+}
+
 export function studyViewForLaterality(study: DicomStudy, laterality: Laterality): DicomStudyView {
+  const volumes: Partial<Record<Plane, DicomVolume>> = {};
+  for (const plane of ['axial', 'sagittal', 'coronal'] as Plane[]) {
+    const vol = volumeForKneePlane(study, laterality, plane);
+    if (vol) volumes[plane] = vol;
+  }
   return {
     ...study,
     laterality,
-    volumes: study.knees[laterality].volumes,
+    volumes,
   };
 }
 
 export function studyHasVolumes(study: DicomStudy): boolean {
-  return LATERALITIES.some((lat) => Object.keys(study.knees[lat].volumes).length > 0);
+  return LATERALITIES.some((lat) => kneeHasVolumes(study, lat));
 }
 
 export function firstAvailableLaterality(study: DicomStudy): Laterality {
-  if (Object.keys(study.knees.left.volumes).length > 0) return 'left';
-  if (Object.keys(study.knees.right.volumes).length > 0) return 'right';
+  for (const lat of LATERALITIES) {
+    if (kneeHasVolumes(study, lat)) return lat;
+  }
   return 'left';
 }
 
 export function loadedPlanesForKnee(study: DicomStudy, laterality: Laterality): Plane[] {
-  return (['axial', 'sagittal', 'coronal'] as Plane[]).filter((p) => study.knees[laterality].volumes[p]);
+  return (['axial', 'sagittal', 'coronal'] as Plane[]).filter((p) => volumeForKneePlane(study, laterality, p));
 }
 
 export function kneeHasVolumes(study: DicomStudy, laterality: Laterality): boolean {
@@ -47,11 +83,11 @@ export function listSequenceMetadata(study: DicomStudy): SequenceMetadata[] {
   const rows: SequenceMetadata[] = [];
   for (const laterality of LATERALITIES) {
     for (const plane of ['axial', 'sagittal', 'coronal'] as Plane[]) {
-      const vol = study.knees[laterality].volumes[plane];
+      const vol = volumeForKneePlane(study, laterality, plane);
       if (!vol) continue;
       rows.push({
         patientId: vol.patientId || study.patientId,
-        laterality,
+        laterality: lateralityForVolume(vol) ?? laterality,
         sequenceName: (vol.seriesDescription && vol.seriesDescription.trim()) || plane,
         plane,
       });
