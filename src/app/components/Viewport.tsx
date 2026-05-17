@@ -9,6 +9,11 @@ function clampWindowLevel(windowWidth: number, windowCenter: number): WindowLeve
   return { window, level };
 }
 
+const VIEWPORT_ZOOM_MIN = 1;
+const VIEWPORT_ZOOM_MAX = 20;
+const VIEWPORT_ZOOM_STEP = 1.18;
+const VIEWPORT_ZOOM_ANIM_MS = 140;
+
 interface ViewportProps {
   imageData: Uint8Array;
   header: any;
@@ -87,10 +92,14 @@ export function Viewport({
   const lastPointerClientRef = useRef<{ x: number; y: number } | null>(null);
   const zoomScaleRef = useRef(zoomScale);
   const panSrcRef = useRef(panSrc);
+  const zoomAnimRafRef = useRef<number | null>(null);
   useEffect(() => {
     zoomScaleRef.current = zoomScale;
     panSrcRef.current = panSrc;
   }, [zoomScale, panSrc]);
+  useEffect(() => () => {
+    if (zoomAnimRafRef.current != null) cancelAnimationFrame(zoomAnimRafRef.current);
+  }, []);
   const rotateDragRef = useRef<{ dragging: boolean; startAngle: number; startRotation: number }>({
     dragging: false,
     startAngle: 0,
@@ -366,8 +375,16 @@ export function Viewport({
     rotateDragRef.current.dragging = false;
   }, []);
 
+  const cancelZoomAnimation = useCallback(() => {
+    if (zoomAnimRafRef.current != null) {
+      cancelAnimationFrame(zoomAnimRafRef.current);
+      zoomAnimRafRef.current = null;
+    }
+  }, []);
+
   /** Pan/zoom/rotate/draft state only (parent handles slice, WL, persisted measurements). */
   const resetViewportInteractionState = useCallback(() => {
+    cancelZoomAnimation();
     stopRotateDrag();
     setAxialTransform({ rotation: 0 });
     zoomScaleRef.current = 1;
@@ -384,7 +401,7 @@ export function Viewport({
     setDrawingPoints([]);
     setIsPanning(false);
     panStartRef.current = null;
-  }, [stopRotateDrag]);
+  }, [stopRotateDrag, cancelZoomAnimation]);
 
   const handleViewerReset = useCallback(() => {
     resetViewportInteractionState();
@@ -446,12 +463,93 @@ export function Viewport({
     [getPlaneGeometry, normalizeAngle, axialTransform.rotation]
   );
 
-  /** Axial zoom mode: zoom toward whatever is under the pointer (hover + scroll). */
-  const applyAxialWheelZoomAtPointer = useCallback(
+  /** Update zoom scale while keeping a fixed image-space focal point (pan only — no slice/WL changes). */
+  const applyZoomAtImageFocal = useCallback((focalX: number, focalY: number, newZ: number) => {
+    const iw = sliceDimsRef.current.w;
+    const ih = sliceDimsRef.current.h;
+    if (iw < 1 || ih < 1) return;
+
+    const clampedZ = Math.min(VIEWPORT_ZOOM_MAX, Math.max(VIEWPORT_ZOOM_MIN, newZ));
+    if (clampedZ <= VIEWPORT_ZOOM_MIN + 1e-6) {
+      zoomScaleRef.current = VIEWPORT_ZOOM_MIN;
+      panSrcRef.current = { x: 0, y: 0 };
+      setZoomScale(VIEWPORT_ZOOM_MIN);
+      setPanSrc({ x: 0, y: 0 });
+      return;
+    }
+
+    const newCropW = Math.max(1, Math.floor(iw / clampedZ));
+    const newCropH = Math.max(1, Math.floor(ih / clampedZ));
+    let npx = Math.round(focalX - newCropW / 2);
+    let npy = Math.round(focalY - newCropH / 2);
+    npx = Math.max(0, Math.min(iw - newCropW, npx));
+    npy = Math.max(0, Math.min(ih - newCropH, npy));
+
+    zoomScaleRef.current = clampedZ;
+    panSrcRef.current = { x: npx, y: npy };
+    setZoomScale(clampedZ);
+    setPanSrc({ x: npx, y: npy });
+  }, []);
+
+  const getViewportCenterImagePixel = useCallback((): { x: number; y: number } => {
+    const iw = sliceDimsRef.current.w;
+    const ih = sliceDimsRef.current.h;
+    if (iw < 1 || ih < 1) return { x: 0, y: 0 };
+    const z = Math.max(VIEWPORT_ZOOM_MIN, zoomScaleRef.current);
+    const cropW = Math.max(1, Math.floor(iw / z));
+    const cropH = Math.max(1, Math.floor(ih / z));
+    return {
+      x: panSrcRef.current.x + cropW / 2,
+      y: panSrcRef.current.y + cropH / 2,
+    };
+  }, []);
+
+  const animateZoomToTarget = useCallback(
+    (targetZ: number) => {
+      cancelZoomAnimation();
+      const iw = sliceDimsRef.current.w;
+      const ih = sliceDimsRef.current.h;
+      if (iw < 1 || ih < 1) return;
+
+      const focal = getViewportCenterImagePixel();
+      const startZ = zoomScaleRef.current;
+      const endZ = Math.min(VIEWPORT_ZOOM_MAX, Math.max(VIEWPORT_ZOOM_MIN, targetZ));
+      if (Math.abs(endZ - startZ) < 1e-4) return;
+
+      const t0 = performance.now();
+      const tick = (now: number) => {
+        const t = Math.min(1, (now - t0) / VIEWPORT_ZOOM_ANIM_MS);
+        const eased = 1 - (1 - t) ** 3;
+        const z = startZ + (endZ - startZ) * eased;
+        applyZoomAtImageFocal(focal.x, focal.y, z);
+        if (t < 1) {
+          zoomAnimRafRef.current = requestAnimationFrame(tick);
+        } else {
+          applyZoomAtImageFocal(focal.x, focal.y, endZ);
+          zoomAnimRafRef.current = null;
+        }
+      };
+      zoomAnimRafRef.current = requestAnimationFrame(tick);
+    },
+    [applyZoomAtImageFocal, cancelZoomAnimation, getViewportCenterImagePixel],
+  );
+
+  const zoomInStep = useCallback(() => {
+    animateZoomToTarget(zoomScaleRef.current * VIEWPORT_ZOOM_STEP);
+  }, [animateZoomToTarget]);
+
+  const zoomOutStep = useCallback(() => {
+    animateZoomToTarget(zoomScaleRef.current / VIEWPORT_ZOOM_STEP);
+  }, [animateZoomToTarget]);
+
+  /** Wheel zoom (unchanged behavior): only when Zoom mode is on; focal = pointer. */
+  const applyWheelZoomAtPointer = useCallback(
     (clientX: number, clientY: number, deltaY: number, deltaMode: number) => {
       const iw = sliceDimsRef.current.w;
       const ih = sliceDimsRef.current.h;
       if (iw < 1 || ih < 1) return;
+
+      cancelZoomAnimation();
 
       const main = canvasRef.current;
       if (main) {
@@ -471,67 +569,37 @@ export function Viewport({
       if (!focal && lastPointerClientRef.current) {
         focal = clientToImagePixel(lastPointerClientRef.current.x, lastPointerClientRef.current.y);
       }
+      const center = getViewportCenterImagePixel();
+      const fx = focal?.imgX ?? center.x;
+      const fy = focal?.imgY ?? center.y;
 
       const prevZ = zoomScaleRef.current;
       let step = deltaY;
       if (deltaMode === 1) step *= 16;
       if (deltaMode === 2) step *= 800;
       const factor = Math.exp(-step * 0.0012);
-      const newZ = Math.min(20, Math.max(1, prevZ * factor));
+      const newZ = Math.min(VIEWPORT_ZOOM_MAX, Math.max(VIEWPORT_ZOOM_MIN, prevZ * factor));
       if (Math.abs(newZ - prevZ) < 1e-6) return;
 
-      if (newZ <= 1) {
-        zoomScaleRef.current = 1;
-        panSrcRef.current = { x: 0, y: 0 };
-        setZoomScale(1);
-        setPanSrc({ x: 0, y: 0 });
-        return;
-      }
-
-      const cropW = Math.max(1, Math.floor(iw / prevZ));
-      const cropH = Math.max(1, Math.floor(ih / prevZ));
-      const px = Math.max(0, Math.min(iw - cropW, Math.round(panSrcRef.current.x)));
-      const py = Math.max(0, Math.min(ih - cropH, Math.round(panSrcRef.current.y)));
-
-      let uFrac = 0.5;
-      let vFrac = 0.5;
-      if (focal) {
-        uFrac = cropW > 0 ? (focal.imgX - px) / cropW : 0.5;
-        vFrac = cropH > 0 ? (focal.imgY - py) / cropH : 0.5;
-        uFrac = Math.max(0, Math.min(1, uFrac));
-        vFrac = Math.max(0, Math.min(1, vFrac));
-      }
-
-      const imgX = px + uFrac * cropW;
-      const imgY = py + vFrac * cropH;
-
-      const newCropW = Math.max(1, Math.floor(iw / newZ));
-      const newCropH = Math.max(1, Math.floor(ih / newZ));
-      let npx = Math.round(imgX - uFrac * newCropW);
-      let npy = Math.round(imgY - vFrac * newCropH);
-      npx = Math.max(0, Math.min(iw - newCropW, npx));
-      npy = Math.max(0, Math.min(ih - newCropH, npy));
-
-      zoomScaleRef.current = newZ;
-      panSrcRef.current = { x: npx, y: npy };
-      setZoomScale(newZ);
-      setPanSrc({ x: npx, y: npy });
+      applyZoomAtImageFocal(fx, fy, newZ);
     },
-    [clientToImagePixel]
+    [applyZoomAtImageFocal, cancelZoomAnimation, clientToImagePixel, getViewportCenterImagePixel],
   );
 
-  // Keep axial starting orientation neutral and centered when loading new image data.
+  // Reset interaction state when a new volume buffer is loaded for this viewer.
   useEffect(() => {
-    if (!isAxial) return;
-    setAxialTransform({ rotation: 0 });
+    if (isAxial) {
+      setAxialTransform({ rotation: 0 });
+      setIsRotateMode(false);
+    }
+    cancelZoomAnimation();
     zoomScaleRef.current = 1;
     panSrcRef.current = { x: 0, y: 0 };
     setZoomScale(1);
     setPanSrc({ x: 0, y: 0 });
-    setIsRotateMode(false);
     setIsZoomMode(false);
     lastPointerClientRef.current = null;
-  }, [imageData, isAxial]);
+  }, [imageData, isAxial, cancelZoomAnimation]);
 
   // Heavy rendering effect: builds source canvas and caches ImageBitmap when slice/WL/weighting changes
   const bitmapRef = useRef<ImageBitmap | null>(null);
@@ -1181,7 +1249,7 @@ export function Viewport({
   const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
     e.preventDefault();
     if (isZoomMode) {
-      applyAxialWheelZoomAtPointer(e.clientX, e.clientY, e.deltaY, e.deltaMode);
+      applyWheelZoomAtPointer(e.clientX, e.clientY, e.deltaY, e.deltaMode);
       return;
     }
     const delta = e.deltaY > 0 ? 1 : -1;
@@ -1235,6 +1303,12 @@ export function Viewport({
             </span>
             <span className="tabular-nums shrink-0 whitespace-nowrap text-gray-200" title="Brightness (this viewer only)">
               Br {Math.round(brightness * 100)}%
+            </span>
+            <span className="text-gray-600 shrink-0" aria-hidden>
+              |
+            </span>
+            <span className="tabular-nums shrink-0 whitespace-nowrap text-gray-200" title="Zoom scale (this viewer only)">
+              Z {Math.round(zoomScale * 100)}%
             </span>
           </div>
           <div className="flex flex-wrap items-center justify-end gap-0.5 shrink-0">
@@ -1290,6 +1364,62 @@ export function Viewport({
             </button>
             <button
               type="button"
+              className={`px-1.5 py-0.5 rounded border text-[10px] ${
+                isZoomMode
+                  ? 'bg-blue-600 border-blue-500 text-white'
+                  : 'bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700'
+              }`}
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsZoomMode((v) => {
+                  const next = !v;
+                  if (next) {
+                    setIsRotateMode(false);
+                    setIsBrightnessMode(false);
+                    setIsWlwwMode(false);
+                    stopRotateDrag();
+                    lastPointerClientRef.current = null;
+                  }
+                  return next;
+                });
+              }}
+              title="Zoom: wheel zooms toward cursor; use +/− for trackpad (this viewer only)"
+              aria-expanded={isZoomMode}
+            >
+              Zoom{isZoomMode ? ' ▼' : ''}
+            </button>
+            {isZoomMode ? (
+              <>
+                <button
+                  type="button"
+                  className="min-w-[1.35rem] px-1 py-0.5 rounded border text-[11px] font-semibold leading-none bg-gray-800 border-gray-700 text-gray-100 hover:bg-gray-700 disabled:opacity-35 disabled:pointer-events-none"
+                  disabled={zoomScale >= VIEWPORT_ZOOM_MAX - 0.02}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    zoomInStep();
+                  }}
+                  title="Zoom in (viewport center)"
+                  aria-label="Zoom in"
+                >
+                  +
+                </button>
+                <button
+                  type="button"
+                  className="min-w-[1.35rem] px-1 py-0.5 rounded border text-[11px] font-semibold leading-none bg-gray-800 border-gray-700 text-gray-100 hover:bg-gray-700 disabled:opacity-35 disabled:pointer-events-none"
+                  disabled={zoomScale <= VIEWPORT_ZOOM_MIN + 0.02}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    zoomOutStep();
+                  }}
+                  title="Zoom out (viewport center)"
+                  aria-label="Zoom out"
+                >
+                  −
+                </button>
+              </>
+            ) : null}
+            <button
+              type="button"
               className="px-1.5 py-0.5 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-[10px] text-gray-100"
               onClick={(e) => {
                 e.stopPropagation();
@@ -1339,30 +1469,6 @@ export function Viewport({
                   title="Rotate (axial)"
                 >
                   Rot
-                </button>
-                <button
-                  type="button"
-                  className={`px-1.5 py-0.5 rounded border text-[10px] ${
-                    isZoomMode
-                      ? 'bg-blue-600 border-blue-500 text-white'
-                      : 'bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700'
-                  }`}
-                  title="Scroll wheel zooms toward cursor (this viewer only)"
-                  onClick={() => {
-                    setIsZoomMode((v) => {
-                      const next = !v;
-                      if (next) {
-                        setIsRotateMode(false);
-                        setIsBrightnessMode(false);
-                        setIsWlwwMode(false);
-                        stopRotateDrag();
-                        lastPointerClientRef.current = null;
-                      }
-                      return next;
-                    });
-                  }}
-                >
-                  Zoom
                 </button>
                 <button
                   type="button"
