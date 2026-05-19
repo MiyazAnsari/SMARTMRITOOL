@@ -57,6 +57,7 @@ export interface Measurement {
   value?: string;
   baseLineId?: string;
   groupId?: string;
+  label?: string;
 }
 
 interface MedicalImageViewerExtras {
@@ -387,11 +388,20 @@ export function MedicalImageViewer({
   }, [workflow.protocolId]);
 
   const handleMeasurementAdd = useCallback((measurement: Measurement) => {
-    setMeasurements(prev => [...prev, { ...measurement, groupId: currentGroupIdRef.current ?? undefined }]);
-
-      // If a workflow step is active and the drawn primitive matches what the
-      // step expects, fold it into workflow state so the checklist advances and
-      // the final clinical value can be computed.
+    setMeasurements(prev => {
+      let label = measurement.label;
+      if (!label) {
+        if (measurement.type === 'perpendicular') {
+          const perpCount = prev.filter(m =>
+            m.type === 'perpendicular' && m.groupId === currentGroupIdRef.current
+          ).length;
+          label = `Perp ${perpCount + 1}`;
+        } else if (activeStep) {
+          label = activeStep.label;
+        }
+      }
+      return [...prev, { ...measurement, groupId: currentGroupIdRef.current ?? undefined, label }];
+    });
       if (protocol && activeStep && measurementMatchesPrimitive(measurement, activeStep.primitive)) {
         setWorkflow(prev =>
           recordStepResult(prev, protocol, {

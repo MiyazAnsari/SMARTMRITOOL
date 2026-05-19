@@ -107,7 +107,7 @@ export function Toolbar({ activeTool, onToolChange, measurements, onMeasurementD
                       {groupMeasurements.map((measurement) => (
                         <div key={measurement.id} className="flex items-start justify-between bg-gray-800 p-2 rounded text-xs">
                           <div className="flex-1 mr-2">
-                            <div className="font-medium text-gray-300 capitalize">{measurement.type}</div>
+                            <div className="font-medium text-gray-300 capitalize">{measurement.label || measurement.type}</div>
                             <div className="text-gray-500 mt-0.5">{measurement.plane} - Slice {measurement.slice}</div>
                             {measurement.value && <div className="text-blue-400 mt-1">{measurement.value}</div>}
                           </div>
