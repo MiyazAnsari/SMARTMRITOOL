@@ -387,7 +387,18 @@ export function MedicalImageViewer({
     }
   }, [workflow.protocolId]);
 
+  const measurementsRef2 = useRef(measurements);
+  useEffect(() => { measurementsRef2.current = measurements; }, [measurements]);
+
   const handleMeasurementAdd = useCallback((measurement: Measurement) => {
+    if (currentGroupIdRef.current && protocol) {
+      const groupMeasurements = measurementsRef2.current.filter(m => m.groupId === currentGroupIdRef.current);
+      const distanceCount = groupMeasurements.filter(m => m.type === 'distance' || m.type === 'line').length;
+      const perpCount = groupMeasurements.filter(m => m.type === 'perpendicular').length;
+  
+      if ((measurement.type === 'distance' || measurement.type === 'line') && distanceCount >= 1) return;
+      if (measurement.type === 'perpendicular' && perpCount >= 2) return;
+    }
     setMeasurements(prev => {
       let label = measurement.label;
       if (!label) {
@@ -395,9 +406,16 @@ export function MedicalImageViewer({
           const perpCount = prev.filter(m =>
             m.type === 'perpendicular' && m.groupId === currentGroupIdRef.current
           ).length;
-          label = `Perp ${perpCount + 1}`;
-        } else if (activeStep) {
-          label = activeStep.label;
+          if (protocol && perpCount < protocol.steps.length - 1) {
+            label = protocol.steps[perpCount + 1].label;
+          } else {
+            label = `Perp ${perpCount + 1}`;
+          }
+        } else if (protocol && currentGroupIdRef.current) {
+          const lineCount = prev.filter(m =>
+            (m.type === 'distance' || m.type === 'line') && m.groupId === currentGroupIdRef.current
+          ).length;
+          label = protocol.steps[lineCount]?.label;
         }
       }
       return [...prev, { ...measurement, groupId: currentGroupIdRef.current ?? undefined, label }];
