@@ -95,21 +95,21 @@ const TT_TG: MeasurementProtocol = {
       id: 'condyle-line',
       label: 'Posterior femoral condyle line',
       instruction:
-        'Scroll to the slice showing the posterior femoral condyles. Place a line tangent to both posterior condyles.',
+        'Scroll to the slice showing the posterior femoral condyles. Click on "Distance" under Measurement Tools and place a line tangent to both posterior condyles.',
       primitive: 'line',
     },
     {
       id: 'trochlear-groove',
       label: 'Deepest point of trochlear groove',
       instruction:
-        'Scroll to the slice showing the trochlear groove. Click the deepest point of the groove.',
+        'Scroll to the slice showing the trochlear groove. Click on "Select" and click on the line you just made to create a perpendicular branch. Drag and adjust this branch to the deepest point of the groove.',
       primitive: 'point',
     },
     {
       id: 'tibial-tubercle',
       label: 'Most anterior point of tibial tubercle',
       instruction:
-        'Scroll down to the slice showing the tibial tubercle. Click the most anterior point.',
+        'Scroll down to the slice showing the tibial tubercle. Click on "Select" to create another perpendicular branch, parallel to the first. Drag and adjust to the most anterior point.',
       primitive: 'point',
     },
   ],

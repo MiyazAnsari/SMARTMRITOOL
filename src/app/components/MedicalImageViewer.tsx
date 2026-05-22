@@ -701,12 +701,6 @@ export function MedicalImageViewer({
 
       <div style={{ width: rightWidth }} className="flex-shrink-0">
         <WeightingPanel
-          weighting={weighting}
-          onWeightingChange={setWeighting}
-          customWeighting={customWeighting}
-          onCustomWeightingChange={(p) => setCustomWeighting(p)}
-          contrastMode={contrastMode}
-          onContrastModeChange={(m) => setContrastMode(m)}
           onStudyPlaneSelect={selectStudyPlane}
           onFileLoad={onFileLoad}
           onStudyLoad={onStudyLoad}
