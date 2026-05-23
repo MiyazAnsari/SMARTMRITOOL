@@ -25,7 +25,6 @@ interface ViewportGridProps {
   activeTool: MeasurementTool;
   measurements: Measurement[];
   onMeasurementAdd: (measurement: Measurement) => void;
-  onMeasurementUpdate: (id: string, newPoints: { x: number; y: number }[]) => void;
   applyWeighting: (pixelValue: number) => number;
   showCrosshair?: boolean;
   /** Multi-sequence mode (study): one draggable window per sequence. */
@@ -48,7 +47,6 @@ export function ViewportGrid({
   activeTool,
   measurements,
   onMeasurementAdd,
-  onMeasurementUpdate,
   applyWeighting,
   showCrosshair = false,
   sequenceWindows,
@@ -167,7 +165,6 @@ export function ViewportGrid({
               activeTool={activeTool}
               measurements={planeMeasurements}
               onMeasurementAdd={onMeasurementAdd}
-              onMeasurementUpdate={onMeasurementUpdate}
               applyWeighting={applyWeighting}
               showCrosshair={showCrosshair}
               onViewportReset={() => onResetViewport?.(viewPlane)}
@@ -238,7 +235,6 @@ export function ViewportGrid({
                 activeTool={activeTool}
                 measurements={measurements.filter((m) => m.plane === w.id)}
                 onMeasurementAdd={onMeasurementAdd}
-                onMeasurementUpdate={onMeasurementUpdate}
                 applyWeighting={applyWeighting}
                 showCrosshair={showCrosshair}
                 parentWindowHeight={pos.height}

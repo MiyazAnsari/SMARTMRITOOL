@@ -3,12 +3,14 @@ import { Separator } from '@/app/components/ui/separator';
 import { 
   Ruler, 
   Triangle, 
+  Circle, 
+  Pentagon, 
+  Pencil,
   Trash2,
   MousePointer
 } from 'lucide-react';
 import { MeasurementTool, type Measurement } from './MedicalImageViewer';
 import { ScrollArea } from '@/app/components/ui/scroll-area';
-import { useState } from 'react';
 
 interface ToolbarProps {
   activeTool: MeasurementTool;
@@ -25,19 +27,13 @@ export function Toolbar({ activeTool, onToolChange, measurements, onMeasurementD
     { id: 'none', icon: MousePointer, label: 'Select' },
     { id: 'distance', icon: Ruler, label: 'Distance' },
     { id: 'angle', icon: Triangle, label: 'Angle' },
+    { id: 'ellipse', icon: Circle, label: 'Ellipse' },
+    { id: 'closedCurve', icon: Pentagon, label: 'Polygon' },
+    { id: 'freehand', icon: Pencil, label: 'Freehand' },
   ];
-  // Group measurements by groupId
-  const groups = measurements.reduce((acc, m) => {
-    const key = m.groupId || 'ungrouped';
-    if (!acc[key]) acc[key] = [];
-    acc[key].push(m);
-    return acc;
-  }, {} as Record<string, typeof measurements>);
-
-  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
 
   return (
-    <div className="bg-gray-900 border-r border-gray-800 flex flex-col w-48">
+    <div className="bg-gray-900 border-r border-gray-800 flex flex-col">
       <div className="p-4">
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-sm font-semibold text-gray-300">Measurement Tools</h2>
@@ -83,31 +79,30 @@ export function Toolbar({ activeTool, onToolChange, measurements, onMeasurementD
             {measurements.length === 0 ? (
               <p className="text-xs text-gray-500 italic">No measurements yet</p>
             ) : (
-              Object.entries(groups).map(([groupId, groupMeasurements]) => (
-                <div key={groupId} className="mb-2">
-                  <button
-                    className="w-full flex items-center justify-between text-xs font-semibold text-gray-300 hover:text-white py-1"
-                    onClick={() => setCollapsedGroups(prev => ({ ...prev, [groupId]: !prev[groupId] }))}
-                  >
-                    <span>{groupId === 'ungrouped' ? 'Measurements' : groupId.split('-').slice(0, -1).join('-').toUpperCase()}</span>
-                    <span>{collapsedGroups[groupId] ? '▶' : '▼'}</span>
-                  </button>
-                  {!collapsedGroups[groupId] && (
-                    <div className="space-y-2">
-                      {groupMeasurements.map((measurement) => (
-                        <div key={measurement.id} className="flex items-start justify-between bg-gray-800 p-2 rounded text-xs">
-                          <div className="flex-1 mr-2">
-                            <div className="font-medium text-gray-300 capitalize">{measurement.label || measurement.type}</div>
-                            <div className="text-gray-500 mt-0.5">{measurement.plane} - Slice {measurement.slice}</div>
-                            {measurement.value && <div className="text-blue-400 mt-1">{measurement.value}</div>}
-                          </div>
-                          <Button variant="ghost" size="sm" className="h-6 w-6 p-0 text-gray-500 hover:text-red-400 hover:bg-gray-700" onClick={() => onMeasurementDelete(measurement.id)}>
-                            <Trash2 className="h-3 w-3" />
-                          </Button>
-                        </div>
-                      ))}
+              measurements.map((measurement) => (
+                <div
+                  key={measurement.id}
+                  className="flex items-start justify-between bg-gray-800 p-2 rounded text-xs"
+                >
+                  <div className="flex-1 mr-2">
+                    <div className="font-medium text-gray-300 capitalize">
+                      {measurement.type}
                     </div>
-                  )}
+                    <div className="text-gray-500 mt-0.5">
+                      {measurement.plane} - Slice {measurement.slice}
+                    </div>
+                    {measurement.value && (
+                      <div className="text-blue-400 mt-1">{measurement.value}</div>
+                    )}
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 w-6 p-0 text-gray-500 hover:text-red-400 hover:bg-gray-700"
+                    onClick={() => onMeasurementDelete(measurement.id)}
+                  >
+                    <Trash2 className="h-3 w-3" />
+                  </Button>
                 </div>
               ))
             )}

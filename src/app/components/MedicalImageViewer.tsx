@@ -1,14 +1,13 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import * as nifti from 'nifti-reader-js';
 import { ViewportGrid } from './ViewportGrid';
-import { Toolbar } from './Toolbar';
 import { WeightingPanel } from './WeightingPanel';
 import { Button } from './ui/button';
 import { RadioGroup, RadioGroupItem } from './ui/radio-group';
 import { Slider } from './ui/slider';
 import { Label } from './ui/label';
 import { MousePointer, Circle as CircleIcon, Pencil, Move } from 'lucide-react';
-import type { DicomStudy } from './dicom/DicomStudy';
+import type { DicomStudyView } from './dicom/patientStudy';
 import type { DicomVolume, Plane } from './dicom/DicomLoader';
 import {
   initialWorkflowState,
@@ -19,14 +18,45 @@ import {
   getProtocol,
   Primitive,
 } from './measurement/MeasurementProtocols';
+import type { SessionAnnotator, SessionAnnotationRow } from '@/app/lib/sessionAnnotationCsv';
+import { splitValueUnits } from '@/app/lib/sessionAnnotationCsv';
+
+const STUDY_PLANE_ORDER: Plane[] = ['axial', 'sagittal', 'coronal'];
 
 function preferredAvailablePlane(volumes: Partial<Record<Plane, DicomVolume>>): Plane | null {
-  const order: Plane[] = ['axial', 'sagittal', 'coronal'];
-  for (const p of order) {
+  for (const p of STUDY_PLANE_ORDER) {
     if (volumes[p]) return p;
   }
   const keys = Object.keys(volumes) as Plane[];
   return keys[0] ?? null;
+}
+
+/** Which floating DICOM viewers are open + which series drives the sidebar / pixel spacing. */
+type StudyViewportState = { open: Plane[]; active: Plane };
+
+function initialOpenPlanesForStudy(volumes: Partial<Record<Plane, DicomVolume>>): Plane[] {
+  return STUDY_PLANE_ORDER.filter((p) => Boolean(volumes[p]));
+}
+
+/** 0-based index of the middle slice: `Math.floor(totalSlices / 2)` (per plane / sequence). */
+export function middleSliceIndexFromCount(totalSlices: number): number {
+  if (!Number.isFinite(totalSlices) || totalSlices <= 0) return 0;
+  return Math.floor(totalSlices / 2);
+}
+
+function stateAfterClosingViewer(
+  s: StudyViewportState,
+  plane: Plane,
+  volumes: Partial<Record<Plane, DicomVolume>>,
+): StudyViewportState {
+  if (!s.open.includes(plane)) return s;
+  const open = s.open.filter((p) => p !== plane);
+  let active = s.active;
+  if (active === plane) {
+    const next = open[0] ?? preferredAvailablePlane(volumes);
+    active = next ?? plane;
+  }
+  return { open, active };
 }
 
 export interface MedicalImageViewerProps {
@@ -37,7 +67,9 @@ export type MeasurementTool =
   | 'none'
   | 'distance'
   | 'angle'
-  | 'perpendicular'
+  | 'ellipse'
+  | 'closedCurve'
+  | 'freehand'
   | 'pan'
   | 'line'
   | 'point';
@@ -48,6 +80,9 @@ export interface WindowLevel {
   level: number;
 }
 
+/** Default W/L for normalized 0–255 NIfTI display (per-viewport state lives in `Viewport`). */
+const NIFTI_DEFAULT_WINDOW_LEVEL: WindowLevel = { window: 255, level: 128 };
+
 export interface Measurement {
   id: string;
   type: MeasurementTool;
@@ -55,15 +90,25 @@ export interface Measurement {
   slice: number;
   plane: 'axial' | 'sagittal' | 'coronal';
   value?: string;
-  baseLineId?: string;
-  groupId?: string;
-  label?: string;
+  /** ISO-8601 when captured; set automatically on add for persisted patients. */
+  timestamp?: string;
 }
 
 interface MedicalImageViewerExtras {
   onFileLoad?: (data: ArrayBuffer, name: string) => void;
-  studyData?: DicomStudy | null;
-  onStudyLoad?: (study: DicomStudy) => void;
+  studyData?: DicomStudyView | null;
+  onStudyLoad?: (study: import('./dicom/DicomStudy').DicomStudy) => void;
+  /** When set with `onPatientMeasurementsUpdate`, measurements are controlled by the parent (per-patient persistence). */
+  patientStorageKey?: string | null;
+  patientMeasurements?: Measurement[];
+  onPatientMeasurementsUpdate?: (updater: (prev: Measurement[]) => Measurement[]) => void;
+  /**
+   * Session-only annotations: when set with `onCommitSessionAnnotation`, new drawings are persisted
+   * as structured rows in the parent (not localStorage). Overrides archive `onPatientMeasurementsUpdate`.
+   */
+  sessionAnnotator?: SessionAnnotator | null;
+  onCommitSessionAnnotation?: (row: SessionAnnotationRow) => void;
+  onDeleteSessionAnnotation?: (annotationId: string) => void;
 }
 
 /** Map a protocol primitive to one of the existing viewport tools. */
@@ -86,8 +131,36 @@ function measurementMatchesPrimitive(measurement: Measurement, primitive: Primit
   if (primitive === 'line') return measurement.type === 'line' || measurement.type === 'distance';
   if (primitive === 'distance') return measurement.type === 'distance' || measurement.type === 'line';
   if (primitive === 'angle') return measurement.type === 'angle';
-  if (primitive === 'point') return measurement.type === 'point' || measurement.type === 'perpendicular';
+  if (primitive === 'point') return measurement.type === 'point';
   return false;
+}
+
+function buildSessionAnnotationRow(
+  m: Measurement,
+  studyData: DicomStudyView,
+  sourcePatientKey: string,
+  annotator: SessionAnnotator,
+): SessionAnnotationRow {
+  const vol = studyData.volumes[m.plane];
+  const sequenceName = (vol?.seriesDescription && vol.seriesDescription.trim()) || m.plane;
+  const { value, units } = splitValueUnits(m.value);
+  const ts = m.timestamp || new Date().toISOString();
+  return {
+    sourcePatientKey,
+    laterality: studyData.laterality,
+    annotationId: crypto.randomUUID(),
+    patientId: studyData.patientId || 'unknown',
+    sequenceName,
+    plane: m.plane,
+    measurementType: m.type,
+    value,
+    units,
+    sliceIndex: m.slice,
+    annotatedBy: annotator.name,
+    annotatorEmail: annotator.email,
+    timestamp: ts,
+    points: m.points.map((p) => ({ x: p.x, y: p.y })),
+  };
 }
 
 export function MedicalImageViewer({
@@ -95,19 +168,34 @@ export function MedicalImageViewer({
   onFileLoad,
   studyData = null,
   onStudyLoad,
+  patientStorageKey = null,
+  patientMeasurements,
+  onPatientMeasurementsUpdate,
+  sessionAnnotator = null,
+  onCommitSessionAnnotation,
+  onDeleteSessionAnnotation,
 }: MedicalImageViewerProps & MedicalImageViewerExtras) {
   const [imageData, setImageData] = useState<Uint8Array | null>(null);
   const [header, setHeader] = useState<any>(null);
   const [dataRange, setDataRange] = useState<{ min: number; max: number }>({ min: 0, max: 255 });
   const [currentSlice, setCurrentSlice] = useState({ axial: 0, sagittal: 0, coronal: 0 });
-  const [windowLevel, setWindowLevel] = useState<WindowLevel>({ window: 400, level: 40 });
+  /** Middle slice at last sequence load (`Math.floor(totalSlices/2)`), per plane; independent A/S/C. */
+  const initialSliceIndex = useRef({ axial: 0, sagittal: 0, coronal: 0 });
   const [activeTool, setActiveTool] = useState<MeasurementTool>('pan');
-  const [measurements, setMeasurements] = useState<Measurement[]>([]);
+  const [localMeasurements, setLocalMeasurements] = useState<Measurement[]>([]);
+  const sessionMeasurementMode =
+    Boolean(patientStorageKey) &&
+    Boolean(sessionAnnotator) &&
+    typeof onCommitSessionAnnotation === 'function';
+  const archiveMeasurementMode =
+    Boolean(patientStorageKey) &&
+    typeof onPatientMeasurementsUpdate === 'function' &&
+    !sessionMeasurementMode;
+  const measurementsControlled = sessionMeasurementMode || archiveMeasurementMode;
+  const measurements = measurementsControlled ? (patientMeasurements ?? []) : localMeasurements;
   const [weighting, setWeighting] = useState<WeightingType>('T1');
   // single psi slider for custom weighting (0-180 degrees)
   const [customWeighting, setCustomWeighting] = useState({ psi: 90 });
-  // Processing mode for contrasts
-  const [contrastMode, setContrastMode] = useState<'disk' | 'gpu'>('disk');
   // UI helpers
   const [showCrosshair, setShowCrosshair] = useState<boolean>(false);
   // resizable right panel width (px)
@@ -115,19 +203,17 @@ export function MedicalImageViewer({
   const rightResizing = useRef(false);
   // Measurement workflow (TT-TG, Insall–Salvati, etc.)
   const [workflow, setWorkflow] = useState<WorkflowState>(initialWorkflowState);
-  /** Which DICOM series is loaded (native acquisition). Independent from Open Planes (MPR view). */
-  const [activeStudyPlane, setActiveStudyPlane] = useState<Plane>('axial');
-  const [hiddenStudyPlanes, setHiddenStudyPlanes] = useState<Set<Plane>>(new Set());
-  const prevStudyDataRef = useRef<DicomStudy | null>(null);
+  /** DICOM: open floating viewers + focused series (single source of truth with `open`). */
+  const [studyViewport, setStudyViewport] = useState<StudyViewportState>({ open: [], active: 'axial' });
+  const prevStudyDataRef = useRef<DicomStudyView | null>(null);
 
   const protocol = useMemo(() => getProtocol(workflow.protocolId), [workflow.protocolId]);
   const activeStep = protocol?.steps[workflow.activeStepIndex] ?? null;
   // When a workflow step is active, override the user-selected tool so the
   // correct primitive is always armed.
-  const effectiveTool: MeasurementTool = activeTool;
-
-  const [currentGroupId, setCurrentGroupId] = useState<string | null>(null);
-  const currentGroupIdRef = useRef<string | null>(null);
+  const effectiveTool: MeasurementTool = activeStep
+    ? primitiveToTool(activeStep.primitive)
+    : activeTool;
 
   useEffect(() => {
     if (!niftiData) return;
@@ -218,15 +304,14 @@ export function MedicalImageViewer({
       setImageData(normalizedData);
       setDataRange({ min, max });
       
-      // Set initial slices to middle
-      setCurrentSlice({
-        axial: Math.floor(niftiHeader.dims[3] / 2),
-        sagittal: Math.floor(niftiHeader.dims[1] / 2),
-        coronal: Math.floor(niftiHeader.dims[2] / 2),
-      });
-      
-      // Set default window/level based on normalized range (0-255)
-      setWindowLevel({ window: 255, level: 128 });
+      const d = niftiHeader.dims;
+      const initial = {
+        axial: middleSliceIndexFromCount(d[3] ?? 0),
+        sagittal: middleSliceIndexFromCount(d[1] ?? 0),
+        coronal: middleSliceIndexFromCount(d[2] ?? 0),
+      };
+      initialSliceIndex.current = initial;
+      setCurrentSlice(initial);
     } catch (error) {
       console.error('Error parsing NIfTI file:', error);
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -234,45 +319,60 @@ export function MedicalImageViewer({
     }
   }, [niftiData]);
 
-  useEffect(() => {
-    if (studyData != null) return;
-    setActiveStudyPlane('axial');
-  }, [studyData]);
-
   // Load pixels from the active DICOM series. Viewer behavior stays axial-like for all sequences.
   useEffect(() => {
     if (!studyData) {
       prevStudyDataRef.current = null;
-      setHiddenStudyPlanes(new Set());
+      setStudyViewport({ open: [], active: 'axial' });
+      const cleared = { axial: 0, sagittal: 0, coronal: 0 };
+      initialSliceIndex.current = cleared;
+      setCurrentSlice(cleared);
       return;
     }
 
     if (prevStudyDataRef.current !== studyData) {
       prevStudyDataRef.current = studyData;
-      setHiddenStudyPlanes(new Set());
-      setCurrentSlice({
-        axial: studyData.volumes.axial ? Math.floor(studyData.volumes.axial.sliceCount / 2) : 0,
-        sagittal: studyData.volumes.sagittal ? Math.floor(studyData.volumes.sagittal.sliceCount / 2) : 0,
-        coronal: studyData.volumes.coronal ? Math.floor(studyData.volumes.coronal.sliceCount / 2) : 0,
-      });
+      const open = initialOpenPlanesForStudy(studyData.volumes);
+      const active0 = open[0] ?? preferredAvailablePlane(studyData.volumes) ?? 'axial';
+      setStudyViewport({ open, active: active0 });
+      const initial = {
+        axial: studyData.volumes.axial
+          ? middleSliceIndexFromCount(studyData.volumes.axial.sliceCount)
+          : 0,
+        sagittal: studyData.volumes.sagittal
+          ? middleSliceIndexFromCount(studyData.volumes.sagittal.sliceCount)
+          : 0,
+        coronal: studyData.volumes.coronal
+          ? middleSliceIndexFromCount(studyData.volumes.coronal.sliceCount)
+          : 0,
+      };
+      initialSliceIndex.current = initial;
+      setCurrentSlice(initial);
+      const vol0 = studyData.volumes[active0];
+      if (vol0) {
+        setHeader(vol0.header);
+        setImageData(vol0.imageData);
+        setDataRange(vol0.dataRange);
+      }
+      return;
     }
 
-    let plane: Plane = activeStudyPlane;
+    let plane: Plane = studyViewport.active;
     let vol = studyData.volumes[plane];
     if (!vol) {
       const p = preferredAvailablePlane(studyData.volumes);
       if (!p) return;
       plane = p;
       vol = studyData.volumes[p]!;
-      setActiveStudyPlane(plane);
+      setStudyViewport((s) => (s.active === plane ? s : { ...s, active: plane }));
     }
 
     setHeader(vol.header);
     setImageData(vol.imageData);
     setDataRange(vol.dataRange);
-    setWindowLevel(vol.defaultWindowLevel);
-  }, [studyData, activeStudyPlane]);
+  }, [studyData, studyViewport.active]);
 
+  /** Workflow / programmatic: ensure plane is open and focused (never closes). */
   const selectStudyPlane = useCallback(
     (plane: Plane) => {
       if (!studyData) return;
@@ -284,34 +384,42 @@ export function MedicalImageViewer({
         );
         return;
       }
-      setActiveStudyPlane(plane);
-      setHiddenStudyPlanes((prev) => {
-        if (!prev.has(plane)) return prev;
-        const next = new Set(prev);
-        next.delete(plane);
-        return next;
-      });
+      setStudyViewport((s) => ({
+        open: s.open.includes(plane) ? s.open : [...s.open, plane],
+        active: plane,
+      }));
     },
     [studyData],
   );
 
-  const hideStudyPlane = useCallback(
+  /** Same state transition as clicking “x” on a viewer (single close path). */
+  const closeStudyPlaneViewport = useCallback(
     (plane: Plane) => {
       if (!studyData?.volumes[plane]) return;
-      setHiddenStudyPlanes((prev) => {
-        if (prev.has(plane)) return prev;
-        const next = new Set(prev);
-        next.add(plane);
-        return next;
-      });
-
-      if (activeStudyPlane === plane) {
-        const order: Plane[] = ['axial', 'sagittal', 'coronal'];
-        const replacement = order.find((p) => p !== plane && studyData.volumes[p] && !hiddenStudyPlanes.has(p));
-        if (replacement) setActiveStudyPlane(replacement);
-      }
+      setStudyViewport((s) => stateAfterClosingViewer(s, plane, studyData.volumes));
     },
-    [studyData, activeStudyPlane, hiddenStudyPlanes],
+    [studyData],
+  );
+
+  /** Sidebar plane buttons: true toggle open/closed. */
+  const toggleStudyPlaneViewport = useCallback(
+    (plane: Plane) => {
+      if (!studyData?.volumes[plane]) {
+        alert(
+          `This study does not contain a ${plane} series. Available: ${Object.keys(
+            studyData.volumes,
+          ).join(', ') || 'none'}.`,
+        );
+        return;
+      }
+      setStudyViewport((s) => {
+        if (s.open.includes(plane)) {
+          return stateAfterClosingViewer(s, plane, studyData.volumes);
+        }
+        return { open: [...s.open, plane], active: plane };
+      });
+    },
+    [studyData],
   );
 
   const handleSliceChange = useCallback((plane: 'axial' | 'sagittal' | 'coronal', slice: number) => {
@@ -321,12 +429,12 @@ export function MedicalImageViewer({
   /** Pixel spacing (mm/pixel) of whatever volume is currently in the viewer. */
   const pixelSpacing = useMemo(() => {
     if (studyData) {
-      const vol = studyData.volumes[activeStudyPlane];
+      const vol = studyData.volumes[studyViewport.active];
       if (vol) return { x: vol.header.pixDims[1], y: vol.header.pixDims[2] };
     }
     if (header?.pixDims) return { x: header.pixDims[1] || 1, y: header.pixDims[2] || 1 };
     return { x: 1, y: 1 };
-  }, [studyData, activeStudyPlane, header]);
+  }, [studyData, studyViewport.active, header]);
 
   /** Switch the active plane (and DICOM volume) the workflow is asking for. */
   const handlePlaneRequest = useCallback(
@@ -337,9 +445,14 @@ export function MedicalImageViewer({
     [studyData, selectStudyPlane],
   );
 
-  const handleWindowLevelChange = useCallback((wl: WindowLevel) => {
-    setWindowLevel(wl);
-  }, []);
+  const resolveDefaultWindowLevel = useCallback(
+    (viewportId: Plane): WindowLevel => {
+      const vol = studyData?.volumes[viewportId];
+      if (vol) return vol.defaultWindowLevel;
+      return NIFTI_DEFAULT_WINDOW_LEVEL;
+    },
+    [studyData],
+  );
 
   // Resizer handlers (only right panel now)
   useEffect(() => {
@@ -376,184 +489,82 @@ export function MedicalImageViewer({
     };
   }, []);
 
-  useEffect(() => {
-    if (workflow.protocolId) {
-      const id = `${workflow.protocolId}-${Date.now()}`;
-      setCurrentGroupId(id);
-      currentGroupIdRef.current = id;
-    } else {
-      setCurrentGroupId(null);
-      currentGroupIdRef.current = null;
-    }
-  }, [workflow.protocolId]);
-
-  const measurementsRef2 = useRef(measurements);
-  useEffect(() => { measurementsRef2.current = measurements; }, [measurements]);
-
-  const handleMeasurementAdd = useCallback((measurement: Measurement) => {
-    if (currentGroupIdRef.current && protocol) {
-      const groupMeasurements = measurementsRef2.current.filter(m => m.groupId === currentGroupIdRef.current);
-      const distanceCount = groupMeasurements.filter(m => m.type === 'distance' || m.type === 'line').length;
-      const perpCount = groupMeasurements.filter(m => m.type === 'perpendicular').length;
-  
-      if ((measurement.type === 'distance' || measurement.type === 'line') && distanceCount >= 1) return;
-      if (measurement.type === 'perpendicular' && perpCount >= 2) return;
-    }
-    setMeasurements(prev => {
-      let label = measurement.label;
-      if (!label) {
-        if (measurement.type === 'perpendicular') {
-          const perpCount = prev.filter(m =>
-            m.type === 'perpendicular' && m.groupId === currentGroupIdRef.current
-          ).length;
-          if (protocol && perpCount < protocol.steps.length - 1) {
-            label = protocol.steps[perpCount + 1].label;
-          } else {
-            label = `Perp ${perpCount + 1}`;
-          }
-        } else if (protocol && currentGroupIdRef.current) {
-          const lineCount = prev.filter(m =>
-            (m.type === 'distance' || m.type === 'line') && m.groupId === currentGroupIdRef.current
-          ).length;
-          label = protocol.steps[lineCount]?.label;
-        }
+  const handleMeasurementAdd = useCallback(
+    (measurement: Measurement) => {
+      const stamped: Measurement = {
+        ...measurement,
+        timestamp: measurement.timestamp || new Date().toISOString(),
+      };
+      if (
+        sessionMeasurementMode &&
+        sessionAnnotator &&
+        onCommitSessionAnnotation &&
+        studyData &&
+        patientStorageKey
+      ) {
+        onCommitSessionAnnotation(
+          buildSessionAnnotationRow(stamped, studyData, patientStorageKey, sessionAnnotator),
+        );
+      } else if (archiveMeasurementMode && onPatientMeasurementsUpdate) {
+        onPatientMeasurementsUpdate((prev) => [...prev, stamped]);
+      } else if (!sessionMeasurementMode) {
+        setLocalMeasurements((prev) => [...prev, stamped]);
       }
-      return [...prev, { ...measurement, groupId: currentGroupIdRef.current ?? undefined, label }];
-    });
-      if (protocol && activeStep && measurementMatchesPrimitive(measurement, activeStep.primitive)) {
-        const recordedPoints =
-          activeStep.primitive === 'point' && measurement.type === 'perpendicular' && measurement.points.length >= 2
-            ? [measurement.points[1]]
-            : measurement.points;
 
+      // If a workflow step is active and the drawn primitive matches what the
+      // step expects, fold it into workflow state so the checklist advances and
+      // the final clinical value can be computed.
+      if (protocol && activeStep && measurementMatchesPrimitive(stamped, activeStep.primitive)) {
         setWorkflow(prev =>
           recordStepResult(prev, protocol, {
             primitive: activeStep.primitive,
-            points: recordedPoints,
-            slice: measurement.slice,
+            points: stamped.points,
+            slice: stamped.slice,
           }),
         );
       }
     },
-    [protocol, activeStep, currentGroupId],
+    [
+      protocol,
+      activeStep,
+      sessionMeasurementMode,
+      archiveMeasurementMode,
+      sessionAnnotator,
+      onCommitSessionAnnotation,
+      studyData,
+      patientStorageKey,
+      onPatientMeasurementsUpdate,
+    ],
   );
 
-  const handleMeasurementDelete = useCallback((id: string) => {
-    setMeasurements(prev => prev.filter(m => m.id !== id));
+  const handleMeasurementDelete = useCallback(
+    (id: string) => {
+      if (sessionMeasurementMode && onDeleteSessionAnnotation) {
+        onDeleteSessionAnnotation(id);
+      } else if (archiveMeasurementMode && onPatientMeasurementsUpdate) {
+        onPatientMeasurementsUpdate((prev) => prev.filter((m) => m.id !== id));
+      } else {
+        setLocalMeasurements((prev) => prev.filter((m) => m.id !== id));
+      }
+    },
+    [
+      sessionMeasurementMode,
+      archiveMeasurementMode,
+      onDeleteSessionAnnotation,
+      onPatientMeasurementsUpdate,
+    ],
+  );
+
+  /** Restore slice index to middle for one plane; viewport clears zoom/pan/WL/brightness/drafts via `Viewport` reset. */
+  const handleResetViewport = useCallback((plane: Plane) => {
+    const mid = initialSliceIndex.current[plane];
+    setCurrentSlice((prev) => ({ ...prev, [plane]: mid }));
   }, []);
-
-  const handleMeasurementUpdate = useCallback((id: string, newPoints: { x: number; y: number }[]) => {
-  setMeasurements(prev => {
-    const updated = prev.map(m => {
-      if (m.id === id) return { ...m, points: newPoints, value: (() => {
-        if (m.type === 'distance' && newPoints.length === 2) {
-          const dx = newPoints[1].x - newPoints[0].x;
-          const dy = newPoints[1].y - newPoints[0].y;
-          return `${Math.sqrt(dx*dx + dy*dy).toFixed(2)} px`;
-        }
-        return m.value;
-      })()};
-      return m;
-    });
-
-    // Also update any perpendicular lines attached to this base line
-    return updated.map(m => {
-    if (m.type !== 'perpendicular' || m.baseLineId !== id) return m;
-    const baseLine = updated.find(b => b.id === id);
-    if (!baseLine || baseLine.points.length < 2) return m;
-    const p0 = baseLine.points[0];
-    const p1 = baseLine.points[1];
-    const dx = p1.x - p0.x;
-    const dy = p1.y - p0.y;
-    const len = Math.sqrt(dx*dx + dy*dy);
-    if (len === 0) return m;
-    const lineX = dx / len;
-    const lineY = dy / len;
-    const perpX = -dy / len;
-    const perpY = dx / len;
-
-    // Find where the old anchor was along the OLD base line
-    // We need to store the t value — for now, project old anchor onto new base line
-    const oldAnchor = m.points[0];
-    const t = Math.max(0, Math.min(1, 
-      ((oldAnchor.x - p0.x) * lineX + (oldAnchor.y - p0.y) * lineY) / len
-    ));
-    const newAnchorX = p0.x + lineX * t * len;
-    const newAnchorY = p0.y + lineY * t * len;
-
-    // Keep stub length and direction
-    const stubDx = m.points[1].x - m.points[0].x;
-    const stubDy = m.points[1].y - m.points[0].y;
-    const stubLen = Math.sqrt(stubDx*stubDx + stubDy*stubDy);
-    const sign = (stubDx * perpX + stubDy * perpY) >= 0 ? 1 : -1;
-
-    return {
-      ...m,
-      points: [
-        { x: newAnchorX, y: newAnchorY },
-        { x: newAnchorX + perpX * stubLen * sign, y: newAnchorY + perpY * stubLen * sign },
-      ],
-    };
-  });
-  });
-}, []);
 
   // Always render with axial interaction/view behavior regardless of which
   // sequence (A/S/C) is loaded. Sequence identity is shown in metadata labels.
   const currentViewPlane: Plane = 'axial';
-  const activeVolumeMeta = studyData ? studyData.volumes[activeStudyPlane] : null;
-
-  const handleAutoWindowLevel = useCallback(() => {
-    if (!imageData || !header) return;
-    const dims = header.dims;
-
-    const plane = currentViewPlane;
-    const sliceIndex = plane === 'axial' ? currentSlice.axial : plane === 'sagittal' ? currentSlice.sagittal : currentSlice.coronal;
-
-    let min = Infinity;
-    let max = -Infinity;
-
-    if (plane === 'axial') {
-      const width = dims[1];
-      const height = dims[2];
-      const offset = sliceIndex * width * height;
-      const sliceSize = width * height;
-      for (let i = 0; i < sliceSize; i++) {
-        const v = imageData[offset + i] || 0;
-        if (v < min) min = v;
-        if (v > max) max = v;
-      }
-    } else if (plane === 'sagittal') {
-      const width = dims[2];
-      const height = dims[3];
-      for (let z = 0; z < height; z++) {
-        for (let y = 0; y < width; y++) {
-          const sourceIdx = z * dims[1] * dims[2] + y * dims[1] + sliceIndex;
-          const v = imageData[sourceIdx] || 0;
-          if (v < min) min = v;
-          if (v > max) max = v;
-        }
-      }
-    } else { // coronal
-      const width = dims[1];
-      const height = dims[3];
-      for (let z = 0; z < height; z++) {
-        for (let x = 0; x < width; x++) {
-          const sourceIdx = z * dims[1] * dims[2] + sliceIndex * dims[1] + x;
-          const v = imageData[sourceIdx] || 0;
-          if (v < min) min = v;
-          if (v > max) max = v;
-        }
-      }
-    }
-
-    if (min === Infinity || max === -Infinity) return;
-
-    const window = Math.max(1, max - min);
-    const level = Math.round((min + max) / 2);
-
-    setWindowLevel({ window, level });
-  }, [imageData, header, currentSlice, currentViewPlane]);
+  const activeVolumeMeta = studyData ? studyData.volumes[studyViewport.active] : null;
 
   const applyWeighting = useCallback((pixelValue: number): number => {
     // DREAMER algorithm simulation - in reality this would be much more complex
@@ -585,7 +596,7 @@ export function MedicalImageViewer({
     if (!studyData) return undefined;
     const order: Plane[] = ['axial', 'sagittal', 'coronal'];
     return order
-      .filter((p) => Boolean(studyData.volumes[p]) && !hiddenStudyPlanes.has(p))
+      .filter((p) => Boolean(studyData.volumes[p]) && studyViewport.open.includes(p))
       .map((p) => {
         const v = studyData.volumes[p]!;
         return {
@@ -593,21 +604,13 @@ export function MedicalImageViewer({
           label: p,
           imageData: v.imageData,
           header: v.header,
+          defaultWindowLevel: v.defaultWindowLevel,
         };
       });
-  }, [studyData, hiddenStudyPlanes]);
+  }, [studyData, studyViewport.open]);
 
   return (
     <div className="h-full flex">
-    <Toolbar
-        activeTool={activeTool}
-        onToolChange={setActiveTool}
-        measurements={measurements}
-        onMeasurementDelete={handleMeasurementDelete}
-        showCrosshair={showCrosshair}
-        onToggleCrosshair={() => setShowCrosshair(v => !v)}
-        onAutoWindowLevel={handleAutoWindowLevel}
-      />
       <div className="flex-1 flex flex-col min-h-0 relative">
         {loaded ? (
           <ViewportGrid
@@ -616,17 +619,18 @@ export function MedicalImageViewer({
             currentSlice={currentSlice}
             viewPlane={currentViewPlane}
             onSliceChange={handleSliceChange}
-            windowLevel={windowLevel}
-            onWindowLevelChange={handleWindowLevelChange}
+            resolveDefaultWindowLevel={resolveDefaultWindowLevel}
             activeTool={effectiveTool}
             measurements={measurements}
             onMeasurementAdd={handleMeasurementAdd}
-            onMeasurementUpdate={handleMeasurementUpdate}
             applyWeighting={applyWeighting}
             showCrosshair={showCrosshair}
             sequenceWindows={sequenceWindows}
-            onWindowFocus={(plane) => setActiveStudyPlane(plane)}
-            onHideWindow={hideStudyPlane}
+            onWindowFocus={(plane) =>
+              setStudyViewport((s) => (s.open.includes(plane) ? { ...s, active: plane } : s))
+            }
+            onHideWindow={closeStudyPlaneViewport}
+            onResetViewport={handleResetViewport}
           />
         ) : (
           <div className="h-full flex items-center justify-center">
@@ -651,13 +655,16 @@ export function MedicalImageViewer({
               Study: <span className="text-gray-100">{studyData.studyName}</span>
             </div>
             <div>
-              Sequence: <span className="text-gray-100 capitalize">{activeStudyPlane}</span>
+              Knee: <span className="text-gray-100 capitalize">{studyData.laterality}</span>
+            </div>
+            <div>
+              Sequence: <span className="text-gray-100 capitalize">{studyViewport.active}</span>
               {activeVolumeMeta?.seriesDescription ? ` (${activeVolumeMeta.seriesDescription})` : ''}
             </div>
           </div>
         )}
 
-        {/* Floating bottom-right tool bar (select, auto WL) */}
+        {/* Floating bottom-right tool bar */}
         <div className="absolute bottom-4 right-4 flex items-center space-x-2" style={{ zIndex: 9999 }}>
           <Button
             size="sm"
@@ -671,22 +678,32 @@ export function MedicalImageViewer({
 
           <Button
             size="sm"
+            variant={activeTool === 'ellipse' ? 'default' : 'ghost'}
+            className={activeTool === 'ellipse' ? 'bg-blue-600 text-white' : 'text-gray-300'}
+            onClick={() => setActiveTool('ellipse')}
+            aria-label="Ellipse tool"
+          >
+            <CircleIcon className="h-4 w-4" />
+          </Button>
+
+          <Button
+            size="sm"
+            variant={activeTool === 'freehand' ? 'default' : 'ghost'}
+            className={activeTool === 'freehand' ? 'bg-blue-600 text-white' : 'text-gray-300'}
+            onClick={() => setActiveTool('freehand')}
+            aria-label="Freehand tool"
+          >
+            <Pencil className="h-4 w-4" />
+          </Button>
+
+          <Button
+            size="sm"
             variant={activeTool === 'pan' ? 'default' : 'ghost'}
             className={activeTool === 'pan' ? 'bg-blue-600 text-white' : 'text-gray-300'}
             onClick={() => setActiveTool(v => v === 'pan' ? 'none' : 'pan')}
             aria-label="Pan tool"
           >
             <Move className="h-4 w-4" />
-          </Button>
-
-          <Button
-            size="sm"
-            variant="ghost"
-            className="text-gray-300"
-            onClick={() => handleAutoWindowLevel()}
-            aria-label="Auto window level"
-          >
-            Auto WL
           </Button>
 
         </div>
@@ -707,11 +724,16 @@ export function MedicalImageViewer({
 
       <div style={{ width: rightWidth }} className="flex-shrink-0">
         <WeightingPanel
-          onStudyPlaneSelect={selectStudyPlane}
+          weighting={weighting}
+          onWeightingChange={setWeighting}
+          customWeighting={customWeighting}
+          onCustomWeightingChange={(p) => setCustomWeighting(p)}
           onFileLoad={onFileLoad}
           onStudyLoad={onStudyLoad}
           studyData={studyData}
-          activeStudyPlane={activeStudyPlane}
+          openStudyPlanes={studyViewport.open}
+          activeStudyPlane={studyViewport.active}
+          onStudyPlaneToggle={toggleStudyPlaneViewport}
           workflow={workflow}
           onWorkflowChange={setWorkflow}
           pixelSpacing={pixelSpacing}

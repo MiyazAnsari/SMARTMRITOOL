@@ -2,52 +2,98 @@ import { useRef, useEffect, useState, useCallback } from 'react';
 import type { WindowLevel, MeasurementTool, Measurement } from './MedicalImageViewer';
 import { Slider } from './ui/slider';
 
+const WL_MIN_WIDTH = 8;
+const WL_MAX_WIDTH = 255;
+const WL_MIN_CENTER = 0;
+const WL_MAX_CENTER = 255;
+
+/** Clamp WW/WL to display-space limits (normalized 0–255 pixels). */
+function sanitizeWindowLevel(
+  windowWidth: number,
+  windowCenter: number,
+  fallback: WindowLevel,
+): WindowLevel {
+  let ww = Math.round(windowWidth);
+  let wc = Math.round(windowCenter);
+  if (!Number.isFinite(ww) || !Number.isFinite(wc)) return { ...fallback };
+  ww = Math.max(WL_MIN_WIDTH, Math.min(WL_MAX_WIDTH, ww));
+  wc = Math.max(WL_MIN_CENTER, Math.min(WL_MAX_CENTER, wc));
+  if (wc + ww / 2 <= wc - ww / 2) return { ...fallback };
+  return { window: ww, level: wc };
+}
+
+const VIEWPORT_ZOOM_MIN = 1;
+const VIEWPORT_ZOOM_MAX = 20;
+const VIEWPORT_ZOOM_STEP = 1.18;
+const VIEWPORT_ZOOM_ANIM_MS = 140;
+
 interface ViewportProps {
   imageData: Uint8Array;
   header: any;
   plane: 'axial' | 'sagittal' | 'coronal';
+  /** When set (e.g. DICOM multi-sequence), shown in the info overlay instead of `plane`. */
+  planeLabel?: string;
+  /** Acquisition / window id stored on measurements (defaults to `plane`). Use for stacked 2D viewers. */
+  measurementPlane?: 'axial' | 'sagittal' | 'coronal';
   currentSlice: number;
   onSliceChange: (slice: number) => void;
-  windowLevel: WindowLevel;
-  onWindowLevelChange: (wl: WindowLevel) => void;
+  /** Initial VOI for this viewer only; window/level and brightness live in local `Viewport` state (not shared across viewers). */
+  defaultWindowLevel: WindowLevel;
   activeTool: MeasurementTool;
   measurements: Measurement[];
   onMeasurementAdd: (measurement: Measurement) => void;
-  onMeasurementUpdate: (id: string, newPoints: { x: number; y: number }[]) => void;
   applyWeighting: (pixelValue: number) => number;
   showCrosshair?: boolean;
   parentWindowHeight?: number;
+  /** Restore upload defaults for this viewer only (slice/WL/measurements handled in parent). */
+  onViewportReset?: () => void;
+  /** Multi-viewer: hide this viewer (same as window chrome close). */
+  onClose?: () => void;
 }
 
 export function Viewport({
   imageData,
   header,
   plane,
+  planeLabel,
+  measurementPlane = plane,
   currentSlice,
   onSliceChange,
-  windowLevel,
-  onWindowLevelChange,
+  defaultWindowLevel,
   activeTool,
   measurements,
   onMeasurementAdd,
-  onMeasurementUpdate,
   applyWeighting,
   showCrosshair = false,
   parentWindowHeight,
+  onViewportReset,
+  onClose,
 }: ViewportProps) {
-  const [autoFlash, setAutoFlash] = useState<{ window: number; level: number } | null>(null);
-  const [draggingPoint, setDraggingPoint] = useState<{ measurementId: string; pointIndex: number } | null>(null);
-  const [selectedLineId, setSelectedLineId] = useState<string | null>(null);
-  const draggingPointRef = useRef<{ measurementId: string; pointIndex: number } | null>(null);
-  const measurementsRef = useRef(measurements);
-  useEffect(() => { measurementsRef.current = measurements; }, [measurements]);
+  const [wl, setWl] = useState<WindowLevel>(() =>
+    sanitizeWindowLevel(defaultWindowLevel.window, defaultWindowLevel.level, defaultWindowLevel),
+  );
+  /** Linear gain after weighting, before W/L — isolated per viewer instance. */
+  const [brightness, setBrightness] = useState(1);
+  const brightnessRef = useRef(brightness);
+  brightnessRef.current = brightness;
+  /** When true, brightness slider row is shown. */
+  const [isBrightnessMode, setIsBrightnessMode] = useState(false);
+  /** Per-viewer window center (level) slider panel. */
+  const [isWlMode, setIsWlMode] = useState(false);
+  /** Per-viewer window width slider panel. */
+  const [isWwMode, setIsWwMode] = useState(false);
+  const wlDefaultsRef = useRef<WindowLevel>(
+    sanitizeWindowLevel(defaultWindowLevel.window, defaultWindowLevel.level, defaultWindowLevel),
+  );
 
-  useEffect(() => {
-    if (!windowLevel) return;
-    setAutoFlash({ window: Math.round(windowLevel.window), level: Math.round(windowLevel.level) });
-    const id = setTimeout(() => setAutoFlash(null), 1200);
-    return () => clearTimeout(id);
-  }, [windowLevel]);
+  const setWlSafe = useCallback((next: WindowLevel | ((prev: WindowLevel) => WindowLevel)) => {
+    setWl((prev) => {
+      const raw = typeof next === 'function' ? next(prev) : next;
+      const sanitized = sanitizeWindowLevel(raw.window, raw.level, wlDefaultsRef.current);
+      if (sanitized.window === prev.window && sanitized.level === prev.level) return prev;
+      return sanitized;
+    });
+  }, []);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
   // container for responsive sizing
@@ -60,8 +106,6 @@ export function Viewport({
   const sliderRef = useRef<HTMLDivElement | null>(null);
   const [isDrawing, setIsDrawing] = useState(false);
   const [drawingPoints, setDrawingPoints] = useState<{ x: number; y: number }[]>([]);
-  const [cursorPos, setCursorPos] = useState<{ x: number; y: number } | null>(null);
-  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
 
   // Pan state
   const [panSrc, setPanSrc] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -77,10 +121,14 @@ export function Viewport({
   const lastPointerClientRef = useRef<{ x: number; y: number } | null>(null);
   const zoomScaleRef = useRef(zoomScale);
   const panSrcRef = useRef(panSrc);
+  const zoomAnimRafRef = useRef<number | null>(null);
   useEffect(() => {
     zoomScaleRef.current = zoomScale;
     panSrcRef.current = panSrc;
   }, [zoomScale, panSrc]);
+  useEffect(() => () => {
+    if (zoomAnimRafRef.current != null) cancelAnimationFrame(zoomAnimRafRef.current);
+  }, []);
   const rotateDragRef = useRef<{ dragging: boolean; startAngle: number; startRotation: number }>({
     dragging: false,
     startAngle: 0,
@@ -273,21 +321,40 @@ export function Viewport({
     };
   }, [getPlaneGeometry]);
 
-  // Apply window/level and weighting to image
+  // New volume buffer → reset this viewer’s W/L and brightness only (no cross-viewport state).
+  const prevImageDataRef = useRef<Uint8Array | null>(null);
+  useEffect(() => {
+    if (prevImageDataRef.current === imageData) return;
+    prevImageDataRef.current = imageData;
+    const safeDefaults = sanitizeWindowLevel(
+      defaultWindowLevel.window,
+      defaultWindowLevel.level,
+      defaultWindowLevel,
+    );
+    wlDefaultsRef.current = { ...safeDefaults };
+    setWl(safeDefaults);
+    setBrightness(1);
+    setIsBrightnessMode(false);
+    setIsWlMode(false);
+    setIsWwMode(false);
+  }, [imageData, defaultWindowLevel]);
+
+  // Apply weighting, per-viewport brightness, then window/level
   const applyWindowLevel = useCallback((value: number): number => {
-    // Apply weighting first
     const weighted = applyWeighting(value);
-    
-    // Then apply window/level
-    const { window, level } = windowLevel;
-    const min = level - window / 2;
-    const max = level + window / 2;
-    
-    if (weighted <= min) return 0;
-    if (weighted >= max) return 255;
-    
-    return Math.round(((weighted - min) / window) * 255);
-  }, [windowLevel, applyWeighting]);
+    const scaled = weighted * brightness;
+
+    const { window: ww, level: wc } = wl;
+    const voiMin = wc - ww / 2;
+    const voiMax = wc + ww / 2;
+    const span = voiMax - voiMin;
+    if (span < 1) return 128;
+
+    if (scaled <= voiMin) return 0;
+    if (scaled >= voiMax) return 255;
+
+    return Math.round(((scaled - voiMin) / span) * 255);
+  }, [wl, brightness, applyWeighting]);
 
   const drawTransformedImage = useCallback((
     ctx: CanvasRenderingContext2D,
@@ -344,6 +411,50 @@ export function Viewport({
     rotateDragRef.current.dragging = false;
   }, []);
 
+  const dismissCanvasToolModes = useCallback(() => {
+    setIsRotateMode(false);
+    stopRotateDrag();
+    setIsZoomMode(false);
+    lastPointerClientRef.current = null;
+  }, [stopRotateDrag]);
+
+  const dismissAllToolbarPanels = useCallback(() => {
+    dismissCanvasToolModes();
+    setIsWlMode(false);
+    setIsWwMode(false);
+    setIsBrightnessMode(false);
+  }, [dismissCanvasToolModes]);
+
+  const cancelZoomAnimation = useCallback(() => {
+    if (zoomAnimRafRef.current != null) {
+      cancelAnimationFrame(zoomAnimRafRef.current);
+      zoomAnimRafRef.current = null;
+    }
+  }, []);
+
+  /** Pan/zoom/rotate/draft state only (parent handles slice, WL, persisted measurements). */
+  const resetViewportInteractionState = useCallback(() => {
+    cancelZoomAnimation();
+    stopRotateDrag();
+    setAxialTransform({ rotation: 0 });
+    zoomScaleRef.current = 1;
+    panSrcRef.current = { x: 0, y: 0 };
+    setZoomScale(1);
+    setPanSrc({ x: 0, y: 0 });
+    dismissAllToolbarPanels();
+    setIsDrawing(false);
+    setDrawingPoints([]);
+    setIsPanning(false);
+    panStartRef.current = null;
+  }, [stopRotateDrag, cancelZoomAnimation, dismissAllToolbarPanels]);
+
+  const handleViewerReset = useCallback(() => {
+    resetViewportInteractionState();
+    setWlSafe({ ...wlDefaultsRef.current });
+    setBrightness(1);
+    onViewportReset?.();
+  }, [onViewportReset, resetViewportInteractionState, setWlSafe]);
+
   /** Map screen position to slice image pixel (continuous) for current zoom/pan/rotation. */
   const clientToImagePixel = useCallback(
     (clientX: number, clientY: number): { imgX: number; imgY: number } | null => {
@@ -397,12 +508,93 @@ export function Viewport({
     [getPlaneGeometry, normalizeAngle, axialTransform.rotation]
   );
 
-  /** Axial zoom mode: zoom toward whatever is under the pointer (hover + scroll). */
-  const applyAxialWheelZoomAtPointer = useCallback(
+  /** Update zoom scale while keeping a fixed image-space focal point (pan only — no slice/WL changes). */
+  const applyZoomAtImageFocal = useCallback((focalX: number, focalY: number, newZ: number) => {
+    const iw = sliceDimsRef.current.w;
+    const ih = sliceDimsRef.current.h;
+    if (iw < 1 || ih < 1) return;
+
+    const clampedZ = Math.min(VIEWPORT_ZOOM_MAX, Math.max(VIEWPORT_ZOOM_MIN, newZ));
+    if (clampedZ <= VIEWPORT_ZOOM_MIN + 1e-6) {
+      zoomScaleRef.current = VIEWPORT_ZOOM_MIN;
+      panSrcRef.current = { x: 0, y: 0 };
+      setZoomScale(VIEWPORT_ZOOM_MIN);
+      setPanSrc({ x: 0, y: 0 });
+      return;
+    }
+
+    const newCropW = Math.max(1, Math.floor(iw / clampedZ));
+    const newCropH = Math.max(1, Math.floor(ih / clampedZ));
+    let npx = Math.round(focalX - newCropW / 2);
+    let npy = Math.round(focalY - newCropH / 2);
+    npx = Math.max(0, Math.min(iw - newCropW, npx));
+    npy = Math.max(0, Math.min(ih - newCropH, npy));
+
+    zoomScaleRef.current = clampedZ;
+    panSrcRef.current = { x: npx, y: npy };
+    setZoomScale(clampedZ);
+    setPanSrc({ x: npx, y: npy });
+  }, []);
+
+  const getViewportCenterImagePixel = useCallback((): { x: number; y: number } => {
+    const iw = sliceDimsRef.current.w;
+    const ih = sliceDimsRef.current.h;
+    if (iw < 1 || ih < 1) return { x: 0, y: 0 };
+    const z = Math.max(VIEWPORT_ZOOM_MIN, zoomScaleRef.current);
+    const cropW = Math.max(1, Math.floor(iw / z));
+    const cropH = Math.max(1, Math.floor(ih / z));
+    return {
+      x: panSrcRef.current.x + cropW / 2,
+      y: panSrcRef.current.y + cropH / 2,
+    };
+  }, []);
+
+  const animateZoomToTarget = useCallback(
+    (targetZ: number) => {
+      cancelZoomAnimation();
+      const iw = sliceDimsRef.current.w;
+      const ih = sliceDimsRef.current.h;
+      if (iw < 1 || ih < 1) return;
+
+      const focal = getViewportCenterImagePixel();
+      const startZ = zoomScaleRef.current;
+      const endZ = Math.min(VIEWPORT_ZOOM_MAX, Math.max(VIEWPORT_ZOOM_MIN, targetZ));
+      if (Math.abs(endZ - startZ) < 1e-4) return;
+
+      const t0 = performance.now();
+      const tick = (now: number) => {
+        const t = Math.min(1, (now - t0) / VIEWPORT_ZOOM_ANIM_MS);
+        const eased = 1 - (1 - t) ** 3;
+        const z = startZ + (endZ - startZ) * eased;
+        applyZoomAtImageFocal(focal.x, focal.y, z);
+        if (t < 1) {
+          zoomAnimRafRef.current = requestAnimationFrame(tick);
+        } else {
+          applyZoomAtImageFocal(focal.x, focal.y, endZ);
+          zoomAnimRafRef.current = null;
+        }
+      };
+      zoomAnimRafRef.current = requestAnimationFrame(tick);
+    },
+    [applyZoomAtImageFocal, cancelZoomAnimation, getViewportCenterImagePixel],
+  );
+
+  const zoomInStep = useCallback(() => {
+    animateZoomToTarget(zoomScaleRef.current * VIEWPORT_ZOOM_STEP);
+  }, [animateZoomToTarget]);
+
+  const zoomOutStep = useCallback(() => {
+    animateZoomToTarget(zoomScaleRef.current / VIEWPORT_ZOOM_STEP);
+  }, [animateZoomToTarget]);
+
+  /** Wheel zoom (unchanged behavior): only when Zoom mode is on; focal = pointer. */
+  const applyWheelZoomAtPointer = useCallback(
     (clientX: number, clientY: number, deltaY: number, deltaMode: number) => {
       const iw = sliceDimsRef.current.w;
       const ih = sliceDimsRef.current.h;
       if (iw < 1 || ih < 1) return;
+
+      cancelZoomAnimation();
 
       const main = canvasRef.current;
       if (main) {
@@ -422,67 +614,37 @@ export function Viewport({
       if (!focal && lastPointerClientRef.current) {
         focal = clientToImagePixel(lastPointerClientRef.current.x, lastPointerClientRef.current.y);
       }
+      const center = getViewportCenterImagePixel();
+      const fx = focal?.imgX ?? center.x;
+      const fy = focal?.imgY ?? center.y;
 
       const prevZ = zoomScaleRef.current;
       let step = deltaY;
       if (deltaMode === 1) step *= 16;
       if (deltaMode === 2) step *= 800;
       const factor = Math.exp(-step * 0.0012);
-      const newZ = Math.min(20, Math.max(1, prevZ * factor));
+      const newZ = Math.min(VIEWPORT_ZOOM_MAX, Math.max(VIEWPORT_ZOOM_MIN, prevZ * factor));
       if (Math.abs(newZ - prevZ) < 1e-6) return;
 
-      if (newZ <= 1) {
-        zoomScaleRef.current = 1;
-        panSrcRef.current = { x: 0, y: 0 };
-        setZoomScale(1);
-        setPanSrc({ x: 0, y: 0 });
-        return;
-      }
-
-      const cropW = Math.max(1, Math.floor(iw / prevZ));
-      const cropH = Math.max(1, Math.floor(ih / prevZ));
-      const px = Math.max(0, Math.min(iw - cropW, Math.round(panSrcRef.current.x)));
-      const py = Math.max(0, Math.min(ih - cropH, Math.round(panSrcRef.current.y)));
-
-      let uFrac = 0.5;
-      let vFrac = 0.5;
-      if (focal) {
-        uFrac = cropW > 0 ? (focal.imgX - px) / cropW : 0.5;
-        vFrac = cropH > 0 ? (focal.imgY - py) / cropH : 0.5;
-        uFrac = Math.max(0, Math.min(1, uFrac));
-        vFrac = Math.max(0, Math.min(1, vFrac));
-      }
-
-      const imgX = px + uFrac * cropW;
-      const imgY = py + vFrac * cropH;
-
-      const newCropW = Math.max(1, Math.floor(iw / newZ));
-      const newCropH = Math.max(1, Math.floor(ih / newZ));
-      let npx = Math.round(imgX - uFrac * newCropW);
-      let npy = Math.round(imgY - vFrac * newCropH);
-      npx = Math.max(0, Math.min(iw - newCropW, npx));
-      npy = Math.max(0, Math.min(ih - newCropH, npy));
-
-      zoomScaleRef.current = newZ;
-      panSrcRef.current = { x: npx, y: npy };
-      setZoomScale(newZ);
-      setPanSrc({ x: npx, y: npy });
+      applyZoomAtImageFocal(fx, fy, newZ);
     },
-    [clientToImagePixel]
+    [applyZoomAtImageFocal, cancelZoomAnimation, clientToImagePixel, getViewportCenterImagePixel],
   );
 
-  // Keep axial starting orientation neutral and centered when loading new image data.
+  // Reset interaction state when a new volume buffer is loaded for this viewer.
   useEffect(() => {
-    if (!isAxial) return;
-    setAxialTransform({ rotation: 0 });
+    if (isAxial) {
+      setAxialTransform({ rotation: 0 });
+      setIsRotateMode(false);
+    }
+    cancelZoomAnimation();
     zoomScaleRef.current = 1;
     panSrcRef.current = { x: 0, y: 0 };
     setZoomScale(1);
     setPanSrc({ x: 0, y: 0 });
-    setIsRotateMode(false);
     setIsZoomMode(false);
     lastPointerClientRef.current = null;
-  }, [imageData, isAxial]);
+  }, [imageData, isAxial, cancelZoomAnimation]);
 
   // Heavy rendering effect: builds source canvas and caches ImageBitmap when slice/WL/weighting changes
   const bitmapRef = useRef<ImageBitmap | null>(null);
@@ -596,7 +758,7 @@ export function Viewport({
       }
 
       // Asynchronously build and cache an ImageBitmap for faster subsequent draws
-      const key = `${plane}:${currentSlice}:${windowLevel.window}:${windowLevel.level}`;
+      const key = `${plane}:${currentSlice}:${wl.window}:${wl.level}:${brightness}`;
       if (bitmapKeyRef.current !== key) {
         try {
           const b = await createImageBitmap(imgData);
@@ -621,7 +783,7 @@ export function Viewport({
     })();
 
     return () => { cancelled = true; };
-  }, [imageData, currentSlice, plane, windowLevel, applyWindowLevel, getSliceData, getPlaneGeometry, displaySize, zoomScale, panSrc, drawTransformedImage]);
+  }, [imageData, currentSlice, plane, wl, applyWindowLevel, getSliceData, getPlaneGeometry, displaySize, zoomScale, panSrc, drawTransformedImage]);
 
   // Fast pan/zoom draw effect: responds to panSrc and zoomScale without rebuilding pixels
   useEffect(() => {
@@ -712,49 +874,57 @@ export function Viewport({
     }
 
     // Draw completed measurements
-    measurementsRef.current.forEach((measurement) => {
-      ctx.strokeStyle = '#FFD700';
-      ctx.fillStyle = '#FFD700';
-      ctx.lineWidth = 1;
+    measurements.forEach((measurement) => {
+      if (measurement.slice !== currentSlice) return;
+
+      ctx.strokeStyle = '#3b82f6';
+      ctx.fillStyle = '#3b82f6';
+      ctx.lineWidth = 2;
 
       const points = measurement.points;
 
       if ((measurement.type === 'distance' || measurement.type === 'line') && points.length >= 2) {
+        if (measurement.type === 'line') {
+          // Visualize the line as extending across the canvas to make tangent
+          // placement obvious.
+          const dx = points[1].x - points[0].x;
+          const dy = points[1].y - points[0].y;
+          const len = Math.hypot(dx, dy) || 1;
+          const ux = dx / len;
+          const uy = dy / len;
+          const big = (canvas.width + canvas.height) / dpr;
+          const a = { x: points[0].x - ux * big, y: points[0].y - uy * big };
+          const b = { x: points[1].x + ux * big, y: points[1].y + uy * big };
+          ctx.save();
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.stroke();
+          ctx.restore();
+        }
         ctx.beginPath();
         ctx.moveTo(points[0].x, points[0].y);
         ctx.lineTo(points[1].x, points[1].y);
         ctx.stroke();
-        
-        // Draw endpoints
+
         points.forEach(p => {
           ctx.beginPath();
           ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
           ctx.fill();
         });
-
-
-        const midX = (points[0].x + points[1].x) / 2;
-        const midY = (points[0].y + points[1].y) / 2;
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '12px sans-serif';
-        ctx.fillText(measurement.value || '', midX + 5, midY - 5);
-        ctx.fillStyle = '#FFD700';
-        if (measurement.id === selectedLineId) {
-          const midX = (points[0].x + points[1].x) / 2;
-          const midY = (points[0].y + points[1].y) / 2;
-          ctx.fillStyle = '#ffffff';
-          ctx.fillRect(midX - 12, midY - 12, 24, 24);
-          ctx.fillStyle = '#000000';
-          ctx.font = 'bold 14px sans-serif';
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-          ctx.fillText('⊥', midX, midY);
-          ctx.fillStyle = '#FFD700';
-          ctx.textAlign = 'left';
-          ctx.textBaseline = 'alphabetic';
-        }
-
-
+      } else if (measurement.type === 'point' && points.length >= 1) {
+        const p = points[0];
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1;
+        ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.strokeStyle = '#3b82f6';
+        ctx.lineWidth = 2;
       } else if (measurement.type === 'angle' && points.length >= 3) {
         ctx.beginPath();
         ctx.moveTo(points[0].x, points[0].y);
@@ -767,43 +937,45 @@ export function Viewport({
           ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
           ctx.fill();
         });
-
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '12px sans-serif';
-        ctx.fillText(measurement.value || '', points[1].x + 8, points[1].y - 8);
-        ctx.fillStyle = '#FFD700';
-
-        } else if (measurement.type === 'perpendicular' && points.length >= 2) {
+      } else if (measurement.type === 'ellipse' && points.length >= 2) {
+        const cx = (points[0].x + points[1].x) / 2;
+        const cy = (points[0].y + points[1].y) / 2;
+        const rx = Math.abs(points[1].x - points[0].x) / 2;
+        const ry = Math.abs(points[1].y - points[0].y) / 2;
+        
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+        ctx.stroke();
+      } else if (measurement.type === 'closedCurve' && points.length > 2) {
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        points.forEach(p => ctx.lineTo(p.x, p.y));
+        ctx.closePath();
+        ctx.stroke();
+        
+        points.forEach(p => {
           ctx.beginPath();
-          ctx.moveTo(points[0].x, points[0].y);
-          ctx.lineTo(points[1].x, points[1].y);
-          ctx.stroke();
-  
-          // Draw draggable tip
-          ctx.fillStyle = '#00FF7F';
-          ctx.beginPath();
-          ctx.arc(points[0].x, points[0].y, 4, 0, Math.PI * 2);
+          ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
           ctx.fill();
-
-          // Draw draggable tip
-          ctx.fillStyle = '#FFD700';
-          ctx.beginPath();
-          ctx.arc(points[1].x, points[1].y, 4, 0, Math.PI * 2);
-          ctx.fill();
-        }
+        });
+      } else if (measurement.type === 'freehand' && points.length > 1) {
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        points.forEach(p => ctx.lineTo(p.x, p.y));
+        ctx.stroke();
+      }
     });
 
     // Draw current drawing
     if (isDrawing && drawingPoints.length > 0) {
-      ctx.strokeStyle = '#FFD700';
-      ctx.fillStyle = '#FFD700';
-      ctx.lineWidth = 1;
+      ctx.strokeStyle = '#60a5fa';
+      ctx.fillStyle = '#60a5fa';
+      ctx.lineWidth = 2;
 
       if (activeTool === 'distance' || activeTool === 'line' || activeTool === 'angle') {
         ctx.beginPath();
         ctx.moveTo(drawingPoints[0].x, drawingPoints[0].y);
         drawingPoints.forEach(p => ctx.lineTo(p.x, p.y));
-        if (cursorPos) ctx.lineTo(cursorPos.x, cursorPos.y);
         ctx.stroke();
         
         drawingPoints.forEach(p => {
@@ -811,9 +983,34 @@ export function Viewport({
           ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
           ctx.fill();
         });
+      } else if (activeTool === 'ellipse' && drawingPoints.length >= 2) {
+        const cx = (drawingPoints[0].x + drawingPoints[1].x) / 2;
+        const cy = (drawingPoints[0].y + drawingPoints[1].y) / 2;
+        const rx = Math.abs(drawingPoints[1].x - drawingPoints[0].x) / 2;
+        const ry = Math.abs(drawingPoints[1].y - drawingPoints[0].y) / 2;
+        
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+        ctx.stroke();
+      } else if (activeTool === 'closedCurve') {
+        ctx.beginPath();
+        ctx.moveTo(drawingPoints[0].x, drawingPoints[0].y);
+        drawingPoints.forEach(p => ctx.lineTo(p.x, p.y));
+        ctx.stroke();
+        
+        drawingPoints.forEach(p => {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      } else if (activeTool === 'freehand') {
+        ctx.beginPath();
+        ctx.moveTo(drawingPoints[0].x, drawingPoints[0].y);
+        drawingPoints.forEach(p => ctx.lineTo(p.x, p.y));
+        ctx.stroke();
       }
     }
-  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool, cursorPos, showCrosshair, selectedLineId]);
+  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool]);
 
   // Calculate measurement value
   const calculateMeasurementValue = (type: MeasurementTool, points: { x: number; y: number }[]): string => {
@@ -830,6 +1027,11 @@ export function Viewport({
       const mag2 = Math.sqrt(v2.x * v2.x + v2.y * v2.y);
       const angle = Math.acos(dot / (mag1 * mag2)) * (180 / Math.PI);
       return `${angle.toFixed(1)}°`;
+    } else if (type === 'ellipse' && points.length === 2) {
+      const rx = Math.abs(points[1].x - points[0].x) / 2;
+      const ry = Math.abs(points[1].y - points[0].y) / 2;
+      const area = Math.PI * rx * ry;
+      return `${area.toFixed(2)} px²`;
     }
     return '';
   };
@@ -839,53 +1041,21 @@ export function Viewport({
     const rect = overlayCanvasRef.current?.getBoundingClientRect();
     if (!rect) return;
 
+    if (e.button === 2) {
+      e.preventDefault();
+      return;
+    }
+
+    if (e.button !== 0) return;
+
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
-
-    // Check if clicking near an existing measurement point
-if (activeTool  === 'none') {
-  for (const m of measurements) {
-    for (let i = 0; i < m.points.length; i++) {
-      const p = m.points[i];
-      const dist = Math.sqrt((x - p.x) ** 2 + (y - p.y) ** 2);
-      if (dist < 10) {
-        draggingPointRef.current = { measurementId: m.id, pointIndex: i };
-        setDraggingPoint({ measurementId: m.id, pointIndex: i });
-        setIsDrawing(false);
-        setDrawingPoints([]);
-        return;
-      }
-    }
-  }
-  for (const m of measurements) {
-  if (m.type !== 'distance' && m.type !== 'line') continue;
-  if (m.points.length < 2) continue;
-  const p0 = m.points[0];
-  const p1 = m.points[1];
-  // distance from click to line segment
-  const dx = p1.x - p0.x;
-  const dy = p1.y - p0.y;
-  const lenSq = dx * dx + dy * dy;
-  if (lenSq === 0) continue;
-  const t = Math.max(0, Math.min(1, ((x - p0.x) * dx + (y - p0.y) * dy) / lenSq));
-  const closestX = p0.x + t * dx;
-  const closestY = p0.y + t * dy;
-  const dist = Math.sqrt((x - closestX) ** 2 + (y - closestY) ** 2);
-  if (dist < 10) {
-    setSelectedLineId(m.id);
-    return;
-  }
-}
-setSelectedLineId(null);
-}
 
     if (isAxial && isRotateMode) {
       startRotateDrag(e.clientX, e.clientY);
     } else if (activeTool === 'pan') {
-      // start panning
       setIsPanning(true);
       panStartRef.current = { clientX: e.clientX, clientY: e.clientY, startX: panSrc.x, startY: panSrc.y };
-    } else if (activeTool === 'none') {
     } else if (activeTool === 'point') {
       // Single-click point primitive — emit immediately, no drag phase.
       onMeasurementAdd({
@@ -893,7 +1063,7 @@ setSelectedLineId(null);
         type: 'point',
         points: [{ x, y }],
         slice: currentSlice,
-        plane,
+        plane: measurementPlane,
       });
     } else {
       setIsDrawing(true);
@@ -950,58 +1120,6 @@ setSelectedLineId(null);
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    if (draggingPointRef.current) {
-  const m = measurementsRef.current.find(m => m.id === draggingPointRef.current!.measurementId);
-  if (m?.type === 'perpendicular' && m.baseLineId) {
-    const baseLine = measurementsRef.current.find(b => b.id === m.baseLineId);
-    if (baseLine && baseLine.points.length >= 2) {
-      const p0 = baseLine.points[0];
-      const p1 = baseLine.points[1];
-      const dx = p1.x - p0.x;
-      const dy = p1.y - p0.y;
-      const len = Math.sqrt(dx * dx + dy * dy);
-      if (len === 0) return;
-      const perpX = -dy / len;
-      const perpY = dx / len;
-
-      if (draggingPointRef.current!.pointIndex === 0) {
-        // Drag anchor along the base line
-        const t = Math.max(0, Math.min(1, ((x - p0.x) * dx + (y - p0.y) * dy) / (len * len)));
-        const anchorX = p0.x + t * dx;
-        const anchorY = p0.y + t * dy;
-        // Keep stub length and direction
-        const stubDx = m.points[1].x - m.points[0].x;
-        const stubDy = m.points[1].y - m.points[0].y;
-        const stubLen = Math.sqrt(stubDx * stubDx + stubDy * stubDy);
-        const sign = (stubDx * perpX + stubDy * perpY) >= 0 ? 1 : -1;
-        onMeasurementUpdate(m.id, [
-          { x: anchorX, y: anchorY },
-          { x: anchorX + perpX * stubLen * sign, y: anchorY + perpY * stubLen * sign },
-        ]);
-      } else {
-        // Drag tip along perpendicular axis from anchor
-        const anchorX = m.points[0].x;
-        const anchorY = m.points[0].y;
-        const t = (x - anchorX) * perpX + (y - anchorY) * perpY;
-        onMeasurementUpdate(m.id, [
-          { x: anchorX, y: anchorY },
-          { x: anchorX + perpX * t, y: anchorY + perpY * t },
-        ]);
-      }
-      return;
-    }
-  }
-    const newMeasurements = measurementsRef.current.map(m => {
-      if (m.id !== draggingPointRef.current!.measurementId) return m;
-      const newPoints = [...m.points];
-      newPoints[draggingPointRef.current!.pointIndex] = { x, y };
-      return { ...m, points: newPoints };
-    });
-    const updated = newMeasurements.find(m => m.id === draggingPointRef.current!.measurementId);
-    if (updated) onMeasurementUpdate(updated.id, updated.points);
-    return;
-}
-
     if (isAxial && isRotateMode && rotateDragRef.current.dragging) {
       moveRotateDrag(e.clientX, e.clientY);
     } else if (activeTool === 'pan' && isPanning && panStartRef.current) {
@@ -1028,11 +1146,15 @@ setSelectedLineId(null);
       panSrcRef.current = { x: newX, y: newY };
       setPanSrc({ x: newX, y: newY });
     } else if (isDrawing) {
-      if (activeTool === 'distance' || activeTool === 'line') {
+      if (activeTool === 'freehand') {
+        setDrawingPoints(prev => [...prev, { x, y }]);
+      } else if (
+        activeTool === 'ellipse' ||
+        ((activeTool === 'distance' || activeTool === 'line') && drawingPoints.length === 1)
+      ) {
         setDrawingPoints([drawingPoints[0], { x, y }]);
       }
     }
-    setCursorPos({ x, y });
   };
 
   const handleMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -1042,12 +1164,6 @@ setSelectedLineId(null);
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    if (draggingPointRef.current) {
-      draggingPointRef.current = null;
-      setDraggingPoint(null);
-      return;
-}
-
     if (isAxial && isRotateMode && rotateDragRef.current.dragging) {
       stopRotateDrag();
     }
@@ -1056,103 +1172,100 @@ setSelectedLineId(null);
       panStartRef.current = null;
     } else if (isDrawing) {
       if (activeTool === 'distance' || activeTool === 'line') {
-        // handled by click
+        if (drawingPoints.length === 1) {
+          const points = [...drawingPoints, { x, y }];
+          const value = calculateMeasurementValue('distance', points);
+          onMeasurementAdd({
+            id: Date.now().toString(),
+            type: activeTool,
+            points,
+            slice: currentSlice,
+            plane: measurementPlane,
+            value,
+          });
+          setIsDrawing(false);
+          setDrawingPoints([]);
+        }
       } else if (activeTool === 'angle') {
-        // handled by click
+        if (drawingPoints.length < 3) {
+          setDrawingPoints(prev => [...prev, { x, y }]);
+        }
+        if (drawingPoints.length === 2) {
+          const points = [...drawingPoints, { x, y }];
+          const value = calculateMeasurementValue('angle', points);
+          onMeasurementAdd({
+            id: Date.now().toString(),
+            type: 'angle',
+            points,
+            slice: currentSlice,
+            plane: measurementPlane,
+            value,
+          });
+          setIsDrawing(false);
+          setDrawingPoints([]);
+        }
+      } else if (activeTool === 'ellipse') {
+        const points = [drawingPoints[0], { x, y }];
+        const value = calculateMeasurementValue('ellipse', points);
+        onMeasurementAdd({
+          id: Date.now().toString(),
+          type: 'ellipse',
+          points,
+          slice: currentSlice,
+          plane: measurementPlane,
+          value,
+        });
+        setIsDrawing(false);
+        setDrawingPoints([]);
+      } else if (activeTool === 'freehand') {
+        if (drawingPoints.length > 1) {
+          onMeasurementAdd({
+            id: Date.now().toString(),
+            type: 'freehand',
+            points: drawingPoints,
+            slice: currentSlice,
+            plane: measurementPlane,
+          });
+        }
+        setIsDrawing(false);
+        setDrawingPoints([]);
       }
     }
   };
 
   const handleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const rect = overlayCanvasRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    if (activeTool === 'closedCurve' && isDrawing) {
+      const rect = overlayCanvasRef.current?.getBoundingClientRect();
+      if (!rect) return;
 
-    // Check if clicking the ⊥ button on a selected line
-    if (activeTool === 'none' && selectedLineId) {
-      const baseLine = measurements.find(m => m.id === selectedLineId);
-      if (baseLine && baseLine.points.length >= 2) {
-        const p0 = baseLine.points[0];
-        const p1 = baseLine.points[1];
-        const midX = (p0.x + p1.x) / 2;
-        const midY = (p0.y + p1.y) / 2;
-        // Check if click is within the ⊥ button bounds
-        if (x >= midX - 12 && x <= midX + 12 && y >= midY - 12 && y <= midY + 12) {
-          // Compute perpendicular direction
-          const dx = p1.x - p0.x;
-          const dy = p1.y - p0.y;
-          const len = Math.sqrt(dx * dx + dy * dy);
-          if (len === 0) {
-            setSelectedLineId(null);
-            return;
-          }
-          const perpX = -dy / len;
-          const perpY = dx / len;
-          const stubLen = 40;
-          // Create perpendicular measurement
-          onMeasurementAdd({
-            id: Date.now().toString(),
-            type: 'perpendicular',
-            points: [
-              { x: midX, y: midY },
-              { x: midX + perpX * stubLen, y: midY + perpY * stubLen },
-            ],
-            slice: currentSlice,
-            plane,
-            baseLineId: selectedLineId,
-          });
-          setSelectedLineId(null)
-          return;
-        }
-      }
-    }
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
 
-    if (activeTool === 'distance' || activeTool === 'line') {
-      if (!isDrawing) {
-        setIsDrawing(true);
-        setDrawingPoints([{ x, y }]);
+      // Check if clicking near first point to close
+      const firstPoint = drawingPoints[0];
+      const dist = Math.sqrt((x - firstPoint.x) ** 2 + (y - firstPoint.y) ** 2);
+      
+      if (dist < 10 && drawingPoints.length > 2) {
+        // Close the curve
+        onMeasurementAdd({
+          id: Date.now().toString(),
+          type: 'closedCurve',
+          points: drawingPoints,
+          slice: currentSlice,
+          plane: measurementPlane,
+        });
+        setIsDrawing(false);
+        setDrawingPoints([]);
       } else {
-        const points = [...drawingPoints, { x, y }];
-        const value = calculateMeasurementValue('distance', points);
-        onMeasurementAdd({
-          id: Date.now().toString(),
-          type: activeTool,
-          points,
-          slice: currentSlice,
-          plane,
-          value,
-        });
-        setIsDrawing(false);
-        setDrawingPoints([]);
-      }
-    } else if (activeTool === 'angle') {
-      if (!isDrawing) {
-        setIsDrawing(true);
-        setDrawingPoints([{ x, y }]);
-      } else if (drawingPoints.length === 1) {
         setDrawingPoints(prev => [...prev, { x, y }]);
-      } else if (drawingPoints.length === 2) {
-        const points = [...drawingPoints, { x, y }];
-        const value = calculateMeasurementValue('angle', points);
-        onMeasurementAdd({
-          id: Date.now().toString(),
-          type: 'angle',
-          points,
-          slice: currentSlice,
-          plane,
-          value,
-        });
-        setIsDrawing(false);
-        setDrawingPoints([]);
       }
     }
   };
 
   const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
     e.preventDefault();
-    if (isAxial && isZoomMode) {
-      applyAxialWheelZoomAtPointer(e.clientX, e.clientY, e.deltaY, e.deltaMode);
+    if (isZoomMode) {
+      applyWheelZoomAtPointer(e.clientX, e.clientY, e.deltaY, e.deltaMode);
       return;
     }
     const delta = e.deltaY > 0 ? 1 : -1;
@@ -1174,16 +1287,6 @@ setSelectedLineId(null);
     }));
   }, [activeTool]);
 
-  // Reset zoom when leaving pan tool unless axial zoom mode is active (preserve zoom).
-  useEffect(() => {
-    if (activeTool === 'pan') return;
-    if (isAxial && isZoomMode) return;
-    zoomScaleRef.current = 1;
-    panSrcRef.current = { x: 0, y: 0 };
-    setZoomScale(1);
-    setPanSrc({ x: 0, y: 0 });
-  }, [activeTool, isAxial, isZoomMode]);
-
   const dims = header.dims;
   const maxSlice = plane === 'axial' ? dims[3] : plane === 'sagittal' ? dims[1] : dims[2];
 
@@ -1193,87 +1296,272 @@ setSelectedLineId(null);
   const displayH = displaySize.height || imgH;
 
   return (
-    <div className="relative bg-gray-900 rounded-lg border border-gray-800 overflow-hidden flex flex-col h-full w-full">
-      {/* debug overlay removed for cleaner UI */}
-      <div className="absolute top-2 left-2 z-10 bg-black bg-opacity-50 px-2 py-1 rounded text-xs text-white">
-        <div className="font-semibold capitalize">{plane}</div>
-        <div className="text-gray-400">
-          Slice: {currentSlice + 1}/{maxSlice}
-        </div>
-        <div className="text-gray-400 mt-1">
-          W: {Math.round(windowLevel.window)} L: {Math.round(windowLevel.level)}
-        </div>
-      </div>
-      {isAxial && (
-        <div className="absolute top-2 right-2 z-10 flex items-center gap-1 bg-black bg-opacity-50 p-1 rounded text-xs text-white">
-          <button
-            className={`px-2 py-1 rounded ${isRotateMode ? 'bg-blue-600 text-white' : 'bg-gray-700 hover:bg-gray-600'}`}
-            onClick={() => {
-              setIsRotateMode(v => {
-                const next = !v;
-                if (next) setIsZoomMode(false);
-                return next;
-              });
-              stopRotateDrag();
-            }}
-          >
-            Rotate
-          </button>
-          <button
-            className={`px-2 py-1 rounded ${isZoomMode ? 'bg-blue-600 text-white' : 'bg-gray-700 hover:bg-gray-600'}`}
-            onClick={() => {
-              setIsZoomMode(v => {
-                const next = !v;
-                if (next) {
-                  setIsRotateMode(false);
-                  stopRotateDrag();
-                  lastPointerClientRef.current = null;
-                }
-                return next;
-              });
-            }}
-          >
-            Zoom
-          </button>
-          <button
-            className="px-2 py-1 bg-gray-700 rounded hover:bg-gray-600"
-            onClick={() => setAxialTransform({ rotation: 0 })}
-          >
-            0 deg
-          </button>
-          <button
-            className="px-2 py-1 bg-gray-700 rounded hover:bg-gray-600"
-            onClick={() => {
-              setAxialTransform({ rotation: 0 });
-              zoomScaleRef.current = 1;
-              panSrcRef.current = { x: 0, y: 0 };
-              setZoomScale(1);
-              setPanSrc({ x: 0, y: 0 });
-              setIsRotateMode(false);
-              setIsZoomMode(false);
-              lastPointerClientRef.current = null;
-              stopRotateDrag();
-            }}
-          >
-            Reset
-          </button>
-          {isZoomMode && (
-            <span className="text-[10px] text-gray-400 max-w-[140px] leading-tight pl-1">
-              Hover and scroll — zooms toward cursor
+    <div className="bg-gray-900 rounded-lg border border-gray-800 overflow-hidden flex flex-col h-full w-full min-h-0">
+      {/* Docked toolbar — does not overlap the image canvas; wraps when multiple viewers are narrow */}
+      <div className="shrink-0 border-b border-gray-800 bg-gray-950 px-1.5 py-0.5">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 justify-between w-full min-w-0">
+          <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0 min-w-0 text-[10px] leading-tight text-gray-300">
+            <span className="font-semibold capitalize text-gray-100 shrink-0">{planeLabel ?? plane}</span>
+            <span className="text-gray-600 shrink-0" aria-hidden>
+              |
             </span>
-          )}
+            <span className="tabular-nums shrink-0 whitespace-nowrap">
+              Sl {currentSlice + 1}/{maxSlice}
+            </span>
+            <span className="text-gray-600 shrink-0" aria-hidden>
+              |
+            </span>
+            <span className="tabular-nums shrink-0 whitespace-nowrap" title="Window width / window center (this viewer)">
+              WW {Math.round(wl.window)} · WC {Math.round(wl.level)}
+            </span>
+            <span className="text-gray-600 shrink-0" aria-hidden>
+              |
+            </span>
+            <span className="tabular-nums shrink-0 whitespace-nowrap text-gray-200" title="Brightness (this viewer only)">
+              Br {Math.round(brightness * 100)}%
+            </span>
+            <span className="text-gray-600 shrink-0" aria-hidden>
+              |
+            </span>
+            <span className="tabular-nums shrink-0 whitespace-nowrap text-gray-200" title="Zoom scale (this viewer only)">
+              Z {Math.round(zoomScale * 100)}%
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-0.5 shrink-0">
+            <button
+              type="button"
+              className={`px-1.5 py-0.5 rounded border text-[10px] ${
+                isWlMode
+                  ? 'bg-amber-600 border-amber-500 text-white'
+                  : 'bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700'
+              }`}
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsWlMode((v) => {
+                  const next = !v;
+                  if (next) dismissCanvasToolModes();
+                  return next;
+                });
+              }}
+              title="Window level (center) — slider (this viewer only)"
+              aria-expanded={isWlMode}
+            >
+              WL
+            </button>
+            <button
+              type="button"
+              className={`px-1.5 py-0.5 rounded border text-[10px] ${
+                isWwMode
+                  ? 'bg-amber-600 border-amber-500 text-white'
+                  : 'bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700'
+              }`}
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsWwMode((v) => {
+                  const next = !v;
+                  if (next) dismissCanvasToolModes();
+                  return next;
+                });
+              }}
+              title="Window width — slider (this viewer only)"
+              aria-expanded={isWwMode}
+            >
+              WW
+            </button>
+            <button
+              type="button"
+              className={`px-1.5 py-0.5 rounded border text-[10px] ${
+                isBrightnessMode
+                  ? 'bg-blue-600 border-blue-500 text-white'
+                  : 'bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700'
+              }`}
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsBrightnessMode((v) => {
+                  const next = !v;
+                  if (next) dismissCanvasToolModes();
+                  return next;
+                });
+              }}
+              title="Brightness gain (this viewer only)"
+              aria-expanded={isBrightnessMode}
+            >
+              Bright
+            </button>
+            <button
+              type="button"
+              className={`px-1.5 py-0.5 rounded border text-[10px] ${
+                isZoomMode
+                  ? 'bg-blue-600 border-blue-500 text-white'
+                  : 'bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700'
+              }`}
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsZoomMode((v) => {
+                  const next = !v;
+                  if (next) dismissCanvasToolModes();
+                  return next;
+                });
+              }}
+              title="Zoom: wheel zooms toward cursor; use +/− for trackpad (this viewer only)"
+              aria-expanded={isZoomMode}
+            >
+              Zoom{isZoomMode ? ' ▼' : ''}
+            </button>
+            {isZoomMode ? (
+              <>
+                <button
+                  type="button"
+                  className="min-w-[1.35rem] px-1 py-0.5 rounded border text-[11px] font-semibold leading-none bg-gray-800 border-gray-700 text-gray-100 hover:bg-gray-700 disabled:opacity-35 disabled:pointer-events-none"
+                  disabled={zoomScale >= VIEWPORT_ZOOM_MAX - 0.02}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    zoomInStep();
+                  }}
+                  title="Zoom in (viewport center)"
+                  aria-label="Zoom in"
+                >
+                  +
+                </button>
+                <button
+                  type="button"
+                  className="min-w-[1.35rem] px-1 py-0.5 rounded border text-[11px] font-semibold leading-none bg-gray-800 border-gray-700 text-gray-100 hover:bg-gray-700 disabled:opacity-35 disabled:pointer-events-none"
+                  disabled={zoomScale <= VIEWPORT_ZOOM_MIN + 0.02}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    zoomOutStep();
+                  }}
+                  title="Zoom out (viewport center)"
+                  aria-label="Zoom out"
+                >
+                  −
+                </button>
+              </>
+            ) : null}
+            <button
+              type="button"
+              className="px-1.5 py-0.5 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-[10px] text-gray-100"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleViewerReset();
+              }}
+              title="Reset viewer to state right after this sequence was loaded (zoom, pan, WL, brightness, slice, in-view marks)"
+            >
+              Reset
+            </button>
+            {onClose ? (
+              <button
+                type="button"
+                className="px-1.5 py-0.5 rounded bg-gray-800 border border-red-900/60 text-red-300 hover:bg-red-950/40 text-[10px]"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onClose();
+                }}
+                title="Close this viewer"
+              >
+                Close
+              </button>
+            ) : null}
+            {isAxial ? (
+              <>
+                <span className="text-gray-600 px-0.5" aria-hidden>
+                  |
+                </span>
+                <button
+                  type="button"
+                  className={`px-1.5 py-0.5 rounded border text-[10px] ${
+                    isRotateMode
+                      ? 'bg-blue-600 border-blue-500 text-white'
+                      : 'bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700'
+                  }`}
+                  onClick={() => {
+                    setIsRotateMode((v) => {
+                      const next = !v;
+                      if (next) dismissCanvasToolModes();
+                      return next;
+                    });
+                    stopRotateDrag();
+                  }}
+                  title="Rotate (axial)"
+                >
+                  Rot
+                </button>
+                <button
+                  type="button"
+                  className="px-1.5 py-0.5 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-[10px] text-gray-200"
+                  onClick={() => setAxialTransform({ rotation: 0 })}
+                  title="Rotation 0°"
+                >
+                  0°
+                </button>
+              </>
+            ) : null}
+          </div>
         </div>
-      )}
+        {(isWlMode || isWwMode || isBrightnessMode) && (
+          <div
+            className="mt-0.5 space-y-0.5 min-w-0 border-t border-gray-800/80 pt-0.5"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            {isWlMode ? (
+              <div className="flex items-center gap-1.5 min-w-0">
+                <span className="text-[10px] text-gray-500 shrink-0 w-[4.5rem]" title="Window center (this viewer)">
+                  WL {Math.round(wl.level)}
+                </span>
+                <Slider
+                  className="min-w-0 flex-1 max-w-[10rem] sm:max-w-[14rem] h-4"
+                  min={WL_MIN_CENTER}
+                  max={WL_MAX_CENTER}
+                  step={1}
+                  value={[wl.level]}
+                  onValueChange={(v) => {
+                    const level = v[0] ?? wl.level;
+                    setWlSafe((prev) => ({ ...prev, level }));
+                  }}
+                  aria-label="Window level"
+                />
+              </div>
+            ) : null}
+            {isWwMode ? (
+              <div className="flex items-center gap-1.5 min-w-0">
+                <span className="text-[10px] text-gray-500 shrink-0 w-[4.5rem]" title="Window width (this viewer)">
+                  WW {Math.round(wl.window)}
+                </span>
+                <Slider
+                  className="min-w-0 flex-1 max-w-[10rem] sm:max-w-[14rem] h-4"
+                  min={WL_MIN_WIDTH}
+                  max={WL_MAX_WIDTH}
+                  step={1}
+                  value={[wl.window]}
+                  onValueChange={(v) => {
+                    const window = v[0] ?? wl.window;
+                    setWlSafe((prev) => ({ ...prev, window }));
+                  }}
+                  aria-label="Window width"
+                />
+              </div>
+            ) : null}
+            {isBrightnessMode ? (
+              <div className="flex items-center gap-1.5 min-w-0">
+                <span className="text-[10px] text-gray-500 shrink-0 w-[4.5rem]" title="Brightness (this viewer only)">
+                  Bright
+                </span>
+                <Slider
+                  className="min-w-0 flex-1 max-w-[10rem] sm:max-w-[14rem] h-4"
+                  min={0.25}
+                  max={2.5}
+                  step={0.02}
+                  value={[brightness]}
+                  onValueChange={(v) => setBrightness(v[0] ?? 1)}
+                  aria-label="Viewer brightness"
+                />
+              </div>
+            ) : null}
+          </div>
+        )}
+      </div>
 
-
-      {/* Auto WL flash */}
-      {autoFlash && (
-        <div className="absolute top-16 left-1/2 transform -translate-x-1/2 z-20 bg-green-800 bg-opacity-80 px-3 py-1 rounded text-xs text-white">
-          Auto WL applied — W: {autoFlash.window} L: {autoFlash.level}
-        </div>
-      )}
-
-      <div ref={containerRef} className="flex-1 flex items-center justify-center p-4 overflow-auto min-h-0">
+      <div ref={containerRef} className="flex-1 flex items-center justify-center p-2 overflow-auto min-h-0">
         <div
           className="relative flex items-center justify-center w-full h-full"
           style={{ overflow: 'visible' }}
@@ -1289,19 +1577,20 @@ setSelectedLineId(null);
                 ref={overlayCanvasRef}
                 className="absolute inset-0 w-full h-full"
                 style={{
-                  cursor: isAxial && isZoomMode
-                    ? 'zoom-in'
-                    : isAxial && isRotateMode
-                      ? 'ew-resize'
-                      : activeTool === 'pan'
-                        ? (isPanning ? 'grabbing' : 'grab')
-                        : 'crosshair',
+                  cursor: isZoomMode
+                      ? 'zoom-in'
+                      : isAxial && isRotateMode
+                        ? 'ew-resize'
+                        : activeTool === 'pan'
+                          ? (isPanning ? 'grabbing' : 'grab')
+                          : 'crosshair',
                 }}
                 onMouseDown={handleMouseDown}
                 onMouseMove={handleMouseMove}
                 onMouseUp={handleMouseUp}
                 onClick={handleClick}
                 onWheel={handleWheel}
+                onContextMenu={(ev) => ev.preventDefault()}
               />
             </div>
 
