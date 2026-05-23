@@ -4,15 +4,57 @@ import {
   groupFilesByDirectory,
   isProbablyDicom,
   loadDicomSeries,
+  readLateralityFromDicomBuffer,
 } from './DicomLoader';
+import {
+  type Laterality,
+  detectSeriesLaterality,
+  lateralityFromSeriesText,
+  resolveLateralityForPlane,
+} from './laterality';
+
+export interface KneeSequences {
+  volumes: Partial<Record<Plane, DicomVolume>>;
+}
 
 export interface DicomStudy {
   studyName: string;
   patientId: string;
   patientName: string;
   studyInstanceUID: string;
-  /** One volume per orientation. Any of these can be undefined if missing. */
-  volumes: Partial<Record<Plane, DicomVolume>>;
+  knees: {
+    left: KneeSequences;
+    right: KneeSequences;
+  };
+}
+
+export function emptyKnees(): DicomStudy['knees'] {
+  return { left: { volumes: {} }, right: { volumes: {} } };
+}
+
+export function mergeStudies(existing: DicomStudy, incoming: DicomStudy): DicomStudy {
+  const knees = emptyKnees();
+  for (const lat of ['left', 'right'] as Laterality[]) {
+    const bucket = knees[lat].volumes;
+    for (const p of ['axial', 'sagittal', 'coronal'] as Plane[]) {
+      const prev = existing.knees[lat].volumes[p];
+      const next = incoming.knees[lat].volumes[p];
+      if (prev && (!next || prev.sliceCount >= next.sliceCount)) {
+        bucket[p] = prev;
+      } else if (next) {
+        bucket[p] = next;
+      }
+    }
+  }
+
+  return {
+    ...existing,
+    studyName: incoming.studyName || existing.studyName,
+    patientId: incoming.patientId || existing.patientId,
+    patientName: incoming.patientName || existing.patientName,
+    studyInstanceUID: incoming.studyInstanceUID || existing.studyInstanceUID,
+    knees,
+  };
 }
 
 const PLANE_HINTS: Array<{ pattern: RegExp; plane: Plane }> = [
@@ -39,9 +81,47 @@ function planeHintFromRelativePath(rel: string): Plane | null {
   return null;
 }
 
+function assignVolume(
+  knees: DicomStudy['knees'],
+  laterality: Laterality,
+  plane: Plane,
+  vol: DicomVolume,
+) {
+  vol.laterality = laterality;
+  const bucket = knees[laterality].volumes;
+  const existing = bucket[plane];
+  if (!existing || vol.sliceCount > existing.sliceCount) {
+    bucket[plane] = vol;
+  }
+}
+
+/**
+ * Move volumes that sit in the wrong knee bucket according to series metadata.
+ * Bilateral studies keep both left and right sequences (never delete the other side).
+ */
+function rebalanceKneesFromMetadata(knees: DicomStudy['knees']): void {
+  for (const plane of ['axial', 'sagittal', 'coronal'] as Plane[]) {
+    for (const lat of ['left', 'right'] as Laterality[]) {
+      const vol = knees[lat].volumes[plane];
+      if (!vol) continue;
+
+      const detected = lateralityFromSeriesText(vol.seriesDescription);
+      if (!detected || detected === lat) continue;
+
+      const dest = knees[detected].volumes[plane];
+      if (!dest || vol.sliceCount > dest.sliceCount) {
+        vol.laterality = detected;
+        knees[detected].volumes[plane] = vol;
+      }
+      delete knees[lat].volumes[plane];
+    }
+  }
+}
+
 /**
  * Load a full knee-MRI study (folder containing A_DICOM, S_DICOM, C_DICOM
- * subfolders) by reading every file once and grouping by parent directory.
+ * subfolders, optionally under LeftKnee/RightKnee) by reading every file once
+ * and grouping by parent directory.
  */
 export async function loadDicomStudy(
   fileList: FileList | File[],
@@ -50,11 +130,10 @@ export async function loadDicomStudy(
   const files = Array.from(fileList).filter((f) => isProbablyDicom(f.name));
   const groups = groupFilesByDirectory(files);
 
-  // The study name = the topmost shared directory
-  const firstRel = (files[0] as any)?.webkitRelativePath || files[0]?.name || 'Study';
+  const firstRel = (files[0] as File & { webkitRelativePath?: string })?.webkitRelativePath || files[0]?.name || 'Study';
   const studyName = firstRel.split('/')[0] || 'Study';
 
-  const volumes: Partial<Record<Plane, DicomVolume>> = {};
+  const knees = emptyKnees();
 
   for (const [dir, dirFiles] of groups) {
     onProgress?.(`Reading ${dir || 'series'} (${dirFiles.length} files)…`);
@@ -62,32 +141,37 @@ export async function loadDicomStudy(
       dirFiles.map(async (f) => ({ name: f.name, buffer: await f.arrayBuffer() })),
     );
 
-    // Hint plane from folder names. When the user selects a single series folder,
-    // webkitRelativePath is often flat ("0001.dcm") so the parent folder name is
-    // missing from `dir` — scan the full relative path of the first file too.
-    const firstRel =
-      (dirFiles[0] as File & { webkitRelativePath?: string })?.webkitRelativePath ||
-      dirFiles[0]?.name ||
-      '';
+    const firstRelPath =
+      (dirFiles[0] as File & { webkitRelativePath?: string })?.webkitRelativePath || dirFiles[0]?.name || '';
     const dirHint = planeFromName(dir.split('/').pop() || dir);
-    const pathHint = planeHintFromRelativePath(firstRel);
+    const pathHint = planeHintFromRelativePath(firstRelPath);
     const seriesHint = dirHint ?? pathHint;
+
     const vol = await loadDicomSeries(buffers, seriesHint || undefined);
     if (!vol) continue;
 
-    // Prefer explicit folder/path naming over geometry heuristics.
     const finalPlane = dirHint ?? pathHint ?? vol.plane;
     vol.plane = finalPlane;
 
-    // If we already filled this plane, keep the larger series.
-    const existing = volumes[finalPlane];
-    if (!existing || vol.sliceCount > existing.sliceCount) {
-      volumes[finalPlane] = vol;
-    }
+    const dicomLat = buffers[0] ? readLateralityFromDicomBuffer(buffers[0].buffer) : null;
+    const latHint = detectSeriesLaterality(
+      vol.seriesDescription,
+      `${dir}/${firstRelPath}`,
+      studyName,
+      dicomLat ?? undefined,
+    );
+    const occupied = {
+      left: Boolean(knees.left.volumes[finalPlane]),
+      right: Boolean(knees.right.volumes[finalPlane]),
+    };
+    const laterality = resolveLateralityForPlane(latHint, finalPlane, occupied);
+    assignVolume(knees, laterality, finalPlane, vol);
   }
 
-  const representative = (['axial', 'sagittal', 'coronal'] as Plane[])
-    .map((p) => volumes[p])
+  rebalanceKneesFromMetadata(knees);
+
+  const representative = (['left', 'right'] as Laterality[])
+    .flatMap((lat) => (['axial', 'sagittal', 'coronal'] as Plane[]).map((p) => knees[lat].volumes[p]))
     .find(Boolean);
 
   return {
@@ -95,6 +179,6 @@ export async function loadDicomStudy(
     patientId: representative?.patientId || `unknown-${studyName}`,
     patientName: representative?.patientName || 'Unknown Patient',
     studyInstanceUID: representative?.studyInstanceUID || '',
-    volumes,
+    knees,
   };
 }

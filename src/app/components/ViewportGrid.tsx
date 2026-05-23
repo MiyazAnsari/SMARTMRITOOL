@@ -10,6 +10,7 @@ interface SequenceWindow {
   label: string;
   imageData: Uint8Array;
   header: any;
+  defaultWindowLevel: WindowLevel;
 }
 
 interface ViewportGridProps {
@@ -19,8 +20,8 @@ interface ViewportGridProps {
   /** Single-view mode */
   viewPlane: ViewPlane;
   onSliceChange: (plane: Plane, slice: number) => void;
-  windowLevel: WindowLevel;
-  onWindowLevelChange: (wl: WindowLevel) => void;
+  /** Initial W/L for each viewer (each `Viewport` owns brightness independently). */
+  resolveDefaultWindowLevel: (viewportId: Plane) => WindowLevel;
   activeTool: MeasurementTool;
   measurements: Measurement[];
   onMeasurementAdd: (measurement: Measurement) => void;
@@ -31,6 +32,8 @@ interface ViewportGridProps {
   sequenceWindows?: SequenceWindow[];
   onWindowFocus?: (plane: Plane) => void;
   onHideWindow?: (plane: Plane) => void;
+  /** Restore defaults for the given acquisition plane / viewer only. */
+  onResetViewport?: (plane: Plane) => void;
 }
 
 type Rect = { top: number; left: number; width: number; height: number; z?: number };
@@ -41,8 +44,7 @@ export function ViewportGrid({
   currentSlice,
   viewPlane,
   onSliceChange,
-  windowLevel,
-  onWindowLevelChange,
+  resolveDefaultWindowLevel,
   activeTool,
   measurements,
   onMeasurementAdd,
@@ -52,6 +54,7 @@ export function ViewportGrid({
   sequenceWindows,
   onWindowFocus,
   onHideWindow,
+  onResetViewport,
 }: ViewportGridProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [positions, setPositions] = useState<Record<string, Rect>>({});
@@ -157,16 +160,17 @@ export function ViewportGrid({
               imageData={imageData}
               header={header}
               plane={viewPlane}
+              measurementPlane={viewPlane}
               currentSlice={planeSlice}
               onSliceChange={(slice) => onSliceChange(viewPlane, slice)}
-              windowLevel={windowLevel}
-              onWindowLevelChange={onWindowLevelChange}
+              defaultWindowLevel={resolveDefaultWindowLevel(viewPlane)}
               activeTool={activeTool}
               measurements={planeMeasurements}
               onMeasurementAdd={onMeasurementAdd}
               onMeasurementUpdate={onMeasurementUpdate}
               applyWeighting={applyWeighting}
               showCrosshair={showCrosshair}
+              onViewportReset={() => onResetViewport?.(viewPlane)}
             />
           </div>
         </div>
@@ -192,7 +196,7 @@ export function ViewportGrid({
         return (
           <div
             key={w.id}
-            className="absolute bg-gray-900 border border-gray-800 rounded-lg shadow-lg overflow-hidden"
+            className="absolute bg-gray-900 border border-gray-800 rounded-lg shadow-lg overflow-hidden flex flex-col"
             style={{ top: pos.top, left: pos.left, width: pos.width, height: pos.height, zIndex: pos.z || 100 }}
             onMouseDown={() => {
               bringToFront(w.id);
@@ -200,7 +204,7 @@ export function ViewportGrid({
             }}
           >
             <div
-              className="flex items-center justify-between px-2 py-1 bg-gray-800 border-b border-gray-700 cursor-move"
+              className="shrink-0 flex items-center justify-between px-2 py-1 bg-gray-800 border-b border-gray-700 cursor-move"
               onMouseDown={(e) => startDrag(w.id, e)}
             >
               <div className="text-xs text-gray-200 font-semibold capitalize">{w.label}</div>
@@ -221,22 +225,25 @@ export function ViewportGrid({
                 </button>
               </div>
             </div>
-            <div className="w-full h-full relative">
+            <div className="flex-1 min-h-0 min-w-0 relative flex flex-col">
               <Viewport
                 imageData={w.imageData}
                 header={w.header}
                 plane="axial"
+                planeLabel={w.label}
+                measurementPlane={w.id}
                 currentSlice={sequenceSlice}
                 onSliceChange={(slice) => onSliceChange(w.id, slice)}
-                windowLevel={windowLevel}
-                onWindowLevelChange={onWindowLevelChange}
+                defaultWindowLevel={w.defaultWindowLevel}
                 activeTool={activeTool}
-                measurements={measurements.filter((m) => m.plane === 'axial')}
+                measurements={measurements.filter((m) => m.plane === w.id)}
                 onMeasurementAdd={onMeasurementAdd}
                 onMeasurementUpdate={onMeasurementUpdate}
                 applyWeighting={applyWeighting}
                 showCrosshair={showCrosshair}
                 parentWindowHeight={pos.height}
+                onViewportReset={() => onResetViewport?.(w.id)}
+                onClose={() => onHideWindow?.(w.id)}
               />
               <div
                 onMouseDown={(e) => startResize(w.id, e)}
