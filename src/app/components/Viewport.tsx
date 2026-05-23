@@ -719,7 +719,7 @@ export function Viewport({
 
       const points = measurement.points;
 
-      if (measurement.type === 'distance' && points.length >= 2) {
+      if ((measurement.type === 'distance' || measurement.type === 'line') && points.length >= 2) {
         ctx.beginPath();
         ctx.moveTo(points[0].x, points[0].y);
         ctx.lineTo(points[1].x, points[1].y);
@@ -853,13 +853,12 @@ if (activeTool  === 'none') {
         setDraggingPoint({ measurementId: m.id, pointIndex: i });
         setIsDrawing(false);
         setDrawingPoints([]);
-        console.log('set dragging point:', draggingPointRef.current);
         return;
       }
     }
   }
   for (const m of measurements) {
-  if (m.type !== 'distance') continue;
+  if (m.type !== 'distance' && m.type !== 'line') continue;
   if (m.points.length < 2) continue;
   const p0 = m.points[0];
   const p1 = m.points[1];
@@ -867,6 +866,7 @@ if (activeTool  === 'none') {
   const dx = p1.x - p0.x;
   const dy = p1.y - p0.y;
   const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) continue;
   const t = Math.max(0, Math.min(1, ((x - p0.x) * dx + (y - p0.y) * dy) / lenSq));
   const closestX = p0.x + t * dx;
   const closestY = p0.y + t * dy;
@@ -960,6 +960,7 @@ setSelectedLineId(null);
       const dx = p1.x - p0.x;
       const dy = p1.y - p0.y;
       const len = Math.sqrt(dx * dx + dy * dy);
+      if (len === 0) return;
       const perpX = -dy / len;
       const perpY = dx / len;
 
@@ -1082,6 +1083,10 @@ setSelectedLineId(null);
           const dx = p1.x - p0.x;
           const dy = p1.y - p0.y;
           const len = Math.sqrt(dx * dx + dy * dy);
+          if (len === 0) {
+            setSelectedLineId(null);
+            return;
+          }
           const perpX = -dy / len;
           const perpY = dx / len;
           const stubLen = 40;

@@ -86,7 +86,7 @@ function measurementMatchesPrimitive(measurement: Measurement, primitive: Primit
   if (primitive === 'line') return measurement.type === 'line' || measurement.type === 'distance';
   if (primitive === 'distance') return measurement.type === 'distance' || measurement.type === 'line';
   if (primitive === 'angle') return measurement.type === 'angle';
-  if (primitive === 'point') return measurement.type === 'point';
+  if (primitive === 'point') return measurement.type === 'point' || measurement.type === 'perpendicular';
   return false;
 }
 
@@ -421,10 +421,15 @@ export function MedicalImageViewer({
       return [...prev, { ...measurement, groupId: currentGroupIdRef.current ?? undefined, label }];
     });
       if (protocol && activeStep && measurementMatchesPrimitive(measurement, activeStep.primitive)) {
+        const recordedPoints =
+          activeStep.primitive === 'point' && measurement.type === 'perpendicular' && measurement.points.length >= 2
+            ? [measurement.points[1]]
+            : measurement.points;
+
         setWorkflow(prev =>
           recordStepResult(prev, protocol, {
             primitive: activeStep.primitive,
-            points: measurement.points,
+            points: recordedPoints,
             slice: measurement.slice,
           }),
         );
@@ -461,6 +466,7 @@ export function MedicalImageViewer({
     const dx = p1.x - p0.x;
     const dy = p1.y - p0.y;
     const len = Math.sqrt(dx*dx + dy*dy);
+    if (len === 0) return m;
     const lineX = dx / len;
     const lineY = dy / len;
     const perpX = -dy / len;
