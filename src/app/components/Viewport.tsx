@@ -42,6 +42,7 @@ interface ViewportProps {
   activeTool: MeasurementTool;
   measurements: Measurement[];
   onMeasurementAdd: (measurement: Measurement) => void;
+  onMeasurementUpdate?: (id: string, newPoints: { x: number; y: number }[]) => void;
   applyWeighting: (pixelValue: number) => number;
   showCrosshair?: boolean;
   parentWindowHeight?: number;
@@ -63,6 +64,7 @@ export function Viewport({
   activeTool,
   measurements,
   onMeasurementAdd,
+  onMeasurementUpdate,
   applyWeighting,
   showCrosshair = false,
   parentWindowHeight,
@@ -106,6 +108,37 @@ export function Viewport({
   const sliderRef = useRef<HTMLDivElement | null>(null);
   const [isDrawing, setIsDrawing] = useState(false);
   const [drawingPoints, setDrawingPoints] = useState<{ x: number; y: number }[]>([]);
+  const [draggingPoint, setDraggingPoint] = useState<{ measurementId: string; pointIndex: number } | null>(null);
+  const [selectedLineId, setSelectedLineId] = useState<string | null>(null);
+  const draggingPointRef = useRef<{ measurementId: string; pointIndex: number } | null>(null);
+  const perpendicularBaseLineRef = useRef<string | null>(null);
+  const measurementsRef = useRef(measurements);
+  useEffect(() => {
+    measurementsRef.current = measurements;
+  }, [measurements]);
+
+  const buildPerpendicularPoints = useCallback((baseLine: Measurement, cursor: { x: number; y: number }) => {
+    if (baseLine.points.length < 2) return null;
+    const p0 = baseLine.points[0];
+    const p1 = baseLine.points[1];
+    const dx = p1.x - p0.x;
+    const dy = p1.y - p0.y;
+    const len = Math.hypot(dx, dy);
+    if (len === 0) return null;
+
+    const midX = (p0.x + p1.x) / 2;
+    const midY = (p0.y + p1.y) / 2;
+    const perpX = -dy / len;
+    const perpY = dx / len;
+    const offset = (cursor.x - midX) * perpX + (cursor.y - midY) * perpY;
+    const stubLen = Math.max(1, Math.abs(offset));
+    const sign = offset >= 0 ? 1 : -1;
+
+    return {
+      anchor: { x: midX, y: midY },
+      tip: { x: midX + perpX * stubLen * sign, y: midY + perpY * stubLen * sign },
+    };
+  }, []);
 
   // Pan state
   const [panSrc, setPanSrc] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -913,6 +946,35 @@ export function Viewport({
           ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
           ctx.fill();
         });
+        if (measurement.id === selectedLineId) {
+          const midX = (points[0].x + points[1].x) / 2;
+          const midY = (points[0].y + points[1].y) / 2;
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(midX - 11, midY - 11, 22, 22);
+          ctx.fillStyle = '#111827';
+          ctx.font = 'bold 13px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('⊥', midX, midY + 0.5);
+          ctx.fillStyle = '#3b82f6';
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'alphabetic';
+        }
+      } else if (measurement.type === 'perpendicular' && points.length >= 2) {
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        ctx.lineTo(points[1].x, points[1].y);
+        ctx.stroke();
+
+        ctx.fillStyle = '#10b981'; // vibrantly color anchor
+        ctx.beginPath();
+        ctx.arc(points[0].x, points[0].y, 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = '#3b82f6';
+        ctx.beginPath();
+        ctx.arc(points[1].x, points[1].y, 4, 0, Math.PI * 2);
+        ctx.fill();
       } else if (measurement.type === 'point' && points.length >= 1) {
         const p = points[0];
         ctx.beginPath();
@@ -972,7 +1034,7 @@ export function Viewport({
       ctx.fillStyle = '#60a5fa';
       ctx.lineWidth = 2;
 
-      if (activeTool === 'distance' || activeTool === 'line' || activeTool === 'angle') {
+      if (activeTool === 'distance' || activeTool === 'line' || activeTool === 'perpendicular' || activeTool === 'angle') {
         ctx.beginPath();
         ctx.moveTo(drawingPoints[0].x, drawingPoints[0].y);
         drawingPoints.forEach(p => ctx.lineTo(p.x, p.y));
@@ -1010,14 +1072,15 @@ export function Viewport({
         ctx.stroke();
       }
     }
-  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool]);
+  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool, selectedLineId]);
 
   // Calculate measurement value
   const calculateMeasurementValue = (type: MeasurementTool, points: { x: number; y: number }[]): string => {
-    if (type === 'distance' && points.length === 2) {
+    if ((type === 'distance' || type === 'perpendicular') && points.length === 2) {
       const dx = points[1].x - points[0].x;
       const dy = points[1].y - points[0].y;
       const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist === 0) return '0.00 px';
       return `${dist.toFixed(2)} px`;
     } else if (type === 'angle' && points.length === 3) {
       const v1 = { x: points[0].x - points[1].x, y: points[0].y - points[1].y };
@@ -1025,6 +1088,7 @@ export function Viewport({
       const dot = v1.x * v2.x + v1.y * v2.y;
       const mag1 = Math.sqrt(v1.x * v1.x + v1.y * v1.y);
       const mag2 = Math.sqrt(v2.x * v2.x + v2.y * v2.y);
+      if (mag1 === 0 || mag2 === 0) return '0.0°';
       const angle = Math.acos(dot / (mag1 * mag2)) * (180 / Math.PI);
       return `${angle.toFixed(1)}°`;
     } else if (type === 'ellipse' && points.length === 2) {
@@ -1051,6 +1115,45 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
+    if (activeTool === 'none') {
+      for (const m of measurementsRef.current) {
+        if (m.slice !== currentSlice) continue;
+        if (m.points.length === 0) continue;
+        for (let i = 0; i < m.points.length; i++) {
+          const p = m.points[i];
+          const dist = Math.sqrt((x - p.x) ** 2 + (y - p.y) ** 2);
+          if (dist < 10) {
+            draggingPointRef.current = { measurementId: m.id, pointIndex: i };
+            setDraggingPoint({ measurementId: m.id, pointIndex: i });
+            setIsDrawing(false);
+            setDrawingPoints([]);
+            return;
+          }
+        }
+      }
+
+      for (const m of measurementsRef.current) {
+        if (m.slice !== currentSlice) continue;
+        if ((m.type !== 'distance' && m.type !== 'line') || m.points.length < 2) continue;
+
+        const p0 = m.points[0];
+        const p1 = m.points[1];
+        const dx = p1.x - p0.x;
+        const dy = p1.y - p0.y;
+        const lenSq = dx * dx + dy * dy;
+        if (lenSq === 0) continue;
+
+        const t = Math.max(0, Math.min(1, ((x - p0.x) * dx + (y - p0.y) * dy) / lenSq));
+        const closestX = p0.x + t * dx;
+        const closestY = p0.y + t * dy;
+        const dist = Math.sqrt((x - closestX) ** 2 + (y - closestY) ** 2);
+        if (dist < 10) {
+          setSelectedLineId(m.id);
+          return;
+        }
+      }
+    }
+
     if (isAxial && isRotateMode) {
       startRotateDrag(e.clientX, e.clientY);
     } else if (activeTool === 'pan') {
@@ -1065,9 +1168,8 @@ export function Viewport({
         slice: currentSlice,
         plane: measurementPlane,
       });
-    } else {
-      setIsDrawing(true);
-      setDrawingPoints([{ x, y }]);
+    } else if (activeTool === 'perpendicular') {
+      // This is now purely handled in handleClick! No dragging to draw.
     }
   };
 
@@ -1120,6 +1222,61 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
+    if (draggingPointRef.current) {
+      const targetMeasurement = measurementsRef.current.find((m) => m.id === draggingPointRef.current!.measurementId);
+      if (targetMeasurement && targetMeasurement.type === 'perpendicular' && targetMeasurement.points.length >= 2) {
+        const baseLine = measurementsRef.current.find((m) => m.id === targetMeasurement.baseLineId);
+        if (baseLine && baseLine.points.length >= 2) {
+          const p0 = baseLine.points[0];
+          const p1 = baseLine.points[1];
+          const dx = p1.x - p0.x;
+          const dy = p1.y - p0.y;
+          const len = Math.hypot(dx, dy);
+          const perpX = len > 0 ? -dy / len : 0;
+          const perpY = len > 0 ? dx / len : 0;
+
+          if (draggingPointRef.current.pointIndex === 0) {
+            // Drag anchor along the base line
+            const t = len > 0 ? Math.max(0, Math.min(1, ((x - p0.x) * dx + (y - p0.y) * dy) / (len * len))) : 0;
+            const anchorX = p0.x + t * dx;
+            const anchorY = p0.y + t * dy;
+
+            const stubDx = targetMeasurement.points[1].x - targetMeasurement.points[0].x;
+            const stubDy = targetMeasurement.points[1].y - targetMeasurement.points[0].y;
+            const stubLen = Math.hypot(stubDx, stubDy);
+            const sign = stubDx * perpX + stubDy * perpY >= 0 ? 1 : -1;
+
+            onMeasurementUpdate?.(targetMeasurement.id, [
+              { x: anchorX, y: anchorY },
+              { x: anchorX + perpX * stubLen * sign, y: anchorY + perpY * stubLen * sign },
+            ]);
+          } else {
+            // Drag tip along perpendicular axis from anchor
+            const anchorX = targetMeasurement.points[0].x;
+            const anchorY = targetMeasurement.points[0].y;
+            const t = (x - anchorX) * perpX + (y - anchorY) * perpY;
+            onMeasurementUpdate?.(targetMeasurement.id, [
+              { x: anchorX, y: anchorY },
+              { x: anchorX + perpX * t, y: anchorY + perpY * t },
+            ]);
+          }
+          return;
+        }
+      }
+
+      const updatedMeasurements = measurementsRef.current.map((m) => {
+        if (m.id !== draggingPointRef.current!.measurementId) return m;
+        const newPoints = [...m.points];
+        newPoints[draggingPointRef.current!.pointIndex] = { x, y };
+        return { ...m, points: newPoints };
+      });
+      const updated = updatedMeasurements.find((m) => m.id === draggingPointRef.current!.measurementId);
+      if (updated) {
+        onMeasurementUpdate?.(updated.id, updated.points);
+      }
+      return;
+    }
+
     if (isAxial && isRotateMode && rotateDragRef.current.dragging) {
       moveRotateDrag(e.clientX, e.clientY);
     } else if (activeTool === 'pan' && isPanning && panStartRef.current) {
@@ -1146,13 +1303,16 @@ export function Viewport({
       panSrcRef.current = { x: newX, y: newY };
       setPanSrc({ x: newX, y: newY });
     } else if (isDrawing) {
-      if (activeTool === 'freehand') {
-        setDrawingPoints(prev => [...prev, { x, y }]);
-      } else if (
-        activeTool === 'ellipse' ||
-        ((activeTool === 'distance' || activeTool === 'line') && drawingPoints.length === 1)
-      ) {
-        setDrawingPoints([drawingPoints[0], { x, y }]);
+      if (activeTool === 'distance' || activeTool === 'line') {
+        if (drawingPoints.length > 0) {
+          setDrawingPoints([drawingPoints[0], { x, y }]);
+        }
+      } else if (activeTool === 'angle') {
+        const pts = [...drawingPoints];
+        if (pts.length > 0) {
+          pts[pts.length - 1] = { x, y };
+          setDrawingPoints(pts);
+        }
       }
     }
   };
@@ -1164,52 +1324,69 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
+    if (draggingPointRef.current) {
+      draggingPointRef.current = null;
+      setDraggingPoint(null);
+      return;
+    }
+
     if (isAxial && isRotateMode && rotateDragRef.current.dragging) {
       stopRotateDrag();
     }
     if (activeTool === 'pan' && isPanning) {
       setIsPanning(false);
       panStartRef.current = null;
-    } else if (isDrawing) {
-      if (activeTool === 'distance' || activeTool === 'line') {
-        if (drawingPoints.length === 1) {
-          const points = [...drawingPoints, { x, y }];
-          const value = calculateMeasurementValue('distance', points);
+    }
+  };
+
+  const handleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const rect = overlayCanvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    if (activeTool === 'none' && selectedLineId) {
+      const baseLine = measurements.find(m => m.id === selectedLineId);
+      if (baseLine && baseLine.points.length >= 2) {
+        const p0 = baseLine.points[0];
+        const p1 = baseLine.points[1];
+        const midX = (p0.x + p1.x) / 2;
+        const midY = (p0.y + p1.y) / 2;
+        if (x >= midX - 12 && x <= midX + 12 && y >= midY - 12 && y <= midY + 12) {
+          const dx = p1.x - p0.x;
+          const dy = p1.y - p0.y;
+          const len = Math.hypot(dx, dy);
+          const perpX = len > 0 ? -dy / len : 0;
+          const perpY = len > 0 ? dx / len : 0;
+          const stubLen = 40;
           onMeasurementAdd({
             id: Date.now().toString(),
-            type: activeTool,
-            points,
+            type: 'perpendicular',
+            points: [
+              { x: midX, y: midY },
+              { x: midX + perpX * stubLen, y: midY + perpY * stubLen },
+            ],
             slice: currentSlice,
             plane: measurementPlane,
-            value,
+            baseLineId: selectedLineId,
           });
-          setIsDrawing(false);
-          setDrawingPoints([]);
+          setSelectedLineId(null);
+          return;
         }
-      } else if (activeTool === 'angle') {
-        if (drawingPoints.length < 3) {
-          setDrawingPoints(prev => [...prev, { x, y }]);
-        }
-        if (drawingPoints.length === 2) {
-          const points = [...drawingPoints, { x, y }];
-          const value = calculateMeasurementValue('angle', points);
-          onMeasurementAdd({
-            id: Date.now().toString(),
-            type: 'angle',
-            points,
-            slice: currentSlice,
-            plane: measurementPlane,
-            value,
-          });
-          setIsDrawing(false);
-          setDrawingPoints([]);
-        }
-      } else if (activeTool === 'ellipse') {
-        const points = [drawingPoints[0], { x, y }];
-        const value = calculateMeasurementValue('ellipse', points);
+      }
+    }
+
+    if (activeTool === 'distance' || activeTool === 'line') {
+      if (!isDrawing) {
+        setIsDrawing(true);
+        setDrawingPoints([{ x, y }]);
+      } else {
+        const points = [...drawingPoints, { x, y }];
+        const value = calculateMeasurementValue('distance', points);
         onMeasurementAdd({
           id: Date.now().toString(),
-          type: 'ellipse',
+          type: activeTool,
           points,
           slice: currentSlice,
           plane: measurementPlane,
@@ -1217,31 +1394,28 @@ export function Viewport({
         });
         setIsDrawing(false);
         setDrawingPoints([]);
-      } else if (activeTool === 'freehand') {
-        if (drawingPoints.length > 1) {
-          onMeasurementAdd({
-            id: Date.now().toString(),
-            type: 'freehand',
-            points: drawingPoints,
-            slice: currentSlice,
-            plane: measurementPlane,
-          });
-        }
+      }
+    } else if (activeTool === 'angle') {
+      if (!isDrawing) {
+        setIsDrawing(true);
+        setDrawingPoints([{ x, y }]);
+      } else if (drawingPoints.length === 1) {
+        setDrawingPoints(prev => [...prev, { x, y }]);
+      } else if (drawingPoints.length === 2) {
+        const points = [...drawingPoints, { x, y }];
+        const value = calculateMeasurementValue('angle', points);
+        onMeasurementAdd({
+          id: Date.now().toString(),
+          type: 'angle',
+          points,
+          slice: currentSlice,
+          plane: measurementPlane,
+          value,
+        });
         setIsDrawing(false);
         setDrawingPoints([]);
       }
-    }
-  };
-
-  const handleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (activeTool === 'closedCurve' && isDrawing) {
-      const rect = overlayCanvasRef.current?.getBoundingClientRect();
-      if (!rect) return;
-
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
-
-      // Check if clicking near first point to close
+    } else if (activeTool === 'closedCurve' && isDrawing) {
       const firstPoint = drawingPoints[0];
       const dist = Math.sqrt((x - firstPoint.x) ** 2 + (y - firstPoint.y) ** 2);
       

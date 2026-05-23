@@ -18,8 +18,8 @@ import {
   getProtocol,
   Primitive,
 } from './measurement/MeasurementProtocols';
-import type { SessionAnnotator, SessionAnnotationRow } from '@/app/lib/sessionAnnotationCsv';
-import { splitValueUnits } from '@/app/lib/sessionAnnotationCsv';
+import type { SessionAnnotator, SessionAnnotationRow } from '../lib/sessionAnnotationCsv';
+import { splitValueUnits } from '../lib/sessionAnnotationCsv';
 
 const STUDY_PLANE_ORDER: Plane[] = ['axial', 'sagittal', 'coronal'];
 
@@ -67,6 +67,7 @@ export type MeasurementTool =
   | 'none'
   | 'distance'
   | 'angle'
+  | 'perpendicular'
   | 'ellipse'
   | 'closedCurve'
   | 'freehand'
@@ -92,6 +93,9 @@ export interface Measurement {
   value?: string;
   /** ISO-8601 when captured; set automatically on add for persisted patients. */
   timestamp?: string;
+  baseLineId?: string;
+  groupId?: string;
+  label?: string;
 }
 
 interface MedicalImageViewerExtras {
@@ -131,7 +135,7 @@ function measurementMatchesPrimitive(measurement: Measurement, primitive: Primit
   if (primitive === 'line') return measurement.type === 'line' || measurement.type === 'distance';
   if (primitive === 'distance') return measurement.type === 'distance' || measurement.type === 'line';
   if (primitive === 'angle') return measurement.type === 'angle';
-  if (primitive === 'point') return measurement.type === 'point';
+  if (primitive === 'point') return measurement.type === 'point' || measurement.type === 'perpendicular';
   return false;
 }
 
@@ -214,6 +218,20 @@ export function MedicalImageViewer({
   const effectiveTool: MeasurementTool = activeStep
     ? primitiveToTool(activeStep.primitive)
     : activeTool;
+
+  const [currentGroupId, setCurrentGroupId] = useState<string | null>(null);
+  const currentGroupIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (workflow.protocolId) {
+      const id = `${workflow.protocolId}-${Date.now()}`;
+      setCurrentGroupId(id);
+      currentGroupIdRef.current = id;
+    } else {
+      setCurrentGroupId(null);
+      currentGroupIdRef.current = null;
+    }
+  }, [workflow.protocolId]);
 
   useEffect(() => {
     if (!niftiData) return;
@@ -395,8 +413,9 @@ export function MedicalImageViewer({
   /** Same state transition as clicking “x” on a viewer (single close path). */
   const closeStudyPlaneViewport = useCallback(
     (plane: Plane) => {
-      if (!studyData?.volumes[plane]) return;
-      setStudyViewport((s) => stateAfterClosingViewer(s, plane, studyData.volumes));
+      const studyVolumes = studyData?.volumes;
+      if (!studyVolumes?.[plane]) return;
+      setStudyViewport((s) => stateAfterClosingViewer(s, plane, studyVolumes));
     },
     [studyData],
   );
@@ -404,17 +423,18 @@ export function MedicalImageViewer({
   /** Sidebar plane buttons: true toggle open/closed. */
   const toggleStudyPlaneViewport = useCallback(
     (plane: Plane) => {
-      if (!studyData?.volumes[plane]) {
+      const studyVolumes = studyData?.volumes;
+      if (!studyVolumes?.[plane]) {
         alert(
           `This study does not contain a ${plane} series. Available: ${Object.keys(
-            studyData.volumes,
+            studyVolumes || {},
           ).join(', ') || 'none'}.`,
         );
         return;
       }
       setStudyViewport((s) => {
         if (s.open.includes(plane)) {
-          return stateAfterClosingViewer(s, plane, studyData.volumes);
+          return stateAfterClosingViewer(s, plane, studyVolumes);
         }
         return { open: [...s.open, plane], active: plane };
       });
@@ -491,9 +511,56 @@ export function MedicalImageViewer({
 
   const handleMeasurementAdd = useCallback(
     (measurement: Measurement) => {
+      if (currentGroupIdRef.current && protocol) {
+        const groupMeasurements = measurements.filter((m) => m.groupId === currentGroupIdRef.current);
+        const distanceCount = groupMeasurements.filter((m) => m.type === 'distance' || m.type === 'line').length;
+        const perpCount = groupMeasurements.filter((m) => m.type === 'perpendicular').length;
+
+        if ((measurement.type === 'distance' || measurement.type === 'line') && distanceCount >= 1) return;
+        if (measurement.type === 'perpendicular' && perpCount >= 2) return;
+      }
+
       const stamped: Measurement = {
         ...measurement,
         timestamp: measurement.timestamp || new Date().toISOString(),
+      };
+      let label = stamped.label;
+      if (!label) {
+        if (stamped.type === 'perpendicular') {
+          const perpCount = measurements.filter(
+            (m) => m.type === 'perpendicular' && m.groupId === currentGroupIdRef.current,
+          ).length;
+          if (protocol && perpCount < protocol.steps.length - 1) {
+            label = protocol.steps[perpCount + 1]?.label || `Perp ${perpCount + 1}`;
+          } else {
+            label = `Perp ${perpCount + 1}`;
+          }
+        } else if (protocol && currentGroupIdRef.current) {
+          const lineCount = measurements.filter(
+            (m) => (m.type === 'distance' || m.type === 'line') && m.groupId === currentGroupIdRef.current,
+          ).length;
+          label = protocol.steps[lineCount]?.label || activeStep?.label;
+        } else if (activeStep) {
+          label = activeStep.label;
+        } else {
+          const baseLabel =
+            stamped.type === 'line'
+              ? 'Line'
+              : stamped.type === 'distance'
+                ? 'Distance'
+                : stamped.type === 'angle'
+                  ? 'Angle'
+                  : stamped.type.charAt(0).toUpperCase() + stamped.type.slice(1);
+          const sameTypeCount = measurements.filter(
+            (m) => m.type === stamped.type && m.groupId === currentGroupIdRef.current,
+          ).length;
+          label = `${baseLabel} ${sameTypeCount + 1}`;
+        }
+      }
+      const groupedMeasurement = {
+        ...stamped,
+        groupId: currentGroupIdRef.current ?? undefined,
+        label,
       };
       if (
         sessionMeasurementMode &&
@@ -502,24 +569,27 @@ export function MedicalImageViewer({
         studyData &&
         patientStorageKey
       ) {
-        onCommitSessionAnnotation(
-          buildSessionAnnotationRow(stamped, studyData, patientStorageKey, sessionAnnotator),
-        );
+        onCommitSessionAnnotation(buildSessionAnnotationRow(groupedMeasurement, studyData, patientStorageKey, sessionAnnotator));
       } else if (archiveMeasurementMode && onPatientMeasurementsUpdate) {
-        onPatientMeasurementsUpdate((prev) => [...prev, stamped]);
+        onPatientMeasurementsUpdate((prev) => [...prev, groupedMeasurement]);
       } else if (!sessionMeasurementMode) {
-        setLocalMeasurements((prev) => [...prev, stamped]);
+        setLocalMeasurements((prev) => [...prev, groupedMeasurement]);
       }
 
       // If a workflow step is active and the drawn primitive matches what the
       // step expects, fold it into workflow state so the checklist advances and
       // the final clinical value can be computed.
-      if (protocol && activeStep && measurementMatchesPrimitive(stamped, activeStep.primitive)) {
+      if (protocol && activeStep && measurementMatchesPrimitive(groupedMeasurement, activeStep.primitive)) {
+        const recordedPoints =
+          activeStep.primitive === 'point' && groupedMeasurement.type === 'perpendicular' && groupedMeasurement.points.length >= 2
+            ? [groupedMeasurement.points[1]]
+            : groupedMeasurement.points;
+
         setWorkflow(prev =>
           recordStepResult(prev, protocol, {
             primitive: activeStep.primitive,
-            points: stamped.points,
-            slice: stamped.slice,
+            points: recordedPoints,
+            slice: groupedMeasurement.slice,
           }),
         );
       }
@@ -534,17 +604,101 @@ export function MedicalImageViewer({
       studyData,
       patientStorageKey,
       onPatientMeasurementsUpdate,
+      measurements,
+      currentGroupId,
     ],
+  );
+
+  const handleMeasurementUpdate = useCallback(
+    (id: string, newPoints: { x: number; y: number }[]) => {
+      const lengthValue = newPoints.length >= 2
+        ? `${Math.hypot(newPoints[1].x - newPoints[0].x, newPoints[1].y - newPoints[0].y).toFixed(2)} px`
+        : undefined;
+
+      const updater = (prev: Measurement[]) => {
+        const updated = prev.map((m) => {
+          if (m.id !== id) return m;
+          return {
+            ...m,
+            points: newPoints,
+            value:
+              (m.type === 'distance' || m.type === 'line' || m.type === 'perpendicular')
+                ? lengthValue ?? m.value
+                : m.value,
+          };
+        });
+
+        const baseLine = updated.find((m) => m.id === id);
+        if (!baseLine || (baseLine.type !== 'distance' && baseLine.type !== 'line')) {
+          return updated;
+        }
+
+        if (baseLine.points.length < 2) {
+          return updated;
+        }
+
+        const p0 = baseLine.points[0];
+        const p1 = baseLine.points[1];
+        const dx = p1.x - p0.x;
+        const dy = p1.y - p0.y;
+        const len = Math.hypot(dx, dy);
+        if (len === 0) {
+          return updated;
+        }
+
+        const lineX = dx / len;
+        const lineY = dy / len;
+        const perpX = -dy / len;
+        const perpY = dx / len;
+
+        return updated.map((m) => {
+          if (m.type !== 'perpendicular' || m.baseLineId !== id || m.points.length < 2) {
+            return m;
+          }
+
+          const oldAnchor = m.points[0];
+          const t = Math.max(
+            0,
+            Math.min(1, ((oldAnchor.x - p0.x) * lineX + (oldAnchor.y - p0.y) * lineY) / len)
+          );
+          const newAnchorX = p0.x + lineX * t * len;
+          const newAnchorY = p0.y + lineY * t * len;
+
+          const stubDx = m.points[1].x - m.points[0].x;
+          const stubDy = m.points[1].y - m.points[0].y;
+          const stubLen = Math.hypot(stubDx, stubDy) || 1;
+          const sign = stubDx * perpX + stubDy * perpY >= 0 ? 1 : -1;
+
+          return {
+            ...m,
+            points: [
+              { x: newAnchorX, y: newAnchorY },
+              { x: newAnchorX + perpX * stubLen * sign, y: newAnchorY + perpY * stubLen * sign },
+            ],
+          };
+        });
+      };
+
+      if (sessionMeasurementMode) return;
+      if (archiveMeasurementMode && onPatientMeasurementsUpdate) {
+        onPatientMeasurementsUpdate(updater);
+      } else {
+        setLocalMeasurements(updater);
+      }
+    },
+    [sessionMeasurementMode, archiveMeasurementMode, onPatientMeasurementsUpdate],
   );
 
   const handleMeasurementDelete = useCallback(
     (id: string) => {
+      const updater = (prev: Measurement[]) => prev.filter((m) => m.id !== id && m.baseLineId !== id);
+
       if (sessionMeasurementMode && onDeleteSessionAnnotation) {
         onDeleteSessionAnnotation(id);
       } else if (archiveMeasurementMode && onPatientMeasurementsUpdate) {
-        onPatientMeasurementsUpdate((prev) => prev.filter((m) => m.id !== id));
+        onPatientMeasurementsUpdate(updater);
       } else {
-        setLocalMeasurements((prev) => prev.filter((m) => m.id !== id));
+        setLocalMeasurements(updater);
       }
     },
     [
@@ -623,6 +777,7 @@ export function MedicalImageViewer({
             activeTool={effectiveTool}
             measurements={measurements}
             onMeasurementAdd={handleMeasurementAdd}
+            onMeasurementUpdate={handleMeasurementUpdate}
             applyWeighting={applyWeighting}
             showCrosshair={showCrosshair}
             sequenceWindows={sequenceWindows}

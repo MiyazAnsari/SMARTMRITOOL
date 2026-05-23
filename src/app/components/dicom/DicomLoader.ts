@@ -358,7 +358,8 @@ export function readLateralityFromDicomBuffer(buffer: ArrayBuffer): Laterality |
 }
 
 /** Heuristic: only DICOM-looking files (no obvious extensions like .json/.txt). */
-export function isProbablyDicom(name: string): boolean {
+export function isProbablyDicom(name: string | undefined | null): boolean {
+  if (!name || typeof name !== 'string') return false;
   const lower = name.toLowerCase();
   if (lower.endsWith('.dcm') || lower.endsWith('.ima')) return true;
   // Many DICOM exports have no extension at all (just numeric names like 0001)
