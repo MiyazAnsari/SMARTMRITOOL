@@ -6,7 +6,7 @@ import { Button } from './ui/button';
 import { RadioGroup, RadioGroupItem } from './ui/radio-group';
 import { Slider } from './ui/slider';
 import { Label } from './ui/label';
-import { MousePointer, Circle as CircleIcon, Pencil, Move } from 'lucide-react';
+import { MousePointer, Circle as CircleIcon, Pencil, Move, Ruler, Triangle, Dot, CornerDownLeft } from 'lucide-react';
 import type { DicomStudyView } from './dicom/patientStudy';
 import type { DicomVolume, Plane } from './dicom/DicomLoader';
 import {
@@ -61,6 +61,8 @@ function stateAfterClosingViewer(
 
 export interface MedicalImageViewerProps {
   niftiData?: ArrayBuffer | null;
+  /** When set to a measurement id, force the viewer to jump to that measurement's slice on select. */
+  forceJumpOnSelectId?: string | null;
 }
 
 export type MeasurementTool =
@@ -75,6 +77,7 @@ export type MeasurementTool =
   | 'line'
   | 'point';
 export type WeightingType = 'T1' | 'T2' | 'PD' | 'CT' | 'Custom';
+export type MeasurementDisplayUnits = 'mm' | 'px';
 
 export interface WindowLevel {
   window: number;
@@ -96,6 +99,9 @@ export interface Measurement {
   baseLineId?: string;
   groupId?: string;
   label?: string;
+  workflowStepId?: string;
+  /** When true the measurement is shown on parallel slices and selection shouldn't force a slice jump. */
+  propagateAcrossSlices?: boolean;
 }
 
 interface MedicalImageViewerExtras {
@@ -123,7 +129,7 @@ function primitiveToTool(p: Primitive): MeasurementTool {
     case 'angle':
       return 'angle';
     case 'point':
-      return 'point';
+      return 'none';
     case 'distance':
     default:
       return 'distance';
@@ -152,14 +158,22 @@ function buildSessionAnnotationRow(
   return {
     sourcePatientKey,
     laterality: studyData.laterality,
-    annotationId: crypto.randomUUID(),
+    // Use the measurement id as the session annotation id so the sidebar
+    // `Select` button can directly select the corresponding measurement in
+    // the viewport (keeps ids aligned between UI and viewport state).
+    annotationId: m.id,
     patientId: studyData.patientId || 'unknown',
     sequenceName,
     plane: m.plane,
     measurementType: m.type,
+    baseLineId: m.baseLineId,
+    groupId: m.groupId,
+    label: m.label,
+    workflowStepId: m.workflowStepId,
     value,
     units,
     sliceIndex: m.slice,
+    propagateAcrossSlices: m.propagateAcrossSlices ?? true,
     annotatedBy: annotator.name,
     annotatorEmail: annotator.email,
     timestamp: ts,
@@ -178,6 +192,10 @@ export function MedicalImageViewer({
   sessionAnnotator = null,
   onCommitSessionAnnotation,
   onDeleteSessionAnnotation,
+  onUpdateSessionAnnotation,
+  selectedMeasurementId = null,
+  onMeasurementSelect,
+  forceJumpOnSelectId = null,
 }: MedicalImageViewerProps & MedicalImageViewerExtras) {
   const [imageData, setImageData] = useState<Uint8Array | null>(null);
   const [header, setHeader] = useState<any>(null);
@@ -186,6 +204,7 @@ export function MedicalImageViewer({
   /** Middle slice at last sequence load (`Math.floor(totalSlices/2)`), per plane; independent A/S/C. */
   const initialSliceIndex = useRef({ axial: 0, sagittal: 0, coronal: 0 });
   const [activeTool, setActiveTool] = useState<MeasurementTool>('pan');
+  const [userToolOverride, setUserToolOverride] = useState<MeasurementTool | null>(null);
   const [localMeasurements, setLocalMeasurements] = useState<Measurement[]>([]);
   const sessionMeasurementMode =
     Boolean(patientStorageKey) &&
@@ -198,6 +217,7 @@ export function MedicalImageViewer({
   const measurementsControlled = sessionMeasurementMode || archiveMeasurementMode;
   const measurements = measurementsControlled ? (patientMeasurements ?? []) : localMeasurements;
   const [weighting, setWeighting] = useState<WeightingType>('T1');
+  const [measurementUnits, setMeasurementUnits] = useState<MeasurementDisplayUnits>('mm');
   // single psi slider for custom weighting (0-180 degrees)
   const [customWeighting, setCustomWeighting] = useState({ psi: 90 });
   // UI helpers
@@ -210,14 +230,13 @@ export function MedicalImageViewer({
   /** DICOM: open floating viewers + focused series (single source of truth with `open`). */
   const [studyViewport, setStudyViewport] = useState<StudyViewportState>({ open: [], active: 'axial' });
   const prevStudyDataRef = useRef<DicomStudyView | null>(null);
+  const previousMeasurementsRef = useRef<Measurement[]>([]);
 
   const protocol = useMemo(() => getProtocol(workflow.protocolId), [workflow.protocolId]);
   const activeStep = protocol?.steps[workflow.activeStepIndex] ?? null;
   // When a workflow step is active, override the user-selected tool so the
-  // correct primitive is always armed.
-  const effectiveTool: MeasurementTool = activeStep
-    ? primitiveToTool(activeStep.primitive)
-    : activeTool;
+  // correct primitive is always armed unless the user manually picks another tool.
+  const effectiveTool: MeasurementTool = userToolOverride ?? (activeStep ? primitiveToTool(activeStep.primitive) : activeTool);
 
   const [currentGroupId, setCurrentGroupId] = useState<string | null>(null);
   const currentGroupIdRef = useRef<string | null>(null);
@@ -232,6 +251,118 @@ export function MedicalImageViewer({
       currentGroupIdRef.current = null;
     }
   }, [workflow.protocolId]);
+
+  useEffect(() => {
+    if (workflow.protocolId) setUserToolOverride(null);
+  }, [workflow.protocolId]);
+
+  useEffect(() => {
+    const previous = previousMeasurementsRef.current;
+    previousMeasurementsRef.current = measurements;
+    if (!protocol) return;
+
+    const currentIds = new Set(measurements.map((m) => m.id));
+    const removed = previous.filter((m) => !currentIds.has(m.id));
+    if (removed.length === 0) return;
+
+    const removedStepIds = new Set<string>();
+    for (const measurement of removed) {
+      const stepId =
+        measurement.workflowStepId ||
+        protocol.steps.find((step) => step.label === measurement.label && measurementMatchesPrimitive(measurement, step.primitive))?.id;
+      if (stepId) removedStepIds.add(stepId);
+    }
+
+    if (removedStepIds.size === 0) return;
+
+    setWorkflow((prev) => {
+      let changed = false;
+      const stepResults = { ...prev.stepResults };
+      let nextActiveIndex = prev.activeStepIndex;
+      for (const stepId of removedStepIds) {
+        if (stepResults[stepId]) {
+          delete stepResults[stepId];
+          const stepIndex = protocol.steps.findIndex((step) => step.id === stepId);
+          if (stepIndex >= 0) nextActiveIndex = stepIndex;
+          changed = true;
+        }
+      }
+      return changed ? { ...prev, stepResults, activeStepIndex: nextActiveIndex } : prev;
+    });
+  }, [measurements, protocol]);
+
+  useEffect(() => {
+    if (!protocol) return;
+
+    const existingResults: Record<string, { primitive: Primitive; points: { x: number; y: number }[]; slice: number }> = {};
+    for (const step of protocol.steps) {
+      const match = measurements.find(
+        (m) =>
+          m.workflowStepId === step.id ||
+          (m.label === step.label && measurementMatchesPrimitive(m, step.primitive)),
+      );
+      if (match) {
+        existingResults[step.id] = {
+          primitive: step.primitive,
+          points: match.points.map((p) => ({ x: p.x, y: p.y })),
+          slice: match.slice,
+        };
+      }
+    }
+
+    setWorkflow((prev) => {
+      if (prev.protocolId !== protocol.id && prev.protocolId !== null) return prev;
+      const merged = { ...prev.stepResults };
+      let changed = false;
+      for (const [stepId, result] of Object.entries(existingResults)) {
+        if (!merged[stepId]) {
+          merged[stepId] = result;
+          changed = true;
+        }
+      }
+      if (!changed) return prev;
+      const nextActiveIndex = protocol.steps.findIndex((step) => !merged[step.id]);
+      return {
+        ...prev,
+        protocolId: protocol.id,
+        stepResults: merged,
+        activeStepIndex: nextActiveIndex >= 0 ? nextActiveIndex : Math.max(0, protocol.steps.length - 1),
+      };
+    });
+  }, [measurements, protocol]);
+
+  useEffect(() => {
+    if (!selectedMeasurementId) return;
+    selectTool('none');
+  }, [selectedMeasurementId]);
+
+  useEffect(() => {
+    if (!selectedMeasurementId) return;
+    const selectedMeasurement = measurements.find((m) => m.id === selectedMeasurementId);
+    if (!selectedMeasurement) return;
+
+    // If the measurement is propagated across slices, do not force the
+    // viewer to jump back to the measurement's original slice. This allows
+    // users to add perpendiculars on other slices that reference a propagated
+    // baseline without being forced to the baseline's slice.
+    // Only suppress the slice-jump when the measurement explicitly indicates
+    // it propagates across slices. Absent the property, fall back to the
+    // original behavior (perform the jump).
+    // If the measurement is propagated across slices, do not force the
+    // viewer to jump back to the measurement's original slice — unless the
+    // parent explicitly asked to force a jump via `forceJumpOnSelectId`.
+    if (selectedMeasurement.propagateAcrossSlices === true && forceJumpOnSelectId !== selectedMeasurementId) return;
+
+    const plane = selectedMeasurement.plane ?? 'axial';
+    setCurrentSlice((prev) =>
+      prev[plane] === selectedMeasurement.slice ? prev : { ...prev, [plane]: selectedMeasurement.slice },
+    );
+  }, [measurements, selectedMeasurementId, forceJumpOnSelectId]);
+
+  const selectTool = (tool: MeasurementTool) => {
+    setActiveTool(tool);
+    setUserToolOverride(tool);
+  };
 
   useEffect(() => {
     if (!niftiData) return;
@@ -513,11 +644,13 @@ export function MedicalImageViewer({
     (measurement: Measurement) => {
       if (currentGroupIdRef.current && protocol) {
         const groupMeasurements = measurements.filter((m) => m.groupId === currentGroupIdRef.current);
+        const lineStepCount = protocol.steps.filter((step) => step.primitive === 'line' || step.primitive === 'distance').length;
+        const pointStepCount = protocol.steps.filter((step) => step.primitive === 'point').length;
         const distanceCount = groupMeasurements.filter((m) => m.type === 'distance' || m.type === 'line').length;
         const perpCount = groupMeasurements.filter((m) => m.type === 'perpendicular').length;
 
-        if ((measurement.type === 'distance' || measurement.type === 'line') && distanceCount >= 1) return;
-        if (measurement.type === 'perpendicular' && perpCount >= 2) return;
+        if ((measurement.type === 'distance' || measurement.type === 'line') && distanceCount >= lineStepCount) return;
+        if (measurement.type === 'perpendicular' && perpCount >= pointStepCount) return;
       }
 
       const stamped: Measurement = {
@@ -561,6 +694,10 @@ export function MedicalImageViewer({
         ...stamped,
         groupId: currentGroupIdRef.current ?? undefined,
         label,
+        workflowStepId:
+          protocol && activeStep && measurementMatchesPrimitive(stamped, activeStep.primitive)
+            ? activeStep.id
+            : undefined,
       };
       if (
         sessionMeasurementMode &&
@@ -610,10 +747,41 @@ export function MedicalImageViewer({
   );
 
   const handleMeasurementUpdate = useCallback(
-    (id: string, newPoints: { x: number; y: number }[]) => {
-      const lengthValue = newPoints.length >= 2
-        ? `${Math.hypot(newPoints[1].x - newPoints[0].x, newPoints[1].y - newPoints[0].y).toFixed(2)} px`
-        : undefined;
+    (id: string, newPoints: { x: number; y: number }[], newValue?: string) => {
+      const target = measurements.find((m) => m.id === id);
+      const lengthValue =
+        newValue ??
+        (newPoints.length >= 2
+          ? `${Math.hypot(newPoints[1].x - newPoints[0].x, newPoints[1].y - newPoints[0].y).toFixed(2)} px`
+          : undefined);
+
+      if (sessionMeasurementMode && onUpdateSessionAnnotation) {
+        const parsed = lengthValue ? splitValueUnits(lengthValue) : null;
+        onUpdateSessionAnnotation(id, (row) => ({
+          ...row,
+          points: newPoints.map((p) => ({ x: p.x, y: p.y })),
+          value: parsed ? parsed.value : row.value,
+          units: parsed ? parsed.units : row.units,
+          timestamp: new Date().toISOString(),
+        }));
+
+        // Keep workflow progress in sync when a session annotation is edited to
+        // satisfy the active step.
+        if (protocol && activeStep && target && measurementMatchesPrimitive(target, activeStep.primitive)) {
+          const recordedPoints =
+            activeStep.primitive === 'point' && target.type === 'perpendicular' && newPoints.length >= 2
+              ? [newPoints[1]]
+              : newPoints;
+          setWorkflow((prev) =>
+            recordStepResult(prev, protocol, {
+              primitive: activeStep.primitive,
+              points: recordedPoints,
+              slice: target.slice,
+            }),
+          );
+        }
+        return;
+      }
 
       const updater = (prev: Measurement[]) => {
         const updated = prev.map((m) => {
@@ -678,19 +846,40 @@ export function MedicalImageViewer({
           };
         });
       };
-
-      if (sessionMeasurementMode) return;
       if (archiveMeasurementMode && onPatientMeasurementsUpdate) {
         onPatientMeasurementsUpdate(updater);
       } else {
         setLocalMeasurements(updater);
       }
+
+      if (protocol && activeStep && target && measurementMatchesPrimitive(target, activeStep.primitive)) {
+        const recordedPoints =
+          activeStep.primitive === 'point' && target.type === 'perpendicular' && newPoints.length >= 2
+            ? [newPoints[1]]
+            : newPoints;
+        setWorkflow((prev) =>
+          recordStepResult(prev, protocol, {
+            primitive: activeStep.primitive,
+            points: recordedPoints,
+            slice: target.slice,
+          }),
+        );
+      }
     },
-    [sessionMeasurementMode, archiveMeasurementMode, onPatientMeasurementsUpdate],
+    [
+      measurements,
+      protocol,
+      activeStep,
+      sessionMeasurementMode,
+      onUpdateSessionAnnotation,
+      archiveMeasurementMode,
+      onPatientMeasurementsUpdate,
+    ],
   );
 
   const handleMeasurementDelete = useCallback(
     (id: string) => {
+      const target = measurements.find((m) => m.id === id);
       const updater = (prev: Measurement[]) => prev.filter((m) => m.id !== id && m.baseLineId !== id);
 
       if (sessionMeasurementMode && onDeleteSessionAnnotation) {
@@ -700,13 +889,39 @@ export function MedicalImageViewer({
       } else {
         setLocalMeasurements(updater);
       }
+
+      if (protocol && target) {
+        const stepId =
+          target.workflowStepId ||
+          protocol.steps.find((s) => s.label === target.label && measurementMatchesPrimitive(target, s.primitive))?.id;
+        if (stepId) {
+          const stepIndex = protocol.steps.findIndex((step) => step.id === stepId);
+          setWorkflow((prev) => {
+            const nextResults = { ...prev.stepResults };
+            delete nextResults[stepId];
+            return { ...prev, stepResults: nextResults, activeStepIndex: stepIndex >= 0 ? stepIndex : prev.activeStepIndex };
+          });
+        }
+      }
     },
     [
+      measurements,
+      protocol,
       sessionMeasurementMode,
       archiveMeasurementMode,
       onDeleteSessionAnnotation,
       onPatientMeasurementsUpdate,
     ],
+  );
+
+  const handleWorkflowStepRedo = useCallback(
+    (stepId: string) => {
+      const target = measurements.find((m) => m.workflowStepId === stepId) ??
+        (protocol ? measurements.find((m) => m.label === protocol.steps.find((s) => s.id === stepId)?.label) : undefined);
+      if (!target) return;
+      handleMeasurementDelete(target.id);
+    },
+    [handleMeasurementDelete, measurements, protocol],
   );
 
   /** Restore slice index to middle for one plane; viewport clears zoom/pan/WL/brightness/drafts via `Viewport` reset. */
@@ -778,14 +993,18 @@ export function MedicalImageViewer({
             measurements={measurements}
             onMeasurementAdd={handleMeasurementAdd}
             onMeasurementUpdate={handleMeasurementUpdate}
+            selectedMeasurementId={selectedMeasurementId}
+            onMeasurementSelect={onMeasurementSelect}
             applyWeighting={applyWeighting}
             showCrosshair={showCrosshair}
+            measurementUnits={measurementUnits}
             sequenceWindows={sequenceWindows}
             onWindowFocus={(plane) =>
               setStudyViewport((s) => (s.open.includes(plane) ? { ...s, active: plane } : s))
             }
             onHideWindow={closeStudyPlaneViewport}
             onResetViewport={handleResetViewport}
+            pixelSpacing={pixelSpacing}
           />
         ) : (
           <div className="h-full flex items-center justify-center">
@@ -823,9 +1042,9 @@ export function MedicalImageViewer({
         <div className="absolute bottom-4 right-4 flex items-center space-x-2" style={{ zIndex: 9999 }}>
           <Button
             size="sm"
-            variant={activeTool === 'none' ? 'default' : 'ghost'}
-            className={activeTool === 'none' ? 'bg-blue-600 text-white' : 'text-gray-300'}
-            onClick={() => setActiveTool('none')}
+            variant={effectiveTool === 'none' ? 'default' : 'ghost'}
+            className={effectiveTool === 'none' ? 'bg-blue-600 text-white' : 'text-gray-300'}
+            onClick={() => selectTool('none')}
             aria-label="Select tool"
           >
             <MousePointer className="h-4 w-4" />
@@ -833,9 +1052,49 @@ export function MedicalImageViewer({
 
           <Button
             size="sm"
-            variant={activeTool === 'ellipse' ? 'default' : 'ghost'}
-            className={activeTool === 'ellipse' ? 'bg-blue-600 text-white' : 'text-gray-300'}
-            onClick={() => setActiveTool('ellipse')}
+            variant={effectiveTool === 'perpendicular' ? 'default' : 'ghost'}
+            className={effectiveTool === 'perpendicular' ? 'bg-blue-600 text-white' : 'text-gray-300'}
+            onClick={() => selectTool('perpendicular')}
+            aria-label="Perpendicular tool"
+          >
+            <CornerDownLeft className="h-4 w-4" />
+          </Button>
+
+          <Button
+            size="sm"
+            variant={effectiveTool === 'distance' ? 'default' : 'ghost'}
+            className={effectiveTool === 'distance' ? 'bg-blue-600 text-white' : 'text-gray-300'}
+            onClick={() => selectTool('distance')}
+            aria-label="Distance tool"
+          >
+            <Ruler className="h-4 w-4" />
+          </Button>
+
+          <Button
+            size="sm"
+            variant={effectiveTool === 'angle' ? 'default' : 'ghost'}
+            className={effectiveTool === 'angle' ? 'bg-blue-600 text-white' : 'text-gray-300'}
+            onClick={() => selectTool('angle')}
+            aria-label="Angle tool"
+          >
+            <Triangle className="h-4 w-4" />
+          </Button>
+
+          <Button
+            size="sm"
+            variant={effectiveTool === 'point' ? 'default' : 'ghost'}
+            className={effectiveTool === 'point' ? 'bg-blue-600 text-white' : 'text-gray-300'}
+            onClick={() => selectTool('point')}
+            aria-label="Point tool"
+          >
+            <Dot className="h-4 w-4" />
+          </Button>
+
+          <Button
+            size="sm"
+            variant={effectiveTool === 'ellipse' ? 'default' : 'ghost'}
+            className={effectiveTool === 'ellipse' ? 'bg-blue-600 text-white' : 'text-gray-300'}
+            onClick={() => selectTool('ellipse')}
             aria-label="Ellipse tool"
           >
             <CircleIcon className="h-4 w-4" />
@@ -843,9 +1102,9 @@ export function MedicalImageViewer({
 
           <Button
             size="sm"
-            variant={activeTool === 'freehand' ? 'default' : 'ghost'}
-            className={activeTool === 'freehand' ? 'bg-blue-600 text-white' : 'text-gray-300'}
-            onClick={() => setActiveTool('freehand')}
+            variant={effectiveTool === 'freehand' ? 'default' : 'ghost'}
+            className={effectiveTool === 'freehand' ? 'bg-blue-600 text-white' : 'text-gray-300'}
+            onClick={() => selectTool('freehand')}
             aria-label="Freehand tool"
           >
             <Pencil className="h-4 w-4" />
@@ -853,9 +1112,9 @@ export function MedicalImageViewer({
 
           <Button
             size="sm"
-            variant={activeTool === 'pan' ? 'default' : 'ghost'}
-            className={activeTool === 'pan' ? 'bg-blue-600 text-white' : 'text-gray-300'}
-            onClick={() => setActiveTool(v => v === 'pan' ? 'none' : 'pan')}
+            variant={effectiveTool === 'pan' ? 'default' : 'ghost'}
+            className={effectiveTool === 'pan' ? 'bg-blue-600 text-white' : 'text-gray-300'}
+            onClick={() => selectTool(effectiveTool === 'pan' ? 'none' : 'pan')}
             aria-label="Pan tool"
           >
             <Move className="h-4 w-4" />
@@ -891,7 +1150,13 @@ export function MedicalImageViewer({
           onStudyPlaneToggle={toggleStudyPlaneViewport}
           workflow={workflow}
           onWorkflowChange={setWorkflow}
+          measurements={measurements}
+          selectedMeasurementId={selectedMeasurementId}
+          onMeasurementSelect={onMeasurementSelect}
+          onStepRedo={handleWorkflowStepRedo}
           pixelSpacing={pixelSpacing}
+          measurementUnits={measurementUnits}
+          onMeasurementUnitsChange={setMeasurementUnits}
           onPlaneRequest={handlePlaneRequest}
         />
       </div>

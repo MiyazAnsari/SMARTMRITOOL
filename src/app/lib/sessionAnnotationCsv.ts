@@ -7,6 +7,11 @@ export type SessionMeasurementView = {
   plane: 'axial' | 'sagittal' | 'coronal';
   value?: string;
   timestamp?: string;
+  baseLineId?: string;
+  groupId?: string;
+  label?: string;
+  workflowStepId?: string;
+  propagateAcrossSlices?: boolean;
 };
 
 /** In-memory row: CSV-exportable fields plus geometry for viewport overlays (not CSV columns). */
@@ -26,9 +31,15 @@ export interface SessionAnnotationRow {
   sequenceName: string;
   plane: 'axial' | 'sagittal' | 'coronal';
   measurementType: string;
+  baseLineId?: string;
+  groupId?: string;
+  label?: string;
+  workflowStepId?: string;
   value: string;
   units: string;
   sliceIndex: number;
+  /** Whether the annotation should be shown across slices in the same plane. Default true. */
+  propagateAcrossSlices?: boolean;
   annotatedBy: string;
   annotatorEmail: string;
   timestamp: string;
@@ -79,26 +90,99 @@ export function sessionRowToMeasurement(row: SessionAnnotationRow): SessionMeasu
     plane: row.plane,
     value: joinValueUnits(row.value, row.units),
     timestamp: row.timestamp,
+    baseLineId: row.baseLineId,
+    groupId: row.groupId,
+    label: row.label,
+    workflowStepId: row.workflowStepId,
+    propagateAcrossSlices: row.propagateAcrossSlices ?? true,
   };
 }
 
 export function exportSessionAnnotationsToCsv(rows: SessionAnnotationRow[]): string {
-  const header = CSV_COLUMNS.join(',');
-  const lines = rows.map((r) =>
-    [
-      escapeCsvField(r.annotationId),
-      escapeCsvField(r.patientId),
-      escapeCsvField(r.sequenceName),
-      escapeCsvField(r.plane),
-      escapeCsvField(r.measurementType),
-      escapeCsvField(r.value),
-      escapeCsvField(r.units),
+  // Extended CSV suitable for ML: include flattened point columns and
+  // baseline endpoints when present. We'll export up to 4 points per
+  // measurement (p0..p3) and baseline endpoints (baseline_p0..p1). Also
+  // include JSON columns for full points arrays.
+  const EXTRA_COLUMNS = [
+    'label',
+    'workflowStepId',
+    'groupId',
+    'propagateAcrossSlices',
+    'points_count',
+    'p0_x',
+    'p0_y',
+    'p1_x',
+    'p1_y',
+    'p2_x',
+    'p2_y',
+    'p3_x',
+    'p3_y',
+    'baseline_p0_x',
+    'baseline_p0_y',
+    'baseline_p1_x',
+    'baseline_p1_y',
+    'points_json',
+    'baseline_points_json',
+  ];
+
+  const header = [...CSV_COLUMNS, ...EXTRA_COLUMNS].join(',');
+
+  // Build index map for quick baseline lookup
+  const byId = new Map<string, SessionAnnotationRow>();
+  for (const r of rows) byId.set(r.annotationId, r);
+
+  const maxPoints = 4;
+
+  const lines = rows.map((r) => {
+    const baseline = r.baseLineId ? byId.get(r.baseLineId) : undefined;
+    const points = Array.isArray(r.points) ? r.points.slice(0, maxPoints) : [];
+    const baselinePoints = baseline && Array.isArray(baseline.points) ? baseline.points.slice(0, 2) : [];
+
+    const flattenedPoints: (string | number)[] = [];
+    for (let i = 0; i < maxPoints; i++) {
+      const p = points[i];
+      flattenedPoints.push(p ? String(p.x) : '');
+      flattenedPoints.push(p ? String(p.y) : '');
+    }
+
+    const baselineFlatten = [
+      baselinePoints[0] ? String(baselinePoints[0].x) : '',
+      baselinePoints[0] ? String(baselinePoints[0].y) : '',
+      baselinePoints[1] ? String(baselinePoints[1].x) : '',
+      baselinePoints[1] ? String(baselinePoints[1].y) : '',
+    ];
+
+    const rowFields: (string | number)[] = [
+      r.annotationId,
+      r.patientId,
+      r.laterality,
+      r.sequenceName,
+      r.plane,
+      r.measurementType,
+      r.value,
+      r.units,
       String(r.sliceIndex),
-      escapeCsvField(r.annotatedBy),
-      escapeCsvField(r.annotatorEmail),
-      escapeCsvField(r.timestamp),
-    ].join(','),
-  );
+      r.annotatedBy,
+      r.annotatorEmail,
+      r.timestamp,
+    ];
+
+    const extraFields: (string | number)[] = [
+      r.label ?? '',
+      r.workflowStepId ?? '',
+      r.groupId ?? '',
+      String(r.propagateAcrossSlices ?? true),
+      String(r.points?.length ?? 0),
+      ...flattenedPoints,
+      ...baselineFlatten,
+      JSON.stringify(r.points ?? []),
+      JSON.stringify(baselinePoints ?? []),
+    ];
+
+    const escaped = [...rowFields, ...extraFields].map((f) => escapeCsvField(String(f ?? '')));
+    return escaped.join(',');
+  });
+
   return [header, ...lines].join('\r\n');
 }
 

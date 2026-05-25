@@ -48,16 +48,8 @@ export interface StepResult {
   slice: number;
 }
 
-const toPhysical = (
-  p: { x: number; y: number },
-  pixelSpacing: { x: number; y: number },
-) => ({ x: p.x * pixelSpacing.x, y: p.y * pixelSpacing.y });
-
-const dist = (
-  a: { x: number; y: number },
-  b: { x: number; y: number },
-  pixelSpacing: { x: number; y: number },
-) => Math.hypot((a.x - b.x) * pixelSpacing.x, (a.y - b.y) * pixelSpacing.y);
+const dist = (a: { x: number; y: number }, b: { x: number; y: number }) =>
+  Math.hypot(a.x - b.x, a.y - b.y);
 
 /**
  * Perpendicular distance, in pixels, from a point to a line defined by two
@@ -67,15 +59,11 @@ function perpDistance(
   pt: { x: number; y: number },
   p1: { x: number; y: number },
   p2: { x: number; y: number },
-  pixelSpacing: { x: number; y: number },
 ): number {
-  const a = toPhysical(pt, pixelSpacing);
-  const b1 = toPhysical(p1, pixelSpacing);
-  const b2 = toPhysical(p2, pixelSpacing);
-  const dx = b2.x - b1.x;
-  const dy = b2.y - b1.y;
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
   const len = Math.hypot(dx, dy) || 1;
-  return Math.abs(dy * a.x - dx * a.y + b2.x * b1.y - b2.y * b1.x) / len;
+  return Math.abs(dy * pt.x - dx * pt.y + p2.x * p1.y - p2.y * p1.x) / len;
 }
 
 function angleBetweenLines(
@@ -83,16 +71,11 @@ function angleBetweenLines(
   p2: { x: number; y: number },
   p3: { x: number; y: number },
   p4: { x: number; y: number },
-  pixelSpacing: { x: number; y: number },
 ): number {
-  const a1 = toPhysical(p1, pixelSpacing);
-  const a2 = toPhysical(p2, pixelSpacing);
-  const b1 = toPhysical(p3, pixelSpacing);
-  const b2 = toPhysical(p4, pixelSpacing);
-  const v1x = a2.x - a1.x;
-  const v1y = a2.y - a1.y;
-  const v2x = b2.x - b1.x;
-  const v2y = b2.y - b1.y;
+  const v1x = p2.x - p1.x;
+  const v1y = p2.y - p1.y;
+  const v2x = p4.x - p3.x;
+  const v2y = p4.y - p3.y;
   const dot = v1x * v2x + v1y * v2y;
   const m1 = Math.hypot(v1x, v1y);
   const m2 = Math.hypot(v2x, v2y);
@@ -141,21 +124,18 @@ const TT_TG: MeasurementProtocol = {
     // Project both landmarks onto the condyle line; the TT-TG distance is the
     // difference of those two projections measured *along* the condyle line.
     const [c1, c2] = cond.points;
-    const c1p = toPhysical(c1, ps);
-    const c2p = toPhysical(c2, ps);
-    const dx = c2p.x - c1p.x;
-    const dy = c2p.y - c1p.y;
+    const dx = c2.x - c1.x;
+    const dy = c2.y - c1.y;
     const len2 = dx * dx + dy * dy || 1;
 
     const projectAlong = (p: { x: number; y: number }) =>
-      (() => {
-        const pp = toPhysical(p, ps);
-        return ((pp.x - c1p.x) * dx + (pp.y - c1p.y) * dy) / len2;
-      })();
+      ((p.x - c1.x) * dx + (p.y - c1.y) * dy) / len2;
 
     const grooveT = projectAlong(groove.points[0]);
     const tubercleT = projectAlong(tubercle.points[0]);
-    const value = Math.abs(tubercleT - grooveT) * Math.hypot(dx, dy);
+    const diffPx = Math.abs(tubercleT - grooveT) * Math.hypot(dx, dy);
+    const mmPerPx = (ps.x + ps.y) / 2;
+    const value = diffPx * mmPerPx;
     return {
       value,
       unit: 'mm',
@@ -196,8 +176,9 @@ const INSALL_SALVATI: MeasurementProtocol = {
     const lp = results['patella-length'];
     const lt = results['tendon-length'];
     if (!lp || lp.points.length < 2 || !lt || lt.points.length < 2) return null;
-    const lpMm = dist(lp.points[0], lp.points[1], ps);
-    const ltMm = dist(lt.points[0], lt.points[1], ps);
+    const mmPerPx = (ps.x + ps.y) / 2;
+    const lpMm = dist(lp.points[0], lp.points[1]) * mmPerPx;
+    const ltMm = dist(lt.points[0], lt.points[1]) * mmPerPx;
     if (lpMm === 0) return null;
     const ratio = ltMm / lpMm;
     return {
@@ -238,7 +219,7 @@ const PATELLAR_TILT: MeasurementProtocol = {
       primitive: 'line',
     },
   ],
-  compute: (results, ps) => {
+  compute: (results) => {
     const cond = results['condyle-line'];
     const pat = results['patella-axis'];
     if (!cond || cond.points.length < 2 || !pat || pat.points.length < 2) return null;
@@ -247,7 +228,6 @@ const PATELLAR_TILT: MeasurementProtocol = {
       cond.points[1],
       pat.points[0],
       pat.points[1],
-      ps,
     );
     // The clinical convention reports the acute angle.
     const acute = angle > 90 ? 180 - angle : angle;
@@ -287,11 +267,11 @@ const SULCUS_ANGLE: MeasurementProtocol = {
       primitive: 'line',
     },
   ],
-  compute: (results, ps) => {
+  compute: (results) => {
     const m = results['medial-line'];
     const l = results['lateral-line'];
     if (!m || m.points.length < 2 || !l || l.points.length < 2) return null;
-    const angle = angleBetweenLines(m.points[0], m.points[1], l.points[1], l.points[0], ps);
+    const angle = angleBetweenLines(m.points[0], m.points[1], l.points[1], l.points[0]);
     return {
       value: angle,
       unit: '°',
@@ -315,4 +295,3 @@ export function getProtocol(id: string | undefined | null): MeasurementProtocol 
   if (!id) return null;
   return MEASUREMENT_PROTOCOLS.find((p) => p.id === id) || null;
 }
-

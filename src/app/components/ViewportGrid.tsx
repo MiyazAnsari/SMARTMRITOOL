@@ -25,7 +25,11 @@ interface ViewportGridProps {
   activeTool: MeasurementTool;
   measurements: Measurement[];
   onMeasurementAdd: (measurement: Measurement) => void;
-  onMeasurementUpdate?: (id: string, newPoints: { x: number; y: number }[]) => void;
+  onMeasurementUpdate?: (id: string, newPoints: { x: number; y: number }[], value?: string) => void;
+  pixelSpacing?: { x: number; y: number };
+  measurementUnits?: 'mm' | 'px';
+  selectedMeasurementId?: string | null;
+  onMeasurementSelect?: (id: string | null) => void;
   applyWeighting: (pixelValue: number) => number;
   showCrosshair?: boolean;
   /** Multi-sequence mode (study): one draggable window per sequence. */
@@ -49,6 +53,10 @@ export function ViewportGrid({
   measurements,
   onMeasurementAdd,
   onMeasurementUpdate,
+  pixelSpacing,
+  measurementUnits,
+  selectedMeasurementId,
+  onMeasurementSelect,
   applyWeighting,
   showCrosshair = false,
   sequenceWindows,
@@ -56,6 +64,7 @@ export function ViewportGrid({
   onHideWindow,
   onResetViewport,
 }: ViewportGridProps) {
+  // pixelSpacing is optional and provided by parent when available
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [positions, setPositions] = useState<Record<string, Rect>>({});
   const zCounterRef = useRef<number>(100);
@@ -150,7 +159,13 @@ export function ViewportGrid({
   if (!sequenceMode) {
     const planeSlice =
       viewPlane === 'axial' ? currentSlice.axial : viewPlane === 'sagittal' ? currentSlice.sagittal : currentSlice.coronal;
-    const planeMeasurements = measurements.filter((m) => m.plane === viewPlane);
+    const planeMeasurements = measurements.filter((m) => {
+      if ((m.plane ?? viewPlane) !== viewPlane) return false;
+      // If propagation is disabled for this measurement, only show on the exact slice
+      const propagate = m.propagateAcrossSlices ?? true;
+      if (propagate) return true;
+      return m.slice === planeSlice;
+    });
 
     return (
       <div ref={containerRef} className="flex-1 min-h-0 min-w-0 flex flex-col bg-gray-950 relative">
@@ -168,6 +183,10 @@ export function ViewportGrid({
               measurements={planeMeasurements}
               onMeasurementAdd={onMeasurementAdd}
               onMeasurementUpdate={onMeasurementUpdate}
+              pixelSpacing={pixelSpacing}
+              measurementUnits={measurementUnits}
+              selectedMeasurementId={selectedMeasurementId}
+              onMeasurementSelect={onMeasurementSelect}
               applyWeighting={applyWeighting}
               showCrosshair={showCrosshair}
               onViewportReset={() => onResetViewport?.(viewPlane)}
@@ -226,7 +245,7 @@ export function ViewportGrid({
               </div>
             </div>
             <div className="flex-1 min-h-0 min-w-0 relative flex flex-col">
-              <Viewport
+                <Viewport
                 imageData={w.imageData}
                 header={w.header}
                 plane="axial"
@@ -236,9 +255,18 @@ export function ViewportGrid({
                 onSliceChange={(slice) => onSliceChange(w.id, slice)}
                 defaultWindowLevel={w.defaultWindowLevel}
                 activeTool={activeTool}
-                measurements={measurements.filter((m) => m.plane === w.id)}
+                measurements={measurements.filter((m) => {
+                  if ((m.plane ?? w.id) !== w.id) return false;
+                  const propagate = m.propagateAcrossSlices ?? true;
+                  if (propagate) return true;
+                  return m.slice === sequenceSlice;
+                })}
                 onMeasurementAdd={onMeasurementAdd}
                 onMeasurementUpdate={onMeasurementUpdate}
+                pixelSpacing={pixelSpacing}
+                measurementUnits={measurementUnits}
+                selectedMeasurementId={selectedMeasurementId}
+                onMeasurementSelect={onMeasurementSelect}
                 applyWeighting={applyWeighting}
                 showCrosshair={showCrosshair}
                 parentWindowHeight={pos.height}

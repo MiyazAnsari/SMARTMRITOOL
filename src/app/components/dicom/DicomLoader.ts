@@ -103,7 +103,7 @@ function parseDicomFile(buffer: ArrayBuffer): ParsedSlice | null {
   try {
     dataSet = dicomParser.parseDicom(byteArray);
   } catch (e) {
-    console.warn('DICOM parse failed, skipping file', e);
+    console.info('Skipping non-DICOM or unsupported DICOM file', e);
     return null;
   }
 

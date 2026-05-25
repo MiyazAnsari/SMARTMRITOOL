@@ -2,23 +2,9 @@ import { useRef, useEffect, useState, useCallback } from 'react';
 import type { WindowLevel, MeasurementTool, Measurement } from './MedicalImageViewer';
 import { Slider } from './ui/slider';
 
-const WL_MIN_WIDTH = 8;
-const WL_MAX_WIDTH = 255;
-const WL_MIN_CENTER = 0;
-const WL_MAX_CENTER = 255;
-
-/** Clamp WW/WL to display-space limits (normalized 0–255 pixels). */
-function sanitizeWindowLevel(
-  windowWidth: number,
-  windowCenter: number,
-  fallback: WindowLevel,
-): WindowLevel {
-  let ww = Math.round(windowWidth);
-  let wc = Math.round(windowCenter);
-  if (!Number.isFinite(ww) || !Number.isFinite(wc)) return { ...fallback };
-  ww = Math.max(WL_MIN_WIDTH, Math.min(WL_MAX_WIDTH, ww));
-  wc = Math.max(WL_MIN_CENTER, Math.min(WL_MAX_CENTER, wc));
-  if (wc + ww / 2 <= wc - ww / 2) return { ...fallback };
+function sanitizeWindowLevel(windowVal: number, levelVal: number, fallback: WindowLevel): WindowLevel {
+  const ww = Number.isFinite(windowVal) && windowVal > 0 ? Math.max(1, Math.round(windowVal)) : fallback.window;
+  const wc = Number.isFinite(levelVal) ? Math.round(levelVal) : fallback.level;
   return { window: ww, level: wc };
 }
 
@@ -42,9 +28,13 @@ interface ViewportProps {
   activeTool: MeasurementTool;
   measurements: Measurement[];
   onMeasurementAdd: (measurement: Measurement) => void;
-  onMeasurementUpdate?: (id: string, newPoints: { x: number; y: number }[]) => void;
+  onMeasurementUpdate?: (id: string, newPoints: { x: number; y: number }[], value?: string) => void;
+  selectedMeasurementId?: string | null;
+  onMeasurementSelect?: (id: string | null) => void;
   applyWeighting: (pixelValue: number) => number;
   showCrosshair?: boolean;
+  pixelSpacing?: { x: number; y: number };
+  measurementUnits?: 'mm' | 'px';
   parentWindowHeight?: number;
   /** Restore upload defaults for this viewer only (slice/WL/measurements handled in parent). */
   onViewportReset?: () => void;
@@ -65,11 +55,15 @@ export function Viewport({
   measurements,
   onMeasurementAdd,
   onMeasurementUpdate,
+  selectedMeasurementId,
+  onMeasurementSelect,
   applyWeighting,
   showCrosshair = false,
   parentWindowHeight,
   onViewportReset,
   onClose,
+  measurementUnits = 'mm',
+  pixelSpacing,
 }: ViewportProps) {
   const [wl, setWl] = useState<WindowLevel>(() =>
     sanitizeWindowLevel(defaultWindowLevel.window, defaultWindowLevel.level, defaultWindowLevel),
@@ -108,14 +102,94 @@ export function Viewport({
   const sliderRef = useRef<HTMLDivElement | null>(null);
   const [isDrawing, setIsDrawing] = useState(false);
   const [drawingPoints, setDrawingPoints] = useState<{ x: number; y: number }[]>([]);
+  const [overlayTick, setOverlayTick] = useState(0);
   const [draggingPoint, setDraggingPoint] = useState<{ measurementId: string; pointIndex: number } | null>(null);
   const [selectedLineId, setSelectedLineId] = useState<string | null>(null);
+  const [hoveredLineId, setHoveredLineId] = useState<string | null>(null);
   const draggingPointRef = useRef<{ measurementId: string; pointIndex: number } | null>(null);
+  const pendingLineDragRef = useRef<{
+    measurementId: string;
+    startX: number;
+    startY: number;
+    initialPoints: { x: number; y: number }[];
+  } | null>(null);
+  const lineDragMovedRef = useRef(false);
+  const draggingPerpendicularRef = useRef<{ measurementId: string; startX: number; startY: number; baseLineId?: string | null } | null>(null);
   const perpendicularBaseLineRef = useRef<string | null>(null);
   const measurementsRef = useRef(measurements);
+  const suppressClickRef = useRef(false);
+  const dragMovedRef = useRef(false);
+  const lastDragTimestampRef = useRef<number>(0);
+  const lastDraggedPointRef = useRef<{ id: string; pointIndex: number; x: number; y: number; ts: number } | null>(null);
+  const lastBaselineUpdateRef = useRef<Map<string, number>>(new Map());
+  const pointerActionRef = useRef<Map<number, { last: 'down' | 'move' | 'drag' | 'up'; ts: number }>>(new Map());
+  const recentPointerDragRef = useRef<Map<number, number>>(new Map());
+  const lastPointerIdRef = useRef<number | null>(null);
+  useEffect(() => {
+    setSelectedLineId(selectedMeasurementId ?? null);
+  }, [selectedMeasurementId]);
+
+  useEffect(() => {
+    setHoveredLineId(null);
+  }, [currentSlice, measurementPlane]);
+
   useEffect(() => {
     measurementsRef.current = measurements;
   }, [measurements]);
+
+  // Force an explicit overlay redraw when the active slice or plane changes.
+  // Some viewers reported annotations not appearing immediately after a
+  // programmatic slice change; bumping `overlayTick` guarantees the overlay
+  // drawing effect runs synchronously with the change.
+  useEffect(() => {
+    setOverlayTick((t) => t + 1);
+  }, [currentSlice, measurementPlane]);
+
+  const SNAP_RADIUS = 8;
+
+  const distanceToSegment = useCallback((pt: { x: number; y: number }, a: { x: number; y: number }, b: { x: number; y: number }) => {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len2 = dx * dx + dy * dy;
+    if (len2 === 0) return Math.hypot(pt.x - a.x, pt.y - a.y);
+    const t = Math.max(0, Math.min(1, ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / len2));
+    const px = a.x + t * dx;
+    const py = a.y + t * dy;
+    return Math.hypot(pt.x - px, pt.y - py);
+  }, []);
+
+  const findSnapPoint = useCallback((x: number, y: number, excludeMeasurementId?: string | null) => {
+    let best: { x: number; y: number; dist: number } | null = null;
+    for (const measurement of measurementsRef.current) {
+      if ((measurement.plane ?? measurementPlane) !== measurementPlane) continue;
+      const propagate = measurement.propagateAcrossSlices ?? true;
+      if (!propagate && measurement.slice !== currentSlice) continue;
+      if (excludeMeasurementId && measurement.id === excludeMeasurementId) continue;
+      for (const point of measurement.points) {
+        const dist = Math.hypot(point.x - x, point.y - y);
+        if (dist <= SNAP_RADIUS && (!best || dist < best.dist)) {
+          best = { x: point.x, y: point.y, dist };
+        }
+      }
+    }
+    return best ? { x: best.x, y: best.y } : { x, y };
+  }, [currentSlice]);
+
+  const findNearbyLine = useCallback((x: number, y: number) => {
+    let best: { measurement: Measurement; distance: number } | null = null;
+    for (const measurement of measurementsRef.current) {
+      if ((measurement.plane ?? measurementPlane) !== measurementPlane) continue;
+      const propagate = measurement.propagateAcrossSlices ?? true;
+      if (!propagate && measurement.slice !== currentSlice) continue;
+      if (measurement.type !== 'distance' && measurement.type !== 'line') continue;
+      if (measurement.points.length < 2) continue;
+      const d = distanceToSegment({ x, y }, measurement.points[0], measurement.points[1]);
+      if (d <= 10 && (!best || d < best.distance)) {
+        best = { measurement, distance: d };
+      }
+    }
+    return best?.measurement ?? null;
+  }, [currentSlice, distanceToSegment]);
 
   const buildPerpendicularPoints = useCallback((baseLine: Measurement, cursor: { x: number; y: number }) => {
     if (baseLine.points.length < 2) return null;
@@ -191,21 +265,15 @@ export function Viewport({
       spacingX = p1;
       spacingY = p2;
     } else if (plane === 'coronal') {
-      // Horizontal = x (same as axial width). Vertical = through-plane (z). Using true dz here
-      // often stretches anatomy because slice spacing ≫ in-plane spacing; match in-plane pitch so
-      // MPR matches the familiar 512×512-style square voxels on screen.
       spacingX = p1;
       spacingY = dInPlane;
     } else {
-      // sagittal: horizontal = y, vertical = z
       spacingX = p2;
       spacingY = dInPlane;
     }
 
     return { width, height, spacingX, spacingY };
   }, [header, plane]);
-
-
 
   // Get slice data based on orientation
   const getSliceData = useCallback(() => {
@@ -248,10 +316,7 @@ export function Viewport({
 
     const update = () => {
       const rect = container.getBoundingClientRect();
-      // store rect for debugging
       setContainerRect({ width: Math.round(rect.width), height: Math.round(rect.height) });
-
-      // also capture parent chain sizes to find where height is constrained
       const parent = container.parentElement;
       const parentRect = parent?.getBoundingClientRect();
       const grandParentRect = parent?.parentElement?.getBoundingClientRect();
@@ -265,7 +330,6 @@ export function Viewport({
         return;
       }
 
-      // Compute available size from the container rect (for floating windows this avoids using the full window size)
       let sliderWidth = 0;
       let sliderMarginLeft = 0;
       const sliderEl = sliderRef.current;
@@ -276,51 +340,40 @@ export function Viewport({
         sliderMarginLeft = parseFloat(sStyle.marginLeft || '0') || 0;
       }
 
-      // Rebuilt fit algorithm (aspect-preserving, deterministic)
       const paddingBuffer = 8;
       const { width: imgW, height: imgH, spacingX, spacingY } = getPlaneGeometry();
       const physicalW = imgW * spacingX;
       const physicalH = imgH * spacingY;
 
-      // Available area inside the container (subtract slider if present)
       const availW = Math.max(1, rect.width - sliderWidth - sliderMarginLeft - paddingBuffer * 2);
       const availH = Math.max(1, rect.height - paddingBuffer * 2);
 
-      // If image has invalid dimensions, fallback to small default
       const safeImgW = Math.max(1, imgW || 1);
       const safeImgH = Math.max(1, imgH || 1);
 
-      // Compute scale so image fits into the available area using the smaller dimension
-      // (allow upscaling so the image can fill the smaller container dimension)
       const safePhysicalW = Math.max(1, physicalW || 1);
       const safePhysicalH = Math.max(1, physicalH || 1);
       const scale = Math.min(availW / safePhysicalW, availH / safePhysicalH);
       const computedW = Math.max(1, Math.round(safePhysicalW * scale));
       const computedH = Math.max(1, Math.round(safePhysicalH * scale));
 
-      // Enforce sensible min / max so the wrapper never collapses
-      const MIN_DISPLAY = 48; // absolute lower bound
+      const MIN_DISPLAY = 48;
       const maxW = Math.max(MIN_DISPLAY, Math.round(rect.width - paddingBuffer * 2));
       const maxH = Math.max(MIN_DISPLAY, Math.round(rect.height - paddingBuffer * 2));
 
       const finalW = Math.max(MIN_DISPLAY, Math.min(maxW, Math.round(computedW)));
       const finalH = Math.max(MIN_DISPLAY, Math.min(maxH, Math.round(computedH)));
 
-      // Adaptive hysteresis based on the container size to avoid micro updates
       const deltaW = Math.max(2, Math.round(rect.width * 0.005));
       const deltaH = Math.max(2, Math.round(rect.height * 0.005));
       if (Math.abs(displaySizeRef.current.width - finalW) < deltaW && Math.abs(displaySizeRef.current.height - finalH) < deltaH) {
         return;
       }
 
-      // Debug trace (left intentionally minimal)
-      console.debug('fit', { rectW: rect.width, rectH: rect.height, availW, availH, imgW: safeImgW, imgH: safeImgH, physicalW: safePhysicalW, physicalH: safePhysicalH, finalW, finalH });
-
       displaySizeRef.current = { width: finalW, height: finalH };
       setDisplaySize({ width: finalW, height: finalH });
     };
 
-    // Debounced ResizeObserver + rAF to avoid reacting to rapid micro-changes
     let rafId: number | null = null;
     const debouncedUpdate = () => {
       if (rafId != null) return;
@@ -337,10 +390,8 @@ export function Viewport({
     const onScroll = () => debouncedUpdate();
 
     window.addEventListener('resize', onResize);
-    // use capture to catch scrolls from ancestors
     window.addEventListener('scroll', onScroll, true);
 
-    // run once immediately
     update();
 
     return () => {
@@ -353,6 +404,64 @@ export function Viewport({
       }
     };
   }, [getPlaneGeometry]);
+
+  const emitMeasurementAdd = useCallback((m: Measurement) => {
+    console.debug('[measurement:add]', { id: m.id, type: m.type, slice: m.slice, points: m.points });
+    onMeasurementAdd(m);
+    // record creation time for this measurement id (useful for debounce guards)
+    try {
+      lastBaselineUpdateRef.current.set(m.id, Date.now());
+    } catch {}
+  }, [onMeasurementAdd]);
+
+  const emitMeasurementUpdate = useCallback((id: string, newPoints: { x: number; y: number }[], value?: string) => {
+    console.debug('[measurement:update]', { id, points: newPoints, value });
+    onMeasurementUpdate?.(id, newPoints, value);
+    try {
+      lastBaselineUpdateRef.current.set(id, Date.now());
+    } catch {}
+  }, [onMeasurementUpdate]);
+
+  // When display size changes (e.g. window or panel resize) scale stored
+  // measurement points so annotations remain aligned with the image.
+  const prevDisplaySizeRef = useRef<{ width: number; height: number } | null>(null);
+  useEffect(() => {
+    const prev = prevDisplaySizeRef.current;
+    const cur = displaySize;
+    // initialize previous size on first run
+    if (!prev) {
+      prevDisplaySizeRef.current = cur;
+      return;
+    }
+    if (prev.width === cur.width && prev.height === cur.height) return;
+
+    // Avoid scaling while user is interacting
+    if (
+      draggingPointRef.current ||
+      pendingLineDragRef.current ||
+      draggingPerpendicularRef.current ||
+      isPanning ||
+      isDrawing
+    ) {
+      prevDisplaySizeRef.current = cur;
+      return;
+    }
+
+    if (!onMeasurementUpdate) {
+      prevDisplaySizeRef.current = cur;
+      return;
+    }
+
+    const scaleX = cur.width / Math.max(1, prev.width);
+    const scaleY = cur.height / Math.max(1, prev.height);
+
+    for (const m of measurements) {
+      const newPoints = m.points.map((p) => ({ x: p.x * scaleX, y: p.y * scaleY }));
+      emitMeasurementUpdate(m.id, newPoints);
+    }
+
+    prevDisplaySizeRef.current = cur;
+  }, [displaySize, measurements, onMeasurementUpdate, isPanning, isDrawing]);
 
   // New volume buffer → reset this viewer’s W/L and brightness only (no cross-viewport state).
   const prevImageDataRef = useRef<Uint8Array | null>(null);
@@ -541,87 +650,87 @@ export function Viewport({
     [getPlaneGeometry, normalizeAngle, axialTransform.rotation]
   );
 
-  /** Update zoom scale while keeping a fixed image-space focal point (pan only — no slice/WL changes). */
-  const applyZoomAtImageFocal = useCallback((focalX: number, focalY: number, newZ: number) => {
-    const iw = sliceDimsRef.current.w;
-    const ih = sliceDimsRef.current.h;
-    if (iw < 1 || ih < 1) return;
-
-    const clampedZ = Math.min(VIEWPORT_ZOOM_MAX, Math.max(VIEWPORT_ZOOM_MIN, newZ));
-    if (clampedZ <= VIEWPORT_ZOOM_MIN + 1e-6) {
-      zoomScaleRef.current = VIEWPORT_ZOOM_MIN;
-      panSrcRef.current = { x: 0, y: 0 };
-      setZoomScale(VIEWPORT_ZOOM_MIN);
-      setPanSrc({ x: 0, y: 0 });
-      return;
-    }
-
-    const newCropW = Math.max(1, Math.floor(iw / clampedZ));
-    const newCropH = Math.max(1, Math.floor(ih / clampedZ));
-    let npx = Math.round(focalX - newCropW / 2);
-    let npy = Math.round(focalY - newCropH / 2);
-    npx = Math.max(0, Math.min(iw - newCropW, npx));
-    npy = Math.max(0, Math.min(ih - newCropH, npy));
-
-    zoomScaleRef.current = clampedZ;
-    panSrcRef.current = { x: npx, y: npy };
-    setZoomScale(clampedZ);
-    setPanSrc({ x: npx, y: npy });
-  }, []);
-
-  const getViewportCenterImagePixel = useCallback((): { x: number; y: number } => {
-    const iw = sliceDimsRef.current.w;
-    const ih = sliceDimsRef.current.h;
-    if (iw < 1 || ih < 1) return { x: 0, y: 0 };
-    const z = Math.max(VIEWPORT_ZOOM_MIN, zoomScaleRef.current);
-    const cropW = Math.max(1, Math.floor(iw / z));
-    const cropH = Math.max(1, Math.floor(ih / z));
-    return {
-      x: panSrcRef.current.x + cropW / 2,
-      y: panSrcRef.current.y + cropH / 2,
-    };
-  }, []);
-
-  const animateZoomToTarget = useCallback(
-    (targetZ: number) => {
-      cancelZoomAnimation();
+    /** Update zoom scale while keeping a fixed image-space focal point (pan only — no slice/WL changes). */
+    const applyZoomAtImageFocal = useCallback((focalX: number, focalY: number, newZ: number) => {
       const iw = sliceDimsRef.current.w;
       const ih = sliceDimsRef.current.h;
       if (iw < 1 || ih < 1) return;
 
-      const focal = getViewportCenterImagePixel();
-      const startZ = zoomScaleRef.current;
-      const endZ = Math.min(VIEWPORT_ZOOM_MAX, Math.max(VIEWPORT_ZOOM_MIN, targetZ));
-      if (Math.abs(endZ - startZ) < 1e-4) return;
+      const clampedZ = Math.min(VIEWPORT_ZOOM_MAX, Math.max(VIEWPORT_ZOOM_MIN, newZ));
+      if (clampedZ <= VIEWPORT_ZOOM_MIN + 1e-6) {
+        zoomScaleRef.current = VIEWPORT_ZOOM_MIN;
+        panSrcRef.current = { x: 0, y: 0 };
+        setZoomScale(VIEWPORT_ZOOM_MIN);
+        setPanSrc({ x: 0, y: 0 });
+        return;
+      }
 
-      const t0 = performance.now();
-      const tick = (now: number) => {
-        const t = Math.min(1, (now - t0) / VIEWPORT_ZOOM_ANIM_MS);
-        const eased = 1 - (1 - t) ** 3;
-        const z = startZ + (endZ - startZ) * eased;
-        applyZoomAtImageFocal(focal.x, focal.y, z);
-        if (t < 1) {
-          zoomAnimRafRef.current = requestAnimationFrame(tick);
-        } else {
-          applyZoomAtImageFocal(focal.x, focal.y, endZ);
-          zoomAnimRafRef.current = null;
-        }
+      const newCropW = Math.max(1, Math.floor(iw / clampedZ));
+      const newCropH = Math.max(1, Math.floor(ih / clampedZ));
+      let npx = Math.round(focalX - newCropW / 2);
+      let npy = Math.round(focalY - newCropH / 2);
+      npx = Math.max(0, Math.min(iw - newCropW, npx));
+      npy = Math.max(0, Math.min(ih - newCropH, npy));
+
+      zoomScaleRef.current = clampedZ;
+      panSrcRef.current = { x: npx, y: npy };
+      setZoomScale(clampedZ);
+      setPanSrc({ x: npx, y: npy });
+    }, []);
+
+    const getViewportCenterImagePixel = useCallback((): { x: number; y: number } => {
+      const iw = sliceDimsRef.current.w;
+      const ih = sliceDimsRef.current.h;
+      if (iw < 1 || ih < 1) return { x: 0, y: 0 };
+      const z = Math.max(VIEWPORT_ZOOM_MIN, zoomScaleRef.current);
+      const cropW = Math.max(1, Math.floor(iw / z));
+      const cropH = Math.max(1, Math.floor(ih / z));
+      return {
+        x: panSrcRef.current.x + cropW / 2,
+        y: panSrcRef.current.y + cropH / 2,
       };
-      zoomAnimRafRef.current = requestAnimationFrame(tick);
-    },
-    [applyZoomAtImageFocal, cancelZoomAnimation, getViewportCenterImagePixel],
-  );
+    }, []);
 
-  const zoomInStep = useCallback(() => {
-    animateZoomToTarget(zoomScaleRef.current * VIEWPORT_ZOOM_STEP);
-  }, [animateZoomToTarget]);
+    const animateZoomToTarget = useCallback(
+      (targetZ: number) => {
+        cancelZoomAnimation();
+        const iw = sliceDimsRef.current.w;
+        const ih = sliceDimsRef.current.h;
+        if (iw < 1 || ih < 1) return;
 
-  const zoomOutStep = useCallback(() => {
-    animateZoomToTarget(zoomScaleRef.current / VIEWPORT_ZOOM_STEP);
-  }, [animateZoomToTarget]);
+        const focal = getViewportCenterImagePixel();
+        const startZ = zoomScaleRef.current;
+        const endZ = Math.min(VIEWPORT_ZOOM_MAX, Math.max(VIEWPORT_ZOOM_MIN, targetZ));
+        if (Math.abs(endZ - startZ) < 1e-4) return;
 
-  /** Wheel zoom (unchanged behavior): only when Zoom mode is on; focal = pointer. */
-  const applyWheelZoomAtPointer = useCallback(
+        const t0 = performance.now();
+        const tick = (now: number) => {
+          const t = Math.min(1, (now - t0) / VIEWPORT_ZOOM_ANIM_MS);
+          const eased = 1 - (1 - t) ** 3;
+          const z = startZ + (endZ - startZ) * eased;
+          applyZoomAtImageFocal(focal.x, focal.y, z);
+          if (t < 1) {
+            zoomAnimRafRef.current = requestAnimationFrame(tick);
+          } else {
+            applyZoomAtImageFocal(focal.x, focal.y, endZ);
+            zoomAnimRafRef.current = null;
+          }
+        };
+        zoomAnimRafRef.current = requestAnimationFrame(tick);
+      },
+      [applyZoomAtImageFocal, cancelZoomAnimation, getViewportCenterImagePixel],
+    );
+
+    const zoomInStep = useCallback(() => {
+      animateZoomToTarget(zoomScaleRef.current * VIEWPORT_ZOOM_STEP);
+    }, [animateZoomToTarget]);
+
+    const zoomOutStep = useCallback(() => {
+      animateZoomToTarget(zoomScaleRef.current / VIEWPORT_ZOOM_STEP);
+    }, [animateZoomToTarget]);
+
+  /** Axial zoom mode: zoom toward whatever is under the pointer (hover + scroll). */
+  const applyAxialWheelZoomAtPointer = useCallback(
     (clientX: number, clientY: number, deltaY: number, deltaMode: number) => {
       const iw = sliceDimsRef.current.w;
       const ih = sliceDimsRef.current.h;
@@ -660,8 +769,7 @@ export function Viewport({
       if (Math.abs(newZ - prevZ) < 1e-6) return;
 
       applyZoomAtImageFocal(fx, fy, newZ);
-    },
-    [applyZoomAtImageFocal, cancelZoomAnimation, clientToImagePixel, getViewportCenterImagePixel],
+    }, [applyZoomAtImageFocal, cancelZoomAnimation, clientToImagePixel, getViewportCenterImagePixel],
   );
 
   // Reset interaction state when a new volume buffer is loaded for this viewer.
@@ -784,7 +892,6 @@ export function Viewport({
           ctx.drawImage(src, px, py, cropW, cropH, 0, 0, drawW, drawH);
         });
       } else {
-        // draw full image centered and scaled
         drawTransformedImage(ctx, dpr, centerX, centerY, drawW, drawH, () => {
           ctx.drawImage(src, 0, 0, width, height, 0, 0, drawW, drawH);
         });
@@ -812,6 +919,8 @@ export function Viewport({
         overlay.height = canvas.height;
         overlay.style.width = `${displayW}px`;
         overlay.style.height = `${displayH}px`;
+        // Force overlay draw effect to run immediately after image draw
+        setOverlayTick((t) => t + 1);
       }
     })();
 
@@ -891,6 +1000,57 @@ export function Viewport({
     const clearH = canvas.height / dpr;
     ctx.clearRect(0, 0, clearW, clearH);
 
+    const drawLabel = (
+      text: string,
+      x: number,
+      y: number,
+      fill = '#111827',
+      textFill = '#e5e7eb',
+      maxWidth = 96,
+      textOpacity = 1,
+      bgOpacity = 0.12,
+    ) => {
+      ctx.save();
+      ctx.font = 'bold 11px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const words = text.split(/\s+/).filter(Boolean);
+      const lines: string[] = [];
+      let current = '';
+      for (const word of words) {
+        const next = current ? `${current} ${word}` : word;
+        if (ctx.measureText(next).width <= maxWidth || !current) {
+          current = next;
+        } else {
+          lines.push(current);
+          current = word;
+        }
+      }
+      if (current) lines.push(current);
+      const lineHeight = 12;
+      const widest = Math.max(...lines.map((line) => ctx.measureText(line).width), 0);
+      const boxW = Math.max(36, Math.min(maxWidth + 14, widest + 14));
+      const boxH = Math.max(18, lines.length * lineHeight + 6);
+
+      // Draw faint background first (same for selected and unselected)
+      ctx.save();
+      ctx.globalAlpha = bgOpacity;
+      ctx.fillStyle = fill;
+      ctx.fillRect(x - boxW / 2, y - boxH / 2, boxW, boxH);
+      ctx.restore();
+
+      // Draw text with requested opacity so selected text can be darker
+      ctx.save();
+      ctx.globalAlpha = textOpacity;
+      ctx.fillStyle = textFill;
+      lines.forEach((line, index) => {
+        const lineY = y - ((lines.length - 1) * lineHeight) / 2 + index * lineHeight + 0.5;
+        ctx.fillText(line, x, lineY);
+      });
+      ctx.restore();
+      ctx.restore();
+    };
+
     // Draw crosshair (optional)
     if (showCrosshair) {
       ctx.strokeStyle = 'rgba(0, 255, 255, 0.5)';
@@ -908,7 +1068,7 @@ export function Viewport({
 
     // Draw completed measurements
     measurements.forEach((measurement) => {
-      if (measurement.slice !== currentSlice) return;
+      if ((measurement.plane ?? measurementPlane) !== measurementPlane) return;
 
       ctx.strokeStyle = '#3b82f6';
       ctx.fillStyle = '#3b82f6';
@@ -916,10 +1076,16 @@ export function Viewport({
 
       const points = measurement.points;
 
+      const isSelected = measurement.id === selectedLineId;
+      const overlayAlpha = 1;
+      const labelTextAlpha = isSelected ? 0.95 : 0.12;
+      const valueTextAlpha = isSelected ? 0.85 : 0.08;
+      const labelBgAlpha = 0.12;
       if ((measurement.type === 'distance' || measurement.type === 'line') && points.length >= 2) {
+        ctx.save();
+        ctx.globalAlpha = overlayAlpha;
+        // draw baseline (dashed for infinite 'line', solid for distance)
         if (measurement.type === 'line') {
-          // Visualize the line as extending across the canvas to make tangent
-          // placement obvious.
           const dx = points[1].x - points[0].x;
           const dy = points[1].y - points[0].y;
           const len = Math.hypot(dx, dy) || 1;
@@ -936,9 +1102,18 @@ export function Viewport({
           ctx.stroke();
           ctx.restore();
         }
+
         ctx.beginPath();
         ctx.moveTo(points[0].x, points[0].y);
         ctx.lineTo(points[1].x, points[1].y);
+        // emphasize if selected
+        if (isSelected) {
+          ctx.strokeStyle = '#f59e0b';
+          ctx.lineWidth = 4;
+        } else {
+          ctx.strokeStyle = '#3b82f6';
+          ctx.lineWidth = 2;
+        }
         ctx.stroke();
 
         points.forEach(p => {
@@ -946,21 +1121,24 @@ export function Viewport({
           ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
           ctx.fill();
         });
-        if (measurement.id === selectedLineId) {
-          const midX = (points[0].x + points[1].x) / 2;
-          const midY = (points[0].y + points[1].y) / 2;
-          ctx.fillStyle = '#ffffff';
-          ctx.fillRect(midX - 11, midY - 11, 22, 22);
-          ctx.fillStyle = '#111827';
-          ctx.font = 'bold 13px sans-serif';
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-          ctx.fillText('⊥', midX, midY + 0.5);
-          ctx.fillStyle = '#3b82f6';
-          ctx.textAlign = 'left';
-          ctx.textBaseline = 'alphabetic';
+        ctx.restore();
+        const midX = (points[0].x + points[1].x) / 2;
+        const midY = (points[0].y + points[1].y) / 2;
+        // value label: prefer measurement.value (keeps panel/overlay in sync),
+        // fall back to viewport calculation if not yet propagated.
+        const valueText = measurement.value || calculateMeasurementValue(measurement.type as MeasurementTool, points);
+        if (measurement.label) {
+          drawLabel(measurement.label, midX, midY - 34, '#0f172a', '#e5e7eb', 96, labelTextAlpha, labelBgAlpha);
+        }
+        if ((pixelSpacing || measurement.value) && valueText) {
+          drawLabel(valueText, midX, midY - 14, '#0f172a', '#e5e7eb', 96, valueTextAlpha, labelBgAlpha);
+        }
+        if (measurement.id === hoveredLineId || measurement.id === selectedLineId) {
+          drawLabel('⊥ add', midX, midY + 14, '#ffffff', '#111827', 96, isSelected ? 0.25 : 0.14, 0.08);
         }
       } else if (measurement.type === 'perpendicular' && points.length >= 2) {
+        ctx.save();
+        ctx.globalAlpha = overlayAlpha;
         ctx.beginPath();
         ctx.moveTo(points[0].x, points[0].y);
         ctx.lineTo(points[1].x, points[1].y);
@@ -975,8 +1153,14 @@ export function Viewport({
         ctx.beginPath();
         ctx.arc(points[1].x, points[1].y, 4, 0, Math.PI * 2);
         ctx.fill();
+        ctx.restore();
+        if (measurement.label) {
+          drawLabel(measurement.label, (points[0].x + points[1].x) / 2, (points[0].y + points[1].y) / 2 - 14, '#0f172a', '#e5e7eb', 96, labelTextAlpha, labelBgAlpha);
+        }
       } else if (measurement.type === 'point' && points.length >= 1) {
         const p = points[0];
+        ctx.save();
+        ctx.globalAlpha = overlayAlpha;
         ctx.beginPath();
         ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
         ctx.fill();
@@ -987,7 +1171,13 @@ export function Viewport({
         ctx.stroke();
         ctx.strokeStyle = '#3b82f6';
         ctx.lineWidth = 2;
+        ctx.restore();
+        if (measurement.label) {
+          drawLabel(measurement.label, p.x, p.y - 14, '#111827', '#e5e7eb', 96, labelTextAlpha, labelBgAlpha);
+        }
       } else if (measurement.type === 'angle' && points.length >= 3) {
+        ctx.save();
+        ctx.globalAlpha = overlayAlpha;
         ctx.beginPath();
         ctx.moveTo(points[0].x, points[0].y);
         ctx.lineTo(points[1].x, points[1].y);
@@ -999,16 +1189,25 @@ export function Viewport({
           ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
           ctx.fill();
         });
+        ctx.restore();
+        if (measurement.label) {
+          drawLabel(measurement.label, points[1].x, points[1].y - 16, '#111827', '#e5e7eb', 96, labelTextAlpha, labelBgAlpha);
+        }
       } else if (measurement.type === 'ellipse' && points.length >= 2) {
         const cx = (points[0].x + points[1].x) / 2;
         const cy = (points[0].y + points[1].y) / 2;
         const rx = Math.abs(points[1].x - points[0].x) / 2;
         const ry = Math.abs(points[1].y - points[0].y) / 2;
         
+        ctx.save();
+        ctx.globalAlpha = overlayAlpha;
         ctx.beginPath();
         ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
         ctx.stroke();
+        ctx.restore();
       } else if (measurement.type === 'closedCurve' && points.length > 2) {
+        ctx.save();
+        ctx.globalAlpha = overlayAlpha;
         ctx.beginPath();
         ctx.moveTo(points[0].x, points[0].y);
         points.forEach(p => ctx.lineTo(p.x, p.y));
@@ -1020,11 +1219,15 @@ export function Viewport({
           ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
           ctx.fill();
         });
+        ctx.restore();
       } else if (measurement.type === 'freehand' && points.length > 1) {
+        ctx.save();
+        ctx.globalAlpha = overlayAlpha;
         ctx.beginPath();
         ctx.moveTo(points[0].x, points[0].y);
         points.forEach(p => ctx.lineTo(p.x, p.y));
         ctx.stroke();
+        ctx.restore();
       }
     });
 
@@ -1072,16 +1275,34 @@ export function Viewport({
         ctx.stroke();
       }
     }
-  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool, selectedLineId]);
+  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool, selectedLineId, overlayTick]);
 
-  // Calculate measurement value
+  // Calculate measurement value (prefer physical units mm when possible)
   const calculateMeasurementValue = (type: MeasurementTool, points: { x: number; y: number }[]): string => {
-    if ((type === 'distance' || type === 'perpendicular') && points.length === 2) {
+    const { width: imgW, height: imgH, spacingX: geomSpacingX, spacingY: geomSpacingY } = getPlaneGeometry();
+    const displayW = displaySize.width || imgW || 1;
+    const displayH = displaySize.height || imgH || 1;
+    const spacingX = pixelSpacing && pixelSpacing.x > 0 ? pixelSpacing.x : geomSpacingX || 1;
+    const spacingY = pixelSpacing && pixelSpacing.y > 0 ? pixelSpacing.y : geomSpacingY || 1;
+    const pxPerCssX = imgW / displayW;
+    const pxPerCssY = imgH / displayH;
+    // mm per CSS pixel = (image_pixels * spacing_mm_per_image_pixel) / display_css_pixels
+    const mmPerCssX = pxPerCssX * spacingX;
+    const mmPerCssY = pxPerCssY * spacingY;
+
+    if ((type === 'distance' || type === 'perpendicular' || type === 'line') && points.length === 2) {
       const dx = points[1].x - points[0].x;
       const dy = points[1].y - points[0].y;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      if (dist === 0) return '0.00 px';
-      return `${dist.toFixed(2)} px`;
+      const dist_px = Math.sqrt((dx * pxPerCssX) ** 2 + (dy * pxPerCssY) ** 2);
+      if (measurementUnits === 'px' || !Number.isFinite(dist_px)) {
+        if (dist_px === 0) return '0.00 px';
+        return `${dist_px.toFixed(2)} px`;
+      }
+      const dx_mm = dx * mmPerCssX;
+      const dy_mm = dy * mmPerCssY;
+      const dist_mm = Math.sqrt(dx_mm * dx_mm + dy_mm * dy_mm);
+      if (dist_mm === 0) return '0.00 mm';
+      return `${dist_mm.toFixed(2)} mm`;
     } else if (type === 'angle' && points.length === 3) {
       const v1 = { x: points[0].x - points[1].x, y: points[0].y - points[1].y };
       const v2 = { x: points[2].x - points[1].x, y: points[2].y - points[1].y };
@@ -1089,13 +1310,18 @@ export function Viewport({
       const mag1 = Math.sqrt(v1.x * v1.x + v1.y * v1.y);
       const mag2 = Math.sqrt(v2.x * v2.x + v2.y * v2.y);
       if (mag1 === 0 || mag2 === 0) return '0.0°';
-      const angle = Math.acos(dot / (mag1 * mag2)) * (180 / Math.PI);
+      const angle = Math.acos(Math.max(-1, Math.min(1, dot / (mag1 * mag2)))) * (180 / Math.PI);
       return `${angle.toFixed(1)}°`;
     } else if (type === 'ellipse' && points.length === 2) {
       const rx = Math.abs(points[1].x - points[0].x) / 2;
       const ry = Math.abs(points[1].y - points[0].y) / 2;
-      const area = Math.PI * rx * ry;
-      return `${area.toFixed(2)} px²`;
+      if (measurementUnits === 'px') {
+        const area_px = Math.PI * (rx * pxPerCssX) * (ry * pxPerCssY);
+        return `${area_px.toFixed(2)} px²`;
+      }
+      const area_css = Math.PI * rx * ry;
+      const area_mm2 = area_css * mmPerCssX * mmPerCssY;
+      return `${area_mm2.toFixed(2)} mm²`;
     }
     return '';
   };
@@ -1117,7 +1343,7 @@ export function Viewport({
 
     if (activeTool === 'none') {
       for (const m of measurementsRef.current) {
-        if (m.slice !== currentSlice) continue;
+        if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
         if (m.points.length === 0) continue;
         for (let i = 0; i < m.points.length; i++) {
           const p = m.points[i];
@@ -1133,7 +1359,24 @@ export function Viewport({
       }
 
       for (const m of measurementsRef.current) {
-        if (m.slice !== currentSlice) continue;
+        if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
+        if (m.type !== 'perpendicular' || m.points.length < 2) continue;
+
+        const anchor = m.points[0];
+        const tip = m.points[1];
+        const nearAnchor = Math.hypot(x - anchor.x, y - anchor.y) < 10;
+        const nearTip = Math.hypot(x - tip.x, y - tip.y) < 10;
+        const nearBody = distanceToSegment({ x, y }, anchor, tip) < 8;
+        if (nearBody && !nearAnchor && !nearTip) {
+          draggingPerpendicularRef.current = { measurementId: m.id, startX: x, startY: y, baseLineId: m.baseLineId };
+          setIsDrawing(false);
+          setDrawingPoints([]);
+          return;
+        }
+      }
+
+      for (const m of measurementsRef.current) {
+        if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
         if ((m.type !== 'distance' && m.type !== 'line') || m.points.length < 2) continue;
 
         const p0 = m.points[0];
@@ -1148,7 +1391,19 @@ export function Viewport({
         const closestY = p0.y + t * dy;
         const dist = Math.sqrt((x - closestX) ** 2 + (y - closestY) ** 2);
         if (dist < 10) {
+          const nearP0 = Math.hypot(x - p0.x, y - p0.y) < 10;
+          const nearP1 = Math.hypot(x - p1.x, y - p1.y) < 10;
           setSelectedLineId(m.id);
+          onMeasurementSelect?.(m.id);
+          if (!nearP0 && !nearP1) {
+            pendingLineDragRef.current = {
+              measurementId: m.id,
+              startX: x,
+              startY: y,
+              initialPoints: m.points.map((p) => ({ x: p.x, y: p.y })),
+            };
+            lineDragMovedRef.current = false;
+          }
           return;
         }
       }
@@ -1159,17 +1414,8 @@ export function Viewport({
     } else if (activeTool === 'pan') {
       setIsPanning(true);
       panStartRef.current = { clientX: e.clientX, clientY: e.clientY, startX: panSrc.x, startY: panSrc.y };
-    } else if (activeTool === 'point') {
-      // Single-click point primitive — emit immediately, no drag phase.
-      onMeasurementAdd({
-        id: Date.now().toString(),
-        type: 'point',
-        points: [{ x, y }],
-        slice: currentSlice,
-        plane: measurementPlane,
-      });
     } else if (activeTool === 'perpendicular') {
-      // This is now purely handled in handleClick! No dragging to draw.
+      // handled in handleClick
     }
   };
 
@@ -1202,7 +1448,6 @@ export function Viewport({
     const cropW = Math.max(1, Math.floor(width / zoomScale));
     const cropH = Math.max(1, Math.floor(height / zoomScale));
 
-    // clear then draw
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
@@ -1221,6 +1466,82 @@ export function Viewport({
 
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
+    const snapped = findSnapPoint(x, y);
+
+    if (draggingPerpendicularRef.current) {
+      const dragged = draggingPerpendicularRef.current;
+      const targetMeasurement = measurementsRef.current.find((m) => m.id === dragged.measurementId);
+      if (targetMeasurement) {
+        const baseLine = targetMeasurement.baseLineId
+          ? measurementsRef.current.find((m) => m.id === targetMeasurement.baseLineId)
+          : null;
+        if (baseLine && baseLine.points.length >= 2) {
+          const p0 = baseLine.points[0];
+          const p1 = baseLine.points[1];
+          const dx = p1.x - p0.x;
+          const dy = p1.y - p0.y;
+          const len = Math.hypot(dx, dy) || 1;
+          const lineX = dx / len;
+          const lineY = dy / len;
+          const perpX = -dy / len;
+          const perpY = dx / len;
+          const anchorT = ((x - p0.x) * dx + (y - p0.y) * dy) / (len * len);
+          const anchorX = p0.x + dx * Math.max(0, Math.min(1, anchorT));
+          const anchorY = p0.y + dy * Math.max(0, Math.min(1, anchorT));
+          const stubDx = targetMeasurement.points[1].x - targetMeasurement.points[0].x;
+          const stubDy = targetMeasurement.points[1].y - targetMeasurement.points[0].y;
+          const stubLen = Math.max(1, Math.hypot(stubDx, stubDy));
+          const sign = stubDx * perpX + stubDy * perpY >= 0 ? 1 : -1;
+          {
+            const pts = [
+              { x: anchorX, y: anchorY },
+              { x: anchorX + perpX * stubLen * sign, y: anchorY + perpY * stubLen * sign },
+            ];
+            const val = calculateMeasurementValue(targetMeasurement.type as MeasurementTool, pts);
+            const now = Date.now();
+            lastDraggedPointRef.current = { id: targetMeasurement.id, pointIndex: 0, x: pts[0].x, y: pts[0].y, ts: now };
+            emitMeasurementUpdate(targetMeasurement.id, pts, val);
+            dragMovedRef.current = true;
+            lastDragTimestampRef.current = now;
+          }
+        } else {
+          const dx = x - dragged.startX;
+          const dy = y - dragged.startY;
+          {
+            const pts = targetMeasurement.points.map((p) => ({ x: p.x + dx, y: p.y + dy }));
+            const val = calculateMeasurementValue(targetMeasurement.type as MeasurementTool, pts);
+            const now = Date.now();
+            lastDraggedPointRef.current = { id: targetMeasurement.id, pointIndex: -1, x: pts[0].x, y: pts[0].y, ts: now };
+            emitMeasurementUpdate(targetMeasurement.id, pts, val);
+            lastDragTimestampRef.current = now;
+          }
+        }
+      }
+      return;
+    }
+
+    if (pendingLineDragRef.current) {
+      const drag = pendingLineDragRef.current;
+      const dx = x - drag.startX;
+      const dy = y - drag.startY;
+      if (Math.abs(dx) + Math.abs(dy) > 1) {
+        lineDragMovedRef.current = true;
+      }
+      if (lineDragMovedRef.current) {
+        {
+          const pts = drag.initialPoints.map((p) => ({ x: p.x + dx, y: p.y + dy }));
+          const targetMeasurement = measurementsRef.current.find((m) => m.id === drag.measurementId);
+          const val = targetMeasurement ? calculateMeasurementValue(targetMeasurement.type as MeasurementTool, pts) : undefined;
+          const now = Date.now();
+          const cx = pts.length ? ((pts[0].x ?? 0) + (pts[1]?.x ?? pts[0].x)) / 2 : pts[0]?.x ?? 0;
+          const cy = pts.length ? ((pts[0].y ?? 0) + (pts[1]?.y ?? pts[0].y)) / 2 : pts[0]?.y ?? 0;
+          lastDraggedPointRef.current = { id: drag.measurementId, pointIndex: -1, x: cx, y: cy, ts: now };
+          emitMeasurementUpdate(drag.measurementId, pts, val);
+          lastDragTimestampRef.current = now;
+        }
+      }
+      return;
+    }
 
     if (draggingPointRef.current) {
       const targetMeasurement = measurementsRef.current.find((m) => m.id === draggingPointRef.current!.measurementId);
@@ -1236,7 +1557,6 @@ export function Viewport({
           const perpY = len > 0 ? dx / len : 0;
 
           if (draggingPointRef.current.pointIndex === 0) {
-            // Drag anchor along the base line
             const t = len > 0 ? Math.max(0, Math.min(1, ((x - p0.x) * dx + (y - p0.y) * dy) / (len * len))) : 0;
             const anchorX = p0.x + t * dx;
             const anchorY = p0.y + t * dy;
@@ -1246,16 +1566,21 @@ export function Viewport({
             const stubLen = Math.hypot(stubDx, stubDy);
             const sign = stubDx * perpX + stubDy * perpY >= 0 ? 1 : -1;
 
-            onMeasurementUpdate?.(targetMeasurement.id, [
+            const pts = [
               { x: anchorX, y: anchorY },
               { x: anchorX + perpX * stubLen * sign, y: anchorY + perpY * stubLen * sign },
-            ]);
+            ];
+            const val = calculateMeasurementValue(targetMeasurement.type as MeasurementTool, pts);
+            const now = Date.now();
+            lastDraggedPointRef.current = { id: targetMeasurement.id, pointIndex: 0, x: pts[0].x, y: pts[0].y, ts: now };
+            emitMeasurementUpdate(targetMeasurement.id, pts, val);
+            dragMovedRef.current = true;
+            lastDragTimestampRef.current = now;
           } else {
-            // Drag tip along perpendicular axis from anchor
             const anchorX = targetMeasurement.points[0].x;
             const anchorY = targetMeasurement.points[0].y;
             const t = (x - anchorX) * perpX + (y - anchorY) * perpY;
-            onMeasurementUpdate?.(targetMeasurement.id, [
+            emitMeasurementUpdate(targetMeasurement.id, [
               { x: anchorX, y: anchorY },
               { x: anchorX + perpX * t, y: anchorY + perpY * t },
             ]);
@@ -1267,20 +1592,35 @@ export function Viewport({
       const updatedMeasurements = measurementsRef.current.map((m) => {
         if (m.id !== draggingPointRef.current!.measurementId) return m;
         const newPoints = [...m.points];
-        newPoints[draggingPointRef.current!.pointIndex] = { x, y };
+        newPoints[draggingPointRef.current!.pointIndex] = findSnapPoint(x, y, m.id);
         return { ...m, points: newPoints };
       });
       const updated = updatedMeasurements.find((m) => m.id === draggingPointRef.current!.measurementId);
       if (updated) {
-        onMeasurementUpdate?.(updated.id, updated.points);
+        {
+          const val = calculateMeasurementValue(updated.type as MeasurementTool, updated.points);
+          const now = Date.now();
+          const dpIndex = draggingPointRef.current!.pointIndex;
+          const moved = updated.points[dpIndex];
+          lastDraggedPointRef.current = { id: updated.id, pointIndex: dpIndex, x: moved.x, y: moved.y, ts: now };
+          emitMeasurementUpdate(updated.id, updated.points, val);
+          dragMovedRef.current = true;
+          lastDragTimestampRef.current = now;
+        }
       }
       return;
+    }
+
+    if (activeTool === 'none') {
+      const hovered = findNearbyLine(x, y);
+      setHoveredLineId(hovered?.id ?? null);
+    } else if (hoveredLineId) {
+      setHoveredLineId(null);
     }
 
     if (isAxial && isRotateMode && rotateDragRef.current.dragging) {
       moveRotateDrag(e.clientX, e.clientY);
     } else if (activeTool === 'pan' && isPanning && panStartRef.current) {
-      // Calculate image crop size
       const cropW = Math.max(1, Math.floor(sliceDimsRef.current.w / zoomScale));
       const cropH = Math.max(1, Math.floor(sliceDimsRef.current.h / zoomScale));
       const displayW = displaySize.width || sliceDimsRef.current.w;
@@ -1295,22 +1635,20 @@ export function Viewport({
       const newX = Math.max(0, Math.min(sliceDimsRef.current.w - cropW, panStartRef.current.startX - imageDx));
       const newY = Math.max(0, Math.min(sliceDimsRef.current.h - cropH, panStartRef.current.startY - imageDy));
 
-      // Immediate visual update via rAF draw
       if (panRafRef.current != null) cancelAnimationFrame(panRafRef.current);
       panRafRef.current = requestAnimationFrame(() => drawPanImmediate(newX, newY));
 
-      // Still update state for persistence and other effects
       panSrcRef.current = { x: newX, y: newY };
       setPanSrc({ x: newX, y: newY });
     } else if (isDrawing) {
       if (activeTool === 'distance' || activeTool === 'line') {
         if (drawingPoints.length > 0) {
-          setDrawingPoints([drawingPoints[0], { x, y }]);
+          setDrawingPoints([drawingPoints[0], snapped]);
         }
       } else if (activeTool === 'angle') {
         const pts = [...drawingPoints];
         if (pts.length > 0) {
-          pts[pts.length - 1] = { x, y };
+          pts[pts.length - 1] = snapped;
           setDrawingPoints(pts);
         }
       }
@@ -1325,8 +1663,46 @@ export function Viewport({
     const y = e.clientY - rect.top;
 
     if (draggingPointRef.current) {
+      const suppressed = dragMovedRef.current;
+      const dpBefore = draggingPointRef.current;
+      dragMovedRef.current = false;
+      if (suppressed) {
+        suppressClickRef.current = true;
+        console.debug('[mouseup] draggingPoint suppressed -> set suppressClick', { x, y, suppressed, dpBefore, lastDragTs: lastDragTimestampRef.current, now: Date.now() });
+      } else {
+        console.debug('[mouseup] draggingPoint', { x, y, suppressed, dpBefore, lastDragTs: lastDragTimestampRef.current, now: Date.now() });
+      }
       draggingPointRef.current = null;
       setDraggingPoint(null);
+      return;
+    }
+
+    if (draggingPerpendicularRef.current) {
+      const dp = draggingPerpendicularRef.current;
+      const suppressed = dragMovedRef.current;
+      dragMovedRef.current = false;
+      if (suppressed) {
+        suppressClickRef.current = true;
+        console.debug('[mouseup] draggingPerpendicular suppressed -> set suppressClick', { x, y, suppressed, dp, lastDragTs: lastDragTimestampRef.current, now: Date.now() });
+      } else {
+        console.debug('[mouseup] draggingPerpendicular', { x, y, suppressed, dp, lastDragTs: lastDragTimestampRef.current, now: Date.now() });
+      }
+      draggingPerpendicularRef.current = null;
+      return;
+    }
+
+    if (pendingLineDragRef.current) {
+      const pending = pendingLineDragRef.current;
+      const suppressed = dragMovedRef.current || lineDragMovedRef.current;
+      dragMovedRef.current = false;
+      if (suppressed) {
+        suppressClickRef.current = true;
+        console.debug('[mouseup] pendingLineDrag suppressed -> set suppressClick', { x, y, suppressed, pendingId: pending?.measurementId ?? null, lastDragTs: lastDragTimestampRef.current, now: Date.now() });
+      } else {
+        console.debug('[mouseup] pendingLineDrag', { x, y, suppressed, pendingId: pending?.measurementId ?? null, lastDragTs: lastDragTimestampRef.current, now: Date.now() });
+      }
+      pendingLineDragRef.current = null;
+      lineDragMovedRef.current = false;
       return;
     }
 
@@ -1339,40 +1715,157 @@ export function Viewport({
     }
   };
 
+  const handleMouseLeave = () => {
+    draggingPointRef.current = null;
+    setDraggingPoint(null);
+    draggingPerpendicularRef.current = null;
+    pendingLineDragRef.current = null;
+    lineDragMovedRef.current = false;
+    if (isPanning) {
+      setIsPanning(false);
+      panStartRef.current = null;
+    }
+    if (isAxial && isRotateMode && rotateDragRef.current.dragging) {
+      stopRotateDrag();
+    }
+  };
+
   const handleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const rect = overlayCanvasRef.current?.getBoundingClientRect();
     if (!rect) return;
 
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
+    if (suppressClickRef.current) {
+      // A drag just finished — suppress the synthetic click that follows.
+      suppressClickRef.current = false;
+      return;
+    }
+    // Also suppress clicks that occur very soon after a drag update (robust
+    // against mouseup firing outside the canvas). If a drag moved recently,
+    // ignore this click.
+    const now = Date.now();
+    if (now - lastDragTimestampRef.current < 350) {
+      return;
+    }
+    // Pointer-scoped hard guard: if the pointer that generated this click
+    // recently performed a drag, suppress the click to avoid races where
+    // the pointerup/click happens immediately after a drag and is meant to
+    // finalize it rather than create a new measurement. `lastPointerIdRef`
+    // is set on pointerdown and cleared when pointer lifecycle ends.
+    const pid = lastPointerIdRef.current;
+    if (pid != null) {
+      const pTs = recentPointerDragRef.current.get(pid) ?? 0;
+      if (pTs && (now - pTs) < 1000) {
+        console.debug('[suppress-click-due-to-pointer-drag]', { pointerId: pid, lastDragTs: pTs, now });
+        // consume this click and clear recent record for this pointer
+        recentPointerDragRef.current.delete(pid);
+        return;
+      }
+    }
+    // If the click is very close to the last point we dragged, treat it as
+    // the user finalizing that drag (not intent to create a perpendicular).
+    const lastDragged = lastDraggedPointRef.current;
+    if (lastDragged && now - lastDragged.ts < 700) {
+      const dxLast = x - lastDragged.x;
+      const dyLast = y - lastDragged.y;
+      const dist = Math.hypot(dxLast, dyLast);
+      if (dist <= 14) {
+        console.debug('[suppress-click-near-last-drag]', { click: { x, y }, lastDragged, dist, now });
+        lastDraggedPointRef.current = null;
+        // consume the click to avoid creating a new perpendicular.
+        return;
+      }
+    }
+    const snappedPoint = findSnapPoint(x, y);
 
-    if (activeTool === 'none' && selectedLineId) {
-      const baseLine = measurements.find(m => m.id === selectedLineId);
-      if (baseLine && baseLine.points.length >= 2) {
-        const p0 = baseLine.points[0];
-        const p1 = baseLine.points[1];
-        const midX = (p0.x + p1.x) / 2;
-        const midY = (p0.y + p1.y) / 2;
-        if (x >= midX - 12 && x <= midX + 12 && y >= midY - 12 && y <= midY + 12) {
-          const dx = p1.x - p0.x;
-          const dy = p1.y - p0.y;
-          const len = Math.hypot(dx, dy);
-          const perpX = len > 0 ? -dy / len : 0;
-          const perpY = len > 0 ? dx / len : 0;
-          const stubLen = 40;
-          onMeasurementAdd({
-            id: Date.now().toString(),
-            type: 'perpendicular',
-            points: [
-              { x: midX, y: midY },
-              { x: midX + perpX * stubLen, y: midY + perpY * stubLen },
-            ],
-            slice: currentSlice,
-            plane: measurementPlane,
-            baseLineId: selectedLineId,
-          });
-          setSelectedLineId(null);
-          return;
+    if (lineDragMovedRef.current) {
+      lineDragMovedRef.current = false;
+      return;
+    }
+
+    // Allow creating a perpendicular either by using the select tool (none)
+    // when clicking the midpoint, or by using the perpendicular tool and
+    // clicking near a line. This makes the behavior more discoverable and
+    // robust across tool states.
+    if ((activeTool === 'none' || activeTool === 'perpendicular')) {
+      // Prefer hovered/selected line, otherwise try to find a nearby line when
+      // the explicit perpendicular tool is selected.
+      let targetLineId: string | null = hoveredLineId ?? selectedLineId ?? null;
+      if (!targetLineId && activeTool === 'perpendicular') {
+        const nearby = findNearbyLine(x, y);
+        targetLineId = nearby?.id ?? null;
+      }
+
+      if (targetLineId) {
+        const baseLine = measurements.find((m) => m.id === targetLineId);
+        if (baseLine && baseLine.points.length >= 2) {
+          const p0 = baseLine.points[0];
+          const p1 = baseLine.points[1];
+          const midX = (p0.x + p1.x) / 2;
+          const midY = (p0.y + p1.y) / 2;
+          // If using select mode require a click near the midpoint for
+          // unambiguous intent — but also accept clicks anywhere on a
+          // hovered or selected line so users can quickly add additional
+          // perpendiculars by clicking the already-selected line.
+          // Only accept when explicitly in `perpendicular` tool, when the
+          // click is near the midpoint (unambiguous intent), or when the
+          // line is actively hovered. Do NOT accept solely because the
+          // line is selected — selection is a passive state and leads to
+          // accidental perpendicular creation during drag/selection flows.
+          const accept = activeTool === 'perpendicular'
+            ? true
+            : (x >= midX - 12 && x <= midX + 12 && y >= midY - 12 && y <= midY + 12)
+              || hoveredLineId === targetLineId;
+          
+          // Defensive guard: if the same baseline was just dragged/updated
+          // recently, suppress perpendicular creation to avoid the mouseup
+          // / click being interpreted as intent to add a perpendicular.
+          const nowGuard = Date.now();
+          const lastDragged = lastDraggedPointRef.current;
+          const lastBaselineTs = lastBaselineUpdateRef.current.get(targetLineId) ?? 0;
+          if (accept && lastBaselineTs && (nowGuard - lastBaselineTs) < 900) {
+            console.debug('[suppress-creation-due-to-recent-baseline-update-map]', { targetLineId, lastBaselineTs, now: nowGuard });
+            return;
+          }
+          if (accept && lastDragged && lastDragged.id === targetLineId && (nowGuard - lastDragged.ts) < 900) {
+            console.debug('[suppress-creation-due-to-recent-baseline-drag]', { targetLineId, lastDragged, now: nowGuard });
+            return;
+          }
+          if (accept) {
+            console.debug('[creating-perpendicular]', {
+              targetLineId,
+              hoveredLineId,
+              selectedLineId,
+              midX,
+              midY,
+              accept,
+              now: Date.now(),
+              lastDragDeltaMs: Date.now() - lastDragTimestampRef.current,
+              suppressClick: suppressClickRef.current,
+              draggingPointRef: draggingPointRef.current,
+            });
+            const dx = p1.x - p0.x;
+            const dy = p1.y - p0.y;
+            const len = Math.hypot(dx, dy);
+            const perpX = len > 0 ? -dy / len : 0;
+            const perpY = len > 0 ? dx / len : 0;
+            const stubLen = 40;
+            emitMeasurementAdd({
+              id: Date.now().toString(),
+              type: 'perpendicular',
+              points: [
+                { x: midX, y: midY },
+                { x: midX + perpX * stubLen, y: midY + perpY * stubLen },
+              ],
+              slice: currentSlice,
+              plane: measurementPlane,
+              baseLineId: targetLineId,
+              groupId: baseLine.groupId,
+              propagateAcrossSlices: true,
+            });
+            return;
+          }
         }
       }
     }
@@ -1380,31 +1873,47 @@ export function Viewport({
     if (activeTool === 'distance' || activeTool === 'line') {
       if (!isDrawing) {
         setIsDrawing(true);
-        setDrawingPoints([{ x, y }]);
+        // Snap the first anchor when it lands on an existing endpoint so
+        // chaining lines from endpoints works naturally.
+        setDrawingPoints([snappedPoint]);
       } else {
-        const points = [...drawingPoints, { x, y }];
+        const points = [...drawingPoints, snappedPoint];
         const value = calculateMeasurementValue('distance', points);
-        onMeasurementAdd({
+        // clear drawing state immediately to avoid rendering a transient
+        // stray point while we commit the new measurement
+        setIsDrawing(false);
+        setDrawingPoints([]);
+        const newMeasurement = {
           id: Date.now().toString(),
           type: activeTool,
           points,
           slice: currentSlice,
           plane: measurementPlane,
           value,
-        });
-        setIsDrawing(false);
-        setDrawingPoints([]);
+        } as Measurement;
+        emitMeasurementAdd(newMeasurement);
+        // select the newly created measurement so immediate drags hit it
+        setSelectedLineId(newMeasurement.id);
+        onMeasurementSelect?.(newMeasurement.id);
       }
+    } else if (activeTool === 'point') {
+      emitMeasurementAdd({
+        id: Date.now().toString(),
+        type: 'point',
+        points: [snappedPoint],
+        slice: currentSlice,
+        plane: measurementPlane,
+      });
     } else if (activeTool === 'angle') {
       if (!isDrawing) {
         setIsDrawing(true);
-        setDrawingPoints([{ x, y }]);
+        setDrawingPoints([snappedPoint]);
       } else if (drawingPoints.length === 1) {
-        setDrawingPoints(prev => [...prev, { x, y }]);
+        setDrawingPoints(prev => [...prev, snappedPoint]);
       } else if (drawingPoints.length === 2) {
-        const points = [...drawingPoints, { x, y }];
+        const points = [...drawingPoints, snappedPoint];
         const value = calculateMeasurementValue('angle', points);
-        onMeasurementAdd({
+        emitMeasurementAdd({
           id: Date.now().toString(),
           type: 'angle',
           points,
@@ -1421,7 +1930,7 @@ export function Viewport({
       
       if (dist < 10 && drawingPoints.length > 2) {
         // Close the curve
-        onMeasurementAdd({
+        emitMeasurementAdd({
           id: Date.now().toString(),
           type: 'closedCurve',
           points: drawingPoints,
@@ -1464,7 +1973,6 @@ export function Viewport({
   const dims = header.dims;
   const maxSlice = plane === 'axial' ? dims[3] : plane === 'sagittal' ? dims[1] : dims[2];
 
-  // Ensure we have sensible display sizes so the wrapper takes space in the layout
   const { width: imgW, height: imgH } = getSliceData();
   const displayW = displaySize.width || imgW;
   const displayH = displaySize.height || imgH;
@@ -1759,10 +2267,110 @@ export function Viewport({
                           ? (isPanning ? 'grabbing' : 'grab')
                           : 'crosshair',
                 }}
-                onMouseDown={handleMouseDown}
-                onMouseMove={handleMouseMove}
-                onMouseUp={handleMouseUp}
-                onClick={handleClick}
+                onPointerDown={(e) => {
+                  overlayCanvasRef.current?.setPointerCapture(e.pointerId);
+                  lastPointerIdRef.current = e.pointerId;
+                  pointerActionRef.current.set(e.pointerId, { last: 'down', ts: Date.now() });
+                  console.debug('[pointerdown]', {
+                    id: e.pointerId,
+                    x: e.clientX,
+                    y: e.clientY,
+                    button: e.button,
+                    hoveredLineId,
+                    selectedLineId,
+                    draggingPointRef: draggingPointRef.current,
+                    pendingLineDragId: pendingLineDragRef.current?.measurementId ?? null,
+                    draggingPerpendicularId: draggingPerpendicularRef.current?.measurementId ?? null,
+                    suppressClick: suppressClickRef.current,
+                    dragMoved: dragMovedRef.current,
+                    lineDragMoved: lineDragMovedRef.current,
+                    lastDragTs: lastDragTimestampRef.current,
+                  });
+                  handleMouseDown(e as any as React.MouseEvent<HTMLCanvasElement>);
+                }}
+                onPointerMove={(e) => {
+                  // track drag activity per-pointer: if user is currently
+                  // dragging a point/line/perpendicular, mark this pointer as
+                  // having performed a drag.
+                  const isDragging = !!(draggingPointRef.current || pendingLineDragRef.current || draggingPerpendicularRef.current || dragMovedRef.current || lineDragMovedRef.current);
+                  if (isDragging) {
+                    pointerActionRef.current.set(e.pointerId, { last: 'drag', ts: Date.now() });
+                  } else {
+                    pointerActionRef.current.set(e.pointerId, { last: 'move', ts: Date.now() });
+                  }
+                  console.debug('[pointermove]', {
+                    id: e.pointerId,
+                    x: e.clientX,
+                    y: e.clientY,
+                    hoveredLineId,
+                    selectedLineId,
+                    draggingPointRef: draggingPointRef.current,
+                    pendingLineDragId: pendingLineDragRef.current?.measurementId ?? null,
+                    draggingPerpendicularId: draggingPerpendicularRef.current?.measurementId ?? null,
+                    suppressClick: suppressClickRef.current,
+                    dragMoved: dragMovedRef.current,
+                    lineDragMoved: lineDragMovedRef.current,
+                    lastDragTs: lastDragTimestampRef.current,
+                  });
+                  handleMouseMove(e as any as React.MouseEvent<HTMLCanvasElement>);
+                }}
+                onPointerUp={(e) => {
+                  try { overlayCanvasRef.current?.releasePointerCapture(e.pointerId); } catch (_) {}
+                  // if this pointer recently performed a drag, record it so
+                  // click handling can suppress events tied to this pointer.
+                  const pa = pointerActionRef.current.get(e.pointerId);
+                  if (pa && pa.last === 'drag') {
+                    recentPointerDragRef.current.set(e.pointerId, Date.now());
+                  }
+                  pointerActionRef.current.set(e.pointerId, { last: 'up', ts: Date.now() });
+                  console.debug('[pointerup]', {
+                    id: e.pointerId,
+                    x: e.clientX,
+                    y: e.clientY,
+                    hoveredLineId,
+                    selectedLineId,
+                    draggingPointRef: draggingPointRef.current,
+                    pendingLineDragId: pendingLineDragRef.current?.measurementId ?? null,
+                    draggingPerpendicularId: draggingPerpendicularRef.current?.measurementId ?? null,
+                    suppressClick: suppressClickRef.current,
+                    dragMoved: dragMovedRef.current,
+                    lineDragMoved: lineDragMovedRef.current,
+                    lastDragTs: lastDragTimestampRef.current,
+                  });
+                  handleMouseUp(e as any as React.MouseEvent<HTMLCanvasElement>);
+                }}
+                onPointerLeave={(e) => {
+                  console.debug('[pointerleave]', {
+                    id: e.pointerId,
+                    hoveredLineId,
+                    selectedLineId,
+                    draggingPointRef: draggingPointRef.current,
+                    pendingLineDragId: pendingLineDragRef.current?.measurementId ?? null,
+                    draggingPerpendicularId: draggingPerpendicularRef.current?.measurementId ?? null,
+                    suppressClick: suppressClickRef.current,
+                    dragMoved: dragMovedRef.current,
+                    lineDragMoved: lineDragMovedRef.current,
+                    lastDragTs: lastDragTimestampRef.current,
+                  });
+                  handleMouseLeave();
+                }}
+                onClick={(e) => {
+                  console.debug('[click]', {
+                    x: (e as any).clientX,
+                    y: (e as any).clientY,
+                    hoveredLineId,
+                    selectedLineId,
+                    draggingPointRef: draggingPointRef.current,
+                    pendingLineDragId: pendingLineDragRef.current?.measurementId ?? null,
+                    draggingPerpendicularId: draggingPerpendicularRef.current?.measurementId ?? null,
+                    suppressClick: suppressClickRef.current,
+                    dragMoved: dragMovedRef.current,
+                    lineDragMoved: lineDragMovedRef.current,
+                    lastDragTs: lastDragTimestampRef.current,
+                    now: Date.now(),
+                  });
+                  handleClick(e as any as React.MouseEvent<HTMLCanvasElement>);
+                }}
                 onWheel={handleWheel}
                 onContextMenu={(ev) => ev.preventDefault()}
               />
