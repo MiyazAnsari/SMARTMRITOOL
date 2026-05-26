@@ -97,6 +97,9 @@ export interface WindowLevel {
   level: number;
 }
 
+/** Allows dynamic scaling during resize to avoid stale closures */
+export type PointUpdater = { x: number; y: number }[] | ((prev: { x: number; y: number }[]) => { x: number; y: number }[]);
+
 /** Default W/L for normalized 0–255 NIfTI display (per-viewport state lives in `Viewport`). */
 const NIFTI_DEFAULT_WINDOW_LEVEL: WindowLevel = { window: 255, level: 128 };
 
@@ -808,40 +811,36 @@ export function MedicalImageViewer({
   );
 
   const handleMeasurementUpdate = useCallback(
-    (id: string, newPoints: { x: number; y: number }[], newValue?: string) => {
-      const target = measurements.find((m) => m.id === id);
-      const matchedStep = protocol && target
-        ? protocol.steps.find(
-            (step) =>
-              target.workflowStepId === step.id ||
-              (target.label === step.label && measurementMatchesPrimitive(target, step.primitive)),
-          )
-        : null;
-      const lengthValue =
-        newValue ??
-        (newPoints.length >= 2
-          ? `${Math.hypot(newPoints[1].x - newPoints[0].x, newPoints[1].y - newPoints[0].y).toFixed(2)} px`
-          : undefined);
+    (id: string, newPoints: PointUpdater, newValue?: string) => {
+      const lengthValue = newValue;
 
       if (sessionMeasurementMode && onUpdateSessionAnnotation) {
-        const parsed = lengthValue ? splitValueUnits(lengthValue) : null;
-        onUpdateSessionAnnotation(id, (row: SessionAnnotationRow) => ({
-          ...row,
-          points: newPoints.map((p) => ({ x: p.x, y: p.y })),
-          value: parsed ? parsed.value : row.value,
-          units: parsed ? parsed.units : row.units,
-          timestamp: new Date().toISOString(),
-        }));
+        const parsed = lengthValue !== undefined ? splitValueUnits(lengthValue) : null;
+        
+        let resolvedPointsForWorkflow: { x: number; y: number }[] = [];
+
+        onUpdateSessionAnnotation(id, (row: SessionAnnotationRow) => {
+          const resolved = typeof newPoints === 'function' ? newPoints(row.points) : newPoints;
+          resolvedPointsForWorkflow = resolved;
+          return {
+            ...row,
+            points: resolved.map((p) => ({ x: p.x, y: p.y })),
+            value: parsed ? parsed.value : row.value,
+            units: parsed ? parsed.units : row.units,
+            timestamp: new Date().toISOString(),
+          };
+        });
+
+        const target = measurements.find((m) => m.id === id);
+        const matchedStep = protocol && target ? protocol.steps.find((step) => target.workflowStepId === step.id || (target.label === step.label && measurementMatchesPrimitive(target, step.primitive))) : null;
 
         if (protocol && matchedStep && target) {
+          const resolvedFallback = typeof newPoints === 'function' ? newPoints(target.points) : newPoints;
           const recordedPoints =
-            matchedStep.primitive === 'point' && target.type === 'perpendicular' && newPoints.length >= 2
-              ? [newPoints[1]]
-              : newPoints;
-          // Update the matched step's result in-place. Do NOT call
-          // recordStepResult here — that function advances activeStepIndex,
-          // which would skip the next unanswered step whenever the user adjusts
-          // a measurement belonging to an already-completed step.
+            matchedStep.primitive === 'point' && target.type === 'perpendicular' && resolvedFallback.length >= 2
+              ? [resolvedFallback[1]]
+              : resolvedFallback;
+          
           setWorkflow((prev) => ({
             ...prev,
             stepResults: {
@@ -860,13 +859,12 @@ export function MedicalImageViewer({
       const updater = (prev: Measurement[]) => {
         const updated = prev.map((m) => {
           if (m.id !== id) return m;
+          const resolvedPoints = typeof newPoints === 'function' ? newPoints(m.points) : newPoints;
           return {
             ...m,
-            points: newPoints,
-            value:
-              (m.type === 'distance' || m.type === 'line' || m.type === 'perpendicular')
-                ? lengthValue ?? m.value
-                : m.value,
+            points: resolvedPoints,
+            // Fallback generically to old m.value if we don't have a new explicit text value
+            value: lengthValue !== undefined ? lengthValue : m.value,
           };
         });
 
@@ -920,21 +918,24 @@ export function MedicalImageViewer({
           };
         });
       };
+
       if (archiveMeasurementMode && onPatientMeasurementsUpdate) {
         onPatientMeasurementsUpdate(updater);
       } else {
         setLocalMeasurements(updater);
       }
 
+      // Update matched protocol step if active
+      const target = measurements.find((m) => m.id === id);
+      const matchedStep = protocol && target ? protocol.steps.find((step) => target.workflowStepId === step.id || (target.label === step.label && measurementMatchesPrimitive(target, step.primitive))) : null;
+
       if (protocol && matchedStep && target) {
+        const resolvedFallback = typeof newPoints === 'function' ? newPoints(target.points) : newPoints;
         const recordedPoints =
-          matchedStep.primitive === 'point' && target.type === 'perpendicular' && newPoints.length >= 2
-            ? [newPoints[1]]
-            : newPoints;
-        // Update the matched step's result in-place. Do NOT call
-        // recordStepResult here — that function advances activeStepIndex,
-        // which would skip the next unanswered step whenever the user adjusts
-        // a measurement belonging to an already-completed step.
+          matchedStep.primitive === 'point' && target.type === 'perpendicular' && resolvedFallback.length >= 2
+            ? [resolvedFallback[1]]
+            : resolvedFallback;
+            
         setWorkflow((prev) => ({
           ...prev,
           stepResults: {

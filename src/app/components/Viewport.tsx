@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
-import type { WindowLevel, MeasurementTool, Measurement } from './MedicalImageViewer';
+import type { WindowLevel, MeasurementTool, Measurement, PointUpdater } from './MedicalImageViewer';
 import { Slider } from './ui/slider';
 
 function sanitizeWindowLevel(windowVal: number, levelVal: number, fallback: WindowLevel): WindowLevel {
@@ -12,6 +12,14 @@ const VIEWPORT_ZOOM_MIN = 1;
 const VIEWPORT_ZOOM_MAX = 20;
 const VIEWPORT_ZOOM_STEP = 1.18;
 const VIEWPORT_ZOOM_ANIM_MS = 140;
+
+// Slider ranges for per-viewport window/level controls.
+// Values are in the 8-bit normalised intensity space (0–255) with generous
+// headroom so edge cases (very bright/dark images) remain adjustable.
+const WL_MIN_CENTER = -128;
+const WL_MAX_CENTER = 384;
+const WL_MIN_WIDTH = 1;
+const WL_MAX_WIDTH = 512;
 
 interface ViewportProps {
   imageData: Uint8Array;
@@ -28,7 +36,7 @@ interface ViewportProps {
   activeTool: MeasurementTool;
   measurements: Measurement[];
   onMeasurementAdd: (measurement: Measurement) => void;
-  onMeasurementUpdate?: (id: string, newPoints: { x: number; y: number }[], value?: string) => void;
+  onMeasurementUpdate?: (id: string, newPoints: PointUpdater, value?: string) => void;
   selectedMeasurementId?: string | null;
   onMeasurementSelect?: (id: string | null) => void;
   applyWeighting: (pixelValue: number) => number;
@@ -138,9 +146,6 @@ export function Viewport({
   }, [measurements]);
 
   // Force an explicit overlay redraw when the active slice or plane changes.
-  // Some viewers reported annotations not appearing immediately after a
-  // programmatic slice change; bumping `overlayTick` guarantees the overlay
-  // drawing effect runs synchronously with the change.
   useEffect(() => {
     setOverlayTick((t) => t + 1);
   }, [currentSlice, measurementPlane]);
@@ -406,37 +411,36 @@ export function Viewport({
     };
   }, [getPlaneGeometry]);
 
-  const emitMeasurementAdd = useCallback((m: Measurement) => {
-    console.debug('[measurement:add]', { id: m.id, type: m.type, slice: m.slice, points: m.points });
-    onMeasurementAdd(m);
-    // record creation time for this measurement id (useful for debounce guards)
-    try {
-      lastBaselineUpdateRef.current.set(m.id, Date.now());
-    } catch {}
-  }, [onMeasurementAdd]);
-
-  const emitMeasurementUpdate = useCallback((id: string, newPoints: { x: number; y: number }[], value?: string) => {
-    console.debug('[measurement:update]', { id, points: newPoints, value });
+  const emitMeasurementUpdate = useCallback((id: string, newPoints: PointUpdater, value?: string) => {
     onMeasurementUpdate?.(id, newPoints, value);
     try {
       lastBaselineUpdateRef.current.set(id, Date.now());
     } catch {}
   }, [onMeasurementUpdate]);
 
-  // When display size changes (e.g. window or panel resize) scale stored
-  // measurement points so annotations remain aligned with the image.
+  const emitMeasurementAdd = useCallback((m: Measurement) => {
+    onMeasurementAdd(m);
+    try {
+      lastBaselineUpdateRef.current.set(m.id, Date.now());
+    } catch {}
+  }, [onMeasurementAdd]);
+
   const prevDisplaySizeRef = useRef<{ width: number; height: number } | null>(null);
   useEffect(() => {
     const prev = prevDisplaySizeRef.current;
     const cur = displaySize;
-    // initialize previous size on first run
-    if (!prev) {
+
+    if (!prev || prev.width === 0 || prev.height === 0) {
       prevDisplaySizeRef.current = cur;
       return;
     }
+    
+    if (cur.width === 0 || cur.height === 0) {
+        return;
+    }
+
     if (prev.width === cur.width && prev.height === cur.height) return;
 
-    // Avoid scaling while user is interacting
     if (
       draggingPointRef.current ||
       pendingLineDragRef.current ||
@@ -453,16 +457,37 @@ export function Viewport({
       return;
     }
 
-    const scaleX = cur.width / Math.max(1, prev.width);
-    const scaleY = cur.height / Math.max(1, prev.height);
+    // Compute the image draw area (size + centering offset) for a given display
+    // size.  Measurements are stored in display-canvas CSS-pixel coordinates,
+    // but the image is centered inside the canvas, so a naive display-ratio
+    // scale corrupts positions when the aspect ratio changes.  We map each
+    // point through image-fraction space instead:
+    //   canvas px  →  fraction of draw area  →  new canvas px
+    const { width: imgW, height: imgH, spacingX, spacingY } = getPlaneGeometry();
+    const physicalW = Math.max(1, imgW * spacingX);
+    const physicalH = Math.max(1, imgH * spacingY);
+
+    const drawArea = (dW: number, dH: number) => {
+      const scale = Math.min(dW / physicalW, dH / physicalH);
+      const drawW = Math.max(1, Math.round(physicalW * scale));
+      const drawH = Math.max(1, Math.round(physicalH * scale));
+      return { drawW, drawH, offsetX: (dW - drawW) / 2, offsetY: (dH - drawH) / 2 };
+    };
+
+    const oldArea = drawArea(prev.width, prev.height);
+    const newArea = drawArea(cur.width, cur.height);
 
     for (const m of measurements) {
-      const newPoints = m.points.map((p) => ({ x: p.x * scaleX, y: p.y * scaleY }));
-      emitMeasurementUpdate(m.id, newPoints);
+      emitMeasurementUpdate(m.id, (oldPoints) =>
+        oldPoints.map((p) => ({
+          x: ((p.x - oldArea.offsetX) / oldArea.drawW) * newArea.drawW + newArea.offsetX,
+          y: ((p.y - oldArea.offsetY) / oldArea.drawH) * newArea.drawH + newArea.offsetY,
+        })),
+      );
     }
 
     prevDisplaySizeRef.current = cur;
-  }, [displaySize, measurements, onMeasurementUpdate, isPanning, isDrawing]);
+  }, [displaySize, measurements, onMeasurementUpdate, isPanning, isDrawing, emitMeasurementUpdate, getPlaneGeometry]);
 
   // New volume buffer → reset this viewer’s W/L and brightness only (no cross-viewport state).
   const prevImageDataRef = useRef<Uint8Array | null>(null);
@@ -2277,104 +2302,30 @@ export function Viewport({
                   overlayCanvasRef.current?.setPointerCapture(e.pointerId);
                   lastPointerIdRef.current = e.pointerId;
                   pointerActionRef.current.set(e.pointerId, { last: 'down', ts: Date.now() });
-                  console.debug('[pointerdown]', {
-                    id: e.pointerId,
-                    x: e.clientX,
-                    y: e.clientY,
-                    button: e.button,
-                    hoveredLineId,
-                    selectedLineId,
-                    draggingPointRef: draggingPointRef.current,
-                    pendingLineDragId: pendingLineDragRef.current?.measurementId ?? null,
-                    draggingPerpendicularId: draggingPerpendicularRef.current?.measurementId ?? null,
-                    suppressClick: suppressClickRef.current,
-                    dragMoved: dragMovedRef.current,
-                    lineDragMoved: lineDragMovedRef.current,
-                    lastDragTs: lastDragTimestampRef.current,
-                  });
                   handleMouseDown(e as any as React.MouseEvent<HTMLCanvasElement>);
                 }}
                 onPointerMove={(e) => {
-                  // track drag activity per-pointer: if user is currently
-                  // dragging a point/line/perpendicular, mark this pointer as
-                  // having performed a drag.
                   const isDragging = !!(draggingPointRef.current || pendingLineDragRef.current || draggingPerpendicularRef.current || dragMovedRef.current || lineDragMovedRef.current);
                   if (isDragging) {
                     pointerActionRef.current.set(e.pointerId, { last: 'drag', ts: Date.now() });
                   } else {
                     pointerActionRef.current.set(e.pointerId, { last: 'move', ts: Date.now() });
                   }
-                  console.debug('[pointermove]', {
-                    id: e.pointerId,
-                    x: e.clientX,
-                    y: e.clientY,
-                    hoveredLineId,
-                    selectedLineId,
-                    draggingPointRef: draggingPointRef.current,
-                    pendingLineDragId: pendingLineDragRef.current?.measurementId ?? null,
-                    draggingPerpendicularId: draggingPerpendicularRef.current?.measurementId ?? null,
-                    suppressClick: suppressClickRef.current,
-                    dragMoved: dragMovedRef.current,
-                    lineDragMoved: lineDragMovedRef.current,
-                    lastDragTs: lastDragTimestampRef.current,
-                  });
                   handleMouseMove(e as any as React.MouseEvent<HTMLCanvasElement>);
                 }}
                 onPointerUp={(e) => {
                   try { overlayCanvasRef.current?.releasePointerCapture(e.pointerId); } catch (_) {}
-                  // if this pointer recently performed a drag, record it so
-                  // click handling can suppress events tied to this pointer.
                   const pa = pointerActionRef.current.get(e.pointerId);
                   if (pa && pa.last === 'drag') {
                     recentPointerDragRef.current.set(e.pointerId, Date.now());
                   }
                   pointerActionRef.current.set(e.pointerId, { last: 'up', ts: Date.now() });
-                  console.debug('[pointerup]', {
-                    id: e.pointerId,
-                    x: e.clientX,
-                    y: e.clientY,
-                    hoveredLineId,
-                    selectedLineId,
-                    draggingPointRef: draggingPointRef.current,
-                    pendingLineDragId: pendingLineDragRef.current?.measurementId ?? null,
-                    draggingPerpendicularId: draggingPerpendicularRef.current?.measurementId ?? null,
-                    suppressClick: suppressClickRef.current,
-                    dragMoved: dragMovedRef.current,
-                    lineDragMoved: lineDragMovedRef.current,
-                    lastDragTs: lastDragTimestampRef.current,
-                  });
                   handleMouseUp(e as any as React.MouseEvent<HTMLCanvasElement>);
                 }}
                 onPointerLeave={(e) => {
-                  console.debug('[pointerleave]', {
-                    id: e.pointerId,
-                    hoveredLineId,
-                    selectedLineId,
-                    draggingPointRef: draggingPointRef.current,
-                    pendingLineDragId: pendingLineDragRef.current?.measurementId ?? null,
-                    draggingPerpendicularId: draggingPerpendicularRef.current?.measurementId ?? null,
-                    suppressClick: suppressClickRef.current,
-                    dragMoved: dragMovedRef.current,
-                    lineDragMoved: lineDragMovedRef.current,
-                    lastDragTs: lastDragTimestampRef.current,
-                  });
                   handleMouseLeave();
                 }}
                 onClick={(e) => {
-                  console.debug('[click]', {
-                    x: (e as any).clientX,
-                    y: (e as any).clientY,
-                    hoveredLineId,
-                    selectedLineId,
-                    draggingPointRef: draggingPointRef.current,
-                    pendingLineDragId: pendingLineDragRef.current?.measurementId ?? null,
-                    draggingPerpendicularId: draggingPerpendicularRef.current?.measurementId ?? null,
-                    suppressClick: suppressClickRef.current,
-                    dragMoved: dragMovedRef.current,
-                    lineDragMoved: lineDragMovedRef.current,
-                    lastDragTs: lastDragTimestampRef.current,
-                    now: Date.now(),
-                  });
                   handleClick(e as any as React.MouseEvent<HTMLCanvasElement>);
                 }}
                 onWheel={handleWheel}
