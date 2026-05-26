@@ -35,7 +35,17 @@ function normalizeMeasurement(raw: Partial<Measurement> & { id: string }): Measu
     points: Array.isArray(raw.points) ? raw.points : [],
     slice: typeof raw.slice === 'number' ? raw.slice : 0,
     plane: (raw.plane as Measurement['plane']) ?? 'axial',
+    patientId: raw.patientId,
+    patientName: raw.patientName,
+    studyName: raw.studyName,
+    sequenceName: raw.sequenceName,
+    laterality: raw.laterality,
     value: raw.value,
+    baseLineId: raw.baseLineId,
+    groupId: raw.groupId,
+    label: raw.label,
+    workflowStepId: raw.workflowStepId,
+    propagateAcrossSlices: raw.propagateAcrossSlices,
     timestamp:
       typeof raw.timestamp === 'string' && raw.timestamp.length > 0 ? raw.timestamp : undefined,
   };

@@ -29,6 +29,7 @@ import {
 import {
   getProtocol,
   Primitive,
+  type WorkflowTool,
 } from './measurement/MeasurementProtocols';
 import type { SessionAnnotator, SessionAnnotationRow } from '../lib/sessionAnnotationCsv';
 import { splitValueUnits } from '../lib/sessionAnnotationCsv';
@@ -105,6 +106,11 @@ export interface Measurement {
   points: { x: number; y: number }[];
   slice: number;
   plane: 'axial' | 'sagittal' | 'coronal';
+  patientId?: string;
+  patientName?: string;
+  studyName?: string;
+  sequenceName?: string;
+  laterality?: 'left' | 'right';
   value?: string;
   /** ISO-8601 when captured; set automatically on add for persisted patients. */
   timestamp?: string;
@@ -131,17 +137,25 @@ interface MedicalImageViewerExtras {
   sessionAnnotator?: SessionAnnotator | null;
   onCommitSessionAnnotation?: (row: SessionAnnotationRow) => void;
   onDeleteSessionAnnotation?: (annotationId: string) => void;
+  onUpdateSessionAnnotation?: (
+    annotationId: string,
+    updater: (row: SessionAnnotationRow) => SessionAnnotationRow,
+  ) => void;
+  selectedMeasurementId?: string | null;
+  onMeasurementSelect?: (id: string | null) => void;
   /** Notify parent when the current protocol group id changes (or null). */
   onCurrentGroupChange?: (groupId: string | null) => void;
 }
 
-/** Map a protocol primitive to one of the existing viewport tools. */
-function primitiveToTool(p: Primitive): MeasurementTool {
-  switch (p) {
+/** Map a workflow step tool to one of the existing viewport tools. */
+function workflowToolToMeasurementTool(tool: WorkflowTool): MeasurementTool {
+  switch (tool) {
     case 'line':
       return 'line';
     case 'angle':
       return 'angle';
+    case 'none':
+      return 'none';
     case 'point':
       return 'none';
     case 'distance':
@@ -176,8 +190,10 @@ function buildSessionAnnotationRow(
     // `Select` button can directly select the corresponding measurement in
     // the viewport (keeps ids aligned between UI and viewport state).
     annotationId: m.id,
-    patientId: studyData.patientId || 'unknown',
-    sequenceName,
+    patientId: m.patientId || studyData.patientId || 'unknown',
+    patientName: m.patientName || studyData.patientName || undefined,
+    studyName: m.studyName || studyData.studyName || undefined,
+    sequenceName: m.sequenceName || sequenceName,
     plane: m.plane,
     measurementType: m.type,
     baseLineId: m.baseLineId,
@@ -251,7 +267,7 @@ export function MedicalImageViewer({
   const activeStep = protocol?.steps[workflow.activeStepIndex] ?? null;
   // When a workflow step is active, override the user-selected tool so the
   // correct primitive is always armed unless the user manually picks another tool.
-  const effectiveTool: MeasurementTool = userToolOverride ?? (activeStep ? primitiveToTool(activeStep.primitive) : activeTool);
+  const effectiveTool: MeasurementTool = userToolOverride ?? (activeStep ? workflowToolToMeasurementTool(activeStep.tool) : activeTool);
 
   const [currentGroupId, setCurrentGroupId] = useState<string | null>(null);
   const currentGroupIdRef = useRef<string | null>(null);
@@ -275,6 +291,11 @@ export function MedicalImageViewer({
   useEffect(() => {
     if (workflow.protocolId) setUserToolOverride(null);
   }, [workflow.protocolId]);
+
+  useEffect(() => {
+    if (!activeStep) return;
+    setUserToolOverride(null);
+  }, [activeStep?.id]);
 
   useEffect(() => {
     const previous = previousMeasurementsRef.current;
@@ -377,11 +398,6 @@ export function MedicalImageViewer({
       };
     });
   }, [measurements, protocol]);
-
-  useEffect(() => {
-    if (!selectedMeasurementId) return;
-    selectTool('none');
-  }, [selectedMeasurementId]);
 
   const onMeasurementSelectRef = useRef(onMeasurementSelect);
   useEffect(() => {
@@ -731,6 +747,13 @@ export function MedicalImageViewer({
       }
       const groupedMeasurement = {
         ...stamped,
+        patientId: stamped.patientId ?? studyData?.patientId ?? undefined,
+        patientName: stamped.patientName ?? studyData?.patientName ?? undefined,
+        studyName: stamped.studyName ?? studyData?.studyName ?? undefined,
+        sequenceName:
+          stamped.sequenceName ??
+          (studyData?.volumes[stamped.plane]?.seriesDescription?.trim() || stamped.plane),
+        laterality: stamped.laterality ?? studyData?.laterality ?? undefined,
         groupId: currentGroupIdRef.current ?? undefined,
         label,
         workflowStepId:
@@ -802,7 +825,7 @@ export function MedicalImageViewer({
 
       if (sessionMeasurementMode && onUpdateSessionAnnotation) {
         const parsed = lengthValue ? splitValueUnits(lengthValue) : null;
-        onUpdateSessionAnnotation(id, (row) => ({
+        onUpdateSessionAnnotation(id, (row: SessionAnnotationRow) => ({
           ...row,
           points: newPoints.map((p) => ({ x: p.x, y: p.y })),
           value: parsed ? parsed.value : row.value,

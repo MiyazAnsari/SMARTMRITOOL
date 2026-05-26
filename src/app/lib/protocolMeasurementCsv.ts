@@ -13,6 +13,9 @@ export type ProtocolExportMeasurement = {
   points: { x: number; y: number }[];
   slice: number;
   plane: Plane;
+  patientId?: string;
+  sequenceName?: string;
+  laterality?: string;
   value?: string;
   baseLineId?: string;
   groupId?: string;
@@ -26,16 +29,17 @@ type CsvValue = string | number | boolean | null | undefined;
 type ProtocolExportContext = {
   study?: DicomStudyView | null;
   patientId?: string;
-  patientName?: string;
-  studyName?: string;
+  sessionUser?: string;
+  sessionUserEmail?: string;
   laterality?: string;
+  sequenceName?: string;
 };
 
 const CSV_COLUMNS = [
   'recordType',
   'patientId',
-  'patientName',
-  'studyName',
+  'sessionUser',
+  'sessionUserEmail',
   'laterality',
   'sequenceName',
   'plane',
@@ -96,6 +100,34 @@ function measurementMatchesPrimitive(measurement: ProtocolExportMeasurement, pri
   if (primitive === 'angle') return measurement.type === 'angle';
   if (primitive === 'point') return measurement.type === 'point' || measurement.type === 'perpendicular';
   return false;
+}
+
+function findBorrowCandidate(
+  protocolPlane: Plane,
+  step: { id: string; label: string; primitive: string },
+  groupMeasurements: ProtocolExportMeasurement[],
+  allMeasurements: ProtocolExportMeasurement[],
+): ProtocolExportMeasurement | undefined {
+  const preferredSlice = groupMeasurements.find((measurement) => measurement.plane === protocolPlane)?.slice;
+
+  const matches = (measurement: ProtocolExportMeasurement) => {
+    if (measurement.workflowStepId === step.id) return true;
+    if (measurement.label === step.label && measurementMatchesPrimitive(measurement, step.primitive)) return true;
+    return false;
+  };
+
+  const borrowed = [...allMeasurements]
+    .reverse()
+    .find((measurement) => {
+      if (groupMeasurements.some((existing) => existing.id === measurement.id)) return false;
+      if (measurement.plane !== protocolPlane) return false;
+      if (matches(measurement)) return true;
+      if (!measurementMatchesPrimitive(measurement, step.primitive)) return false;
+      if (preferredSlice == null) return true;
+      return measurement.slice === preferredSlice;
+    });
+
+  return borrowed;
 }
 
 function formatPoints(
@@ -164,6 +196,19 @@ function getPlaneSpacing(study: DicomStudyView | null | undefined, plane: Plane)
 function getSequenceName(study: DicomStudyView | null | undefined, plane: Plane): string {
   const volume = study?.volumes?.[plane];
   return (volume?.seriesDescription && volume.seriesDescription.trim()) || plane;
+}
+
+function resolveExportContext(
+  measurement: ProtocolExportMeasurement,
+  context: ProtocolExportContext,
+): { patientId: string; sessionUser: string; sessionUserEmail: string; laterality: string; sequenceName: string } {
+  return {
+    patientId: measurement.patientId ?? context.patientId ?? '',
+    sessionUser: context.sessionUser ?? '',
+    sessionUserEmail: context.sessionUserEmail ?? '',
+    laterality: measurement.laterality ?? context.laterality ?? '',
+    sequenceName: measurement.sequenceName ?? context.sequenceName ?? '',
+  };
 }
 
 function inferProtocolStepResults(
@@ -268,20 +313,10 @@ export function exportProtocolMeasurementsToCsv(
       );
       if (satisfied) continue;
 
-      // Search every other measurement for a matching candidate.
-      for (const candidate of measurements) {
-        // Skip if already present in this group.
-        if (groupMeasurements.some((m) => m.id === candidate.id)) continue;
-
-        const matchesById = candidate.workflowStepId === step.id;
-        const matchesByLabel =
-          candidate.label === step.label && measurementMatchesPrimitive(candidate, step.primitive);
-
-        if (matchesById || matchesByLabel) {
-          // Shallow-clone so the original's groupId is unchanged.
-          groupMeasurements.push({ ...candidate, groupId });
-          break;
-        }
+      const candidate = findBorrowCandidate(protocol.requiredPlane, step, groupMeasurements, measurements);
+      if (candidate) {
+        // Shallow-clone so the original's groupId is unchanged.
+        groupMeasurements.push({ ...candidate, groupId });
       }
     }
   }
@@ -297,7 +332,8 @@ export function exportProtocolMeasurementsToCsv(
       const tb = b.workflowStepId ? 0 : 1;
       return ta - tb || a.slice - b.slice || a.id.localeCompare(b.id);
     });
-    const sequenceName = protocol ? getSequenceName(context.study, protocol.requiredPlane) : groupSorted[0]?.plane ?? '';
+    const groupContext = resolveExportContext(groupSorted[0] ?? ({} as ProtocolExportMeasurement), context);
+    const sequenceName = groupContext.sequenceName || (protocol ? getSequenceName(context.study, protocol.requiredPlane) : groupSorted[0]?.plane ?? '');
     const spacing = protocol ? getPlaneSpacing(context.study, protocol.requiredPlane) : { x: 1, y: 1 };
 
     const baselineMap = new Map<string, ProtocolExportMeasurement>();
@@ -312,10 +348,10 @@ export function exportProtocolMeasurementsToCsv(
       if (finalResult) {
         rows.push([
           'protocol_result',
-          context.patientId ?? '',
-          context.patientName ?? '',
-          context.studyName ?? '',
-          context.laterality ?? '',
+          groupContext.patientId,
+          groupContext.sessionUser,
+          groupContext.sessionUserEmail,
+          groupContext.laterality,
           sequenceName,
           protocol.requiredPlane,
           protocol.id,
@@ -367,13 +403,14 @@ export function exportProtocolMeasurementsToCsv(
         const finalResultInterpretation = finalResult?.interpretation ?? '';
         const measurementPointsJson = JSON.stringify(convertPointsToMm(measurement.points, spacing));
         const baselinePointsJson = JSON.stringify(convertPointsToMm(baseline?.points ?? [], spacing));
+        const rowContext = resolveExportContext(measurement, context);
         rows.push([
           'step_measurement',
-          context.patientId ?? '',
-          context.patientName ?? '',
-          context.studyName ?? '',
-          context.laterality ?? '',
-          sequenceName,
+          rowContext.patientId,
+          rowContext.sessionUser,
+          rowContext.sessionUserEmail,
+          rowContext.laterality,
+          rowContext.sequenceName || sequenceName,
           measurement.plane,
           protocol.id,
           protocol.label,
@@ -412,13 +449,14 @@ export function exportProtocolMeasurementsToCsv(
       const baselinePointsJson = '[]';
       const computed = computeMeasurementValue(measurement, spacing);
       const measurementValueCell = computed.value != null ? computed.value.toFixed(4) : '';
+      const rowContext = resolveExportContext(measurement, context);
       rows.push([
         'raw_measurement',
-        context.patientId ?? '',
-        context.patientName ?? '',
-        context.studyName ?? '',
-        context.laterality ?? '',
-        sequenceName,
+        rowContext.patientId,
+        rowContext.sessionUser,
+        rowContext.sessionUserEmail,
+        rowContext.laterality,
+        rowContext.sequenceName || sequenceName,
         measurement.plane,
         '',
         '',

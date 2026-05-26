@@ -406,13 +406,20 @@ function App() {
       return;
     }
     const csv = exportProtocolMeasurementsToCsv(
-      annotator ? sessionAnnotations.map(sessionRowToMeasurement) : activePatientMeasurements,
+      annotator
+        ? sessionAnnotations.map((row) => ({
+            ...sessionRowToMeasurement(row),
+            patientId: row.patientId,
+            laterality: row.laterality,
+          }))
+        : activePatientMeasurements,
       {
         study: activeStudy,
         patientId: activeStudy?.patientId || activePatientKey || undefined,
-        patientName: activeStudy?.patientName || undefined,
-        studyName: activeStudy?.studyName || undefined,
+        sessionUser: annotator?.name || undefined,
+        sessionUserEmail: annotator?.email || undefined,
         laterality: activeStudy?.laterality || undefined,
+        sequenceName: undefined,
       },
     );
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');

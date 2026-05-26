@@ -1,6 +1,7 @@
 import type { Plane } from '../dicom/DicomLoader';
 
 export type Primitive = 'line' | 'distance' | 'angle' | 'point';
+export type WorkflowTool = 'none' | 'distance' | 'angle' | 'line' | 'point';
 
 export interface ProtocolStep {
   /** Stable id used to key results inside the workflow state. */
@@ -9,6 +10,8 @@ export interface ProtocolStep {
   label: string;
   /** Longer instruction shown when the step is active. */
   instruction: string;
+  /** Bottom toolbar tool that should be highlighted for this step. */
+  tool: WorkflowTool;
   /** Geometric primitive the user must draw to complete this step. */
   primitive: Primitive;
 }
@@ -112,21 +115,24 @@ const TT_TG: MeasurementProtocol = {
       id: 'condyle-line',
       label: 'Posterior femoral condyle line',
       instruction:
-        'Scroll to the slice showing the posterior femoral condyles. Click on "Distance" under Measurement Tools and place a line tangent to both posterior condyles.',
+        'Use Distance. On the slice with both posterior condyles, draw a tangent line.',
+      tool: 'distance',
       primitive: 'line',
     },
     {
       id: 'trochlear-groove',
       label: 'Deepest point of trochlear groove',
       instruction:
-        'Scroll to the slice showing the trochlear groove. Click on "Perpendicular" and click on the line you just made to create a perpendicular branch. Drag and adjust this branch to the deepest point of the groove.',
+        'Use Select. Click the condyle line, then drag the branch to the deepest trochlear groove point.',
+      tool: 'none',
       primitive: 'point',
     },
     {
       id: 'tibial-tubercle',
       label: 'Most anterior point of tibial tubercle',
       instruction:
-        'Scroll down to the slice showing the tibial tubercle. Click on "Perpendicular" and click on the line you just made to create another perpendicular branch, parallel to the first. Drag and adjust to the most anterior point.',
+        'Use Select. Add the second branch from the condyle line, then drag it to the most anterior tibial tubercle point.',
+      tool: 'none',
       primitive: 'point',
     },
   ],
@@ -185,14 +191,16 @@ const INSALL_SALVATI: MeasurementProtocol = {
       id: 'patella-length',
       label: 'Patella length (LP)',
       instruction:
-        'Scroll to the sagittal slice that shows the full patella and tendon. Draw a line along the longest diagonal of the patella.',
+        'Use Distance. Draw a line along the longest patellar axis.',
+      tool: 'distance',
       primitive: 'distance',
     },
     {
       id: 'tendon-length',
       label: 'Patellar tendon length (LT)',
       instruction:
-        'Draw a line from the lower pole of the patella to the tibial tuberosity attachment.',
+        'Use Distance. Draw a line from the lower patellar pole to the tibial tuberosity.',
+      tool: 'distance',
       primitive: 'distance',
     },
   ],
@@ -231,14 +239,16 @@ const PATELLAR_TILT: MeasurementProtocol = {
       id: 'condyle-line',
       label: 'Posterior femoral condyle line',
       instruction:
-        'On the axial slice that shows both posterior condyles, place a line tangent to them.',
+        'Use Distance. Draw a tangent line across both posterior condyles.',
+      tool: 'distance',
       primitive: 'line',
     },
     {
       id: 'patella-axis',
       label: 'Patella transverse axis',
       instruction:
-        'Place a line across the widest medial-to-lateral axis of the patella on the same slice.',
+        'Use Distance. Draw a line across the widest patellar width.',
+      tool: 'distance',
       primitive: 'line',
     },
   ],
@@ -280,14 +290,16 @@ const SULCUS_ANGLE: MeasurementProtocol = {
       id: 'medial-line',
       label: 'Line from medial condyle peak to sulcus',
       instruction:
-        'Click the highest point of the medial condyle, then click the deepest point of the trochlear groove.',
+        'Use Distance. Click the medial condyle peak, then the deepest trochlear groove point.',
+      tool: 'distance',
       primitive: 'line',
     },
     {
       id: 'lateral-line',
       label: 'Line from lateral condyle peak to sulcus',
       instruction:
-        'Click the highest point of the lateral condyle, then click the same deepest groove point as before.',
+        'Use Distance. Click the lateral condyle peak, then the same groove point.',
+      tool: 'distance',
       primitive: 'line',
     },
   ],

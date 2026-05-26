@@ -1805,19 +1805,24 @@ export function Viewport({
           const p1 = baseLine.points[1];
           const midX = (p0.x + p1.x) / 2;
           const midY = (p0.y + p1.y) / 2;
+          const addLabelX = midX;
+          const addLabelY = midY + 14;
+          const addLabelHit = x >= addLabelX - 24 && x <= addLabelX + 24 && y >= addLabelY - 10 && y <= addLabelY + 10;
           // If using select mode require a click near the midpoint for
           // unambiguous intent — but also accept clicks anywhere on a
           // hovered or selected line so users can quickly add additional
           // perpendiculars by clicking the already-selected line.
           // Only accept when explicitly in `perpendicular` tool, when the
           // click is near the midpoint (unambiguous intent), or when the
-          // line is actively hovered. Do NOT accept solely because the
+          // line is actively hovered, or when the perpendicular overlay label
+          // itself is clicked. Do NOT accept solely because the
           // line is selected — selection is a passive state and leads to
           // accidental perpendicular creation during drag/selection flows.
           const accept = activeTool === 'perpendicular'
             ? true
             : (x >= midX - 12 && x <= midX + 12 && y >= midY - 12 && y <= midY + 12)
-              || hoveredLineId === targetLineId;
+              || hoveredLineId === targetLineId
+              || addLabelHit;
           
           // Defensive guard: if the same baseline was just dragged/updated
           // recently, suppress perpendicular creation to avoid the mouseup

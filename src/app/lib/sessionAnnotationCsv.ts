@@ -5,6 +5,11 @@ export type SessionMeasurementView = {
   points: { x: number; y: number }[];
   slice: number;
   plane: 'axial' | 'sagittal' | 'coronal';
+  patientId?: string;
+  patientName?: string;
+  studyName?: string;
+  sequenceName?: string;
+  laterality?: Laterality;
   value?: string;
   timestamp?: string;
   baseLineId?: string;
@@ -28,6 +33,8 @@ export interface SessionAnnotationRow {
   laterality: Laterality;
   annotationId: string;
   patientId: string;
+  patientName?: string;
+  studyName?: string;
   sequenceName: string;
   plane: 'axial' | 'sagittal' | 'coronal';
   measurementType: string;
@@ -88,6 +95,11 @@ export function sessionRowToMeasurement(row: SessionAnnotationRow): SessionMeasu
     points: Array.isArray(row.points) ? row.points.map((p) => ({ x: p.x, y: p.y })) : [],
     slice: row.sliceIndex,
     plane: row.plane,
+    patientId: row.patientId,
+    patientName: row.patientName,
+    studyName: row.studyName,
+    sequenceName: row.sequenceName,
+    laterality: row.laterality,
     value: joinValueUnits(row.value, row.units),
     timestamp: row.timestamp,
     baseLineId: row.baseLineId,
