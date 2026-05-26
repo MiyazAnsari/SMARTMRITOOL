@@ -200,17 +200,18 @@ export function Viewport({
     const len = Math.hypot(dx, dy);
     if (len === 0) return null;
 
-    const midX = (p0.x + p1.x) / 2;
-    const midY = (p0.y + p1.y) / 2;
+    const t = ((cursor.x - p0.x) * dx + (cursor.y - p0.y) * dy) / (len * len);
+    const anchorX = p0.x + dx * Math.max(0, Math.min(1, t));
+    const anchorY = p0.y + dy * Math.max(0, Math.min(1, t));
     const perpX = -dy / len;
     const perpY = dx / len;
-    const offset = (cursor.x - midX) * perpX + (cursor.y - midY) * perpY;
+    const offset = (cursor.x - anchorX) * perpX + (cursor.y - anchorY) * perpY;
     const stubLen = Math.max(1, Math.abs(offset));
     const sign = offset >= 0 ? 1 : -1;
 
     return {
-      anchor: { x: midX, y: midY },
-      tip: { x: midX + perpX * stubLen * sign, y: midY + perpY * stubLen * sign },
+      anchor: { x: anchorX, y: anchorY },
+      tip: { x: anchorX + perpX * stubLen * sign, y: anchorY + perpY * stubLen * sign },
     };
   }, []);
 

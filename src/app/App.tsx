@@ -172,7 +172,18 @@ function App() {
   const [measurementsPanelOpen, setMeasurementsPanelOpen] = useState(true);
   const [selectedMeasurementId, setSelectedMeasurementId] = useState<string | null>(null);
   const [forceJumpOnSelectId, setForceJumpOnSelectId] = useState<string | null>(null);
+  const [currentProtocolGroupId, setCurrentProtocolGroupId] = useState<string | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
+
+  const handleMeasurementSelect = useCallback(
+    (id: string | null) => {
+      setSelectedMeasurementId(id);
+      if (id && forceJumpOnSelectId === id) {
+        setForceJumpOnSelectId(null);
+      }
+    },
+    [forceJumpOnSelectId],
+  );
 
   useEffect(() => {
     savePatientMeasurementArchive(measurementArchive);
@@ -757,14 +768,35 @@ function App() {
                     activeSessionRowsForPatient.map((r) => (
                       <li
                         key={r.annotationId}
-                        className="rounded border border-gray-700 bg-gray-800/80 px-2 py-1.5 text-gray-200"
+                        className="rounded border border-gray-700 bg-gray-800/80 px-2 py-1.5 text-gray-200 hover:bg-gray-750 cursor-pointer"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setForceJumpOnSelectId(r.annotationId);
+                          setSelectedMeasurementId(r.annotationId);
+                        }}
                       >
                         <div className="flex justify-between gap-1 items-start">
                           <div className="min-w-0 flex-1">
-                            <div className="font-medium text-gray-100 capitalize">{r.label || r.measurementType}</div>
-                            <div className="text-[10px] text-blue-300 mt-0.5">
-                              {r.workflowStepId ? `Step ${r.workflowStepId}` : r.measurementType}
-                            </div>
+                              <div className="flex items-center gap-1 flex-wrap">
+                                <div className="font-medium text-gray-100 capitalize">{r.label || r.measurementType}</div>
+                                {(() => {
+                                  if (!r.groupId || !currentProtocolGroupId) return null;
+                                  const protocolPrefix = currentProtocolGroupId.split('-').slice(0, -1).join('-');
+                                  const belongsToActive = r.groupId === currentProtocolGroupId;
+                                  return belongsToActive ? (
+                                    <span
+                                      title={`Active protocol group: ${protocolPrefix} (${r.groupId})`}
+                                      aria-label={`Measurement belongs to active protocol group ${r.groupId}`}
+                                      className="inline-block text-[10px] px-1 py-0.5 rounded bg-green-800 text-green-200 cursor-help"
+                                    >
+                                      group
+                                    </span>
+                                  ) : null;
+                                })()}
+                              </div>
+                              <div className="text-[10px] text-blue-300 mt-0.5">
+                                {r.workflowStepId || r.groupId || r.measurementType}
+                              </div>
                             <div className="text-gray-400">
                               {r.laterality} knee · {r.sequenceName} · {r.plane} · slice {r.sliceIndex}
                             </div>
@@ -789,7 +821,10 @@ function App() {
                                 ? 'border-blue-500 bg-blue-900/50 text-blue-200 hover:bg-blue-800/60'
                                 : 'border-gray-600 bg-gray-800 text-gray-200 hover:bg-gray-700'
                             }`}
-                            onClick={() => setSelectedMeasurementId(r.annotationId)}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setForceJumpOnSelectId(r.annotationId);
+                            }}
                             aria-label={`Select measurement ${r.annotationId}`}
                           >
                             {selectedMeasurementId === r.annotationId ? 'Selected' : 'Select'}
@@ -797,7 +832,10 @@ function App() {
                           <button
                             type="button"
                             className="shrink-0 text-[10px] text-red-400 hover:text-red-300"
-                            onClick={() => deleteSidebarMeasurement(r.annotationId)}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              deleteSidebarMeasurement(r.annotationId);
+                            }}
                             aria-label={`Delete measurement ${r.annotationId}`}
                           >
                             ×
@@ -805,7 +843,8 @@ function App() {
                             <button
                               type="button"
                               className="shrink-0 text-[10px] text-gray-300 hover:text-gray-200 ml-2"
-                              onClick={() => {
+                              onClick={(e) => {
+                                e.stopPropagation();
                                 const newLabel = prompt('Rename measurement', r.label || r.measurementType);
                                 if (newLabel != null) {
                                   updateSessionAnnotation(r.annotationId, (row) => ({ ...row, label: newLabel }));
@@ -818,7 +857,10 @@ function App() {
                           <button
                             type="button"
                             className="shrink-0 text-[10px] text-gray-300 hover:text-gray-200"
-                            onClick={() => updateSessionAnnotation(r.annotationId, (row) => ({ ...row, propagateAcrossSlices: !row.propagateAcrossSlices }))}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              updateSessionAnnotation(r.annotationId, (row) => ({ ...row, propagateAcrossSlices: !row.propagateAcrossSlices }));
+                            }}
                             aria-label={`Toggle propagate across slices for ${r.annotationId}`}
                           >
                             {r.propagateAcrossSlices === false ? 'Lock' : 'Prop'}
@@ -856,12 +898,30 @@ function App() {
                                           ? 'border-blue-500 bg-blue-900/55 ring-1 ring-blue-400/70'
                                           : 'border-gray-700 bg-gray-800/80 hover:border-gray-500 hover:bg-gray-750'
                                       }`}
-                                      onClick={() => setSelectedMeasurementId(m.id)}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setForceJumpOnSelectId(m.id);
+                                        setSelectedMeasurementId(m.id);
+                                      }}
                                     >
                                       <div className="flex justify-between gap-2 items-start">
                                         <div className="min-w-0 flex-1">
                                           <div className="flex items-center justify-between gap-2">
                                             <div className={`font-semibold capitalize ${selected ? 'text-blue-100' : 'text-gray-100'}`}>{m.label || m.type}</div>
+                                              {(() => {
+                                                if (!m.groupId || !currentProtocolGroupId) return null;
+                                                const protocolPrefix = currentProtocolGroupId.split('-').slice(0, -1).join('-');
+                                                const belongsToActive = m.groupId === currentProtocolGroupId;
+                                                return belongsToActive ? (
+                                                  <span
+                                                    title={`Active protocol group: ${protocolPrefix} (${m.groupId})`}
+                                                    aria-label={`Measurement belongs to active protocol group ${m.groupId}`}
+                                                    className="ml-2 inline-block text-[10px] px-1 py-0.5 rounded bg-green-800 text-green-200 cursor-help"
+                                                  >
+                                                    group
+                                                  </span>
+                                                ) : null;
+                                              })()}
                                             <button
                                               type="button"
                                               className="ml-2 text-[10px] text-gray-300 hover:text-gray-200"
@@ -886,10 +946,8 @@ function App() {
                                             }`}
                                             onClick={(e) => {
                                               e.stopPropagation();
-                                              setSelectedMeasurementId(m.id);
+                                              console.debug('[App] request force jump for', m.id);
                                               setForceJumpOnSelectId(m.id);
-                                              // clear the forced jump shortly after to avoid sticky behavior
-                                              setTimeout(() => setForceJumpOnSelectId((cur) => (cur === m.id ? null : cur)), 1200);
                                             }}
                                             aria-label={`Select measurement ${m.id}`}
                                           >
@@ -975,8 +1033,9 @@ function App() {
             onDeleteSessionAnnotation={activePatientKey && annotator ? deleteSessionAnnotation : undefined}
             onUpdateSessionAnnotation={activePatientKey && annotator ? updateSessionAnnotation : undefined}
             selectedMeasurementId={selectedMeasurementId}
-            onMeasurementSelect={setSelectedMeasurementId}
+            onMeasurementSelect={handleMeasurementSelect}
             forceJumpOnSelectId={forceJumpOnSelectId}
+            onCurrentGroupChange={setCurrentProtocolGroupId}
           />
         </div>
       </main>

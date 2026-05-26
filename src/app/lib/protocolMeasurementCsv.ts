@@ -55,6 +55,7 @@ const CSV_COLUMNS = [
   'interpretation',
   'measurementLabel',
   'measurementValue',
+  'measurementUnit',
   'measurementPropagateAcrossSlices',
   'p0_x',
   'p0_y',
@@ -64,11 +65,13 @@ const CSV_COLUMNS = [
   'p2_y',
   'p3_x',
   'p3_y',
+  'stepPointsMmJson',
   'baselineId',
   'baseline_p0_x',
   'baseline_p0_y',
   'baseline_p1_x',
   'baseline_p1_y',
+  'baselinePointsMmJson',
   'pointsJson',
   'baselinePointsJson',
   'stepMeasurementIdsJson',
@@ -95,14 +98,58 @@ function measurementMatchesPrimitive(measurement: ProtocolExportMeasurement, pri
   return false;
 }
 
-function formatPoints(points: { x: number; y: number }[], maxPoints = 4): (string | number)[] {
+function formatPoints(
+  points: { x: number; y: number }[],
+  maxPoints = 4,
+  spacing: { x: number; y: number } = { x: 1, y: 1 },
+): (string | number)[] {
   const flattened: (string | number)[] = [];
   for (let index = 0; index < maxPoints; index += 1) {
     const point = points[index];
-    flattened.push(point ? point.x : '');
-    flattened.push(point ? point.y : '');
+    if (point) {
+      const xmm = point.x * spacing.x;
+      const ymm = point.y * spacing.y;
+      flattened.push(Number.isFinite(xmm) ? xmm.toFixed(4) : '');
+      flattened.push(Number.isFinite(ymm) ? ymm.toFixed(4) : '');
+    } else {
+      flattened.push('');
+      flattened.push('');
+    }
   }
   return flattened;
+}
+
+function convertPointsToMm(points: { x: number; y: number }[], spacing: { x: number; y: number }) {
+  return points.map((p) => ({ x: Number((p.x * spacing.x).toFixed(4)), y: Number((p.y * spacing.y).toFixed(4)) }));
+}
+
+function computeMeasurementValue(
+  measurement: ProtocolExportMeasurement,
+  spacing: { x: number; y: number },
+): { value: number | null; unit: string | null } {
+  const pts = measurement.points;
+  if (!pts || pts.length < 2) return { value: null, unit: null };
+  const dx = (pts[1].x - pts[0].x) * spacing.x;
+  const dy = (pts[1].y - pts[0].y) * spacing.y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  if (measurement.type === 'line' || measurement.type === 'distance' || measurement.type === 'perpendicular') {
+    return { value: dist, unit: 'mm' };
+  }
+  if (measurement.type === 'angle' && pts.length >= 3) {
+    const ax = (pts[0].x - pts[1].x) * spacing.x;
+    const ay = (pts[0].y - pts[1].y) * spacing.y;
+    const bx = (pts[2].x - pts[1].x) * spacing.x;
+    const by = (pts[2].y - pts[1].y) * spacing.y;
+    const adotb = ax * bx + ay * by;
+    const alen = Math.sqrt(ax * ax + ay * ay);
+    const blen = Math.sqrt(bx * bx + by * by);
+    if (alen > 0 && blen > 0) {
+      const cos = Math.max(-1, Math.min(1, adotb / (alen * blen)));
+      const deg = (Math.acos(cos) * 180) / Math.PI;
+      return { value: deg, unit: '°' };
+    }
+  }
+  return { value: null, unit: null };
 }
 
 function getPlaneSpacing(study: DicomStudyView | null | undefined, plane: Plane): { x: number; y: number } {
@@ -124,24 +171,63 @@ function inferProtocolStepResults(
   measurements: ProtocolExportMeasurement[],
 ): Record<string, StepResult> {
   const result: Record<string, StepResult> = {};
-  const reversed = [...measurements].reverse();
+  // Track which measurements have already been claimed so that two steps with
+  // the same primitive type (e.g. both line steps in Patellar Tilt) cannot
+  // both latch onto the same measurement.
+  const usedIds = new Set<string>();
 
-  for (const step of protocol.steps) {
-    const match = reversed.find(
-      (measurement) =>
-        measurement.workflowStepId === step.id ||
-        (measurement.label === step.label && measurementMatchesPrimitive(measurement, step.primitive)),
-    );
-    if (!match) continue;
-    const points =
-      step.primitive === 'point' && match.type === 'perpendicular' && match.points.length >= 2
-        ? [match.points[1]]
-        : match.points;
+  // Helper: extract the anatomical landmark from a measurement.
+  // Perpendicular tools store [anchor-on-reference-line, actual-landmark];
+  // for point steps we want the actual landmark (last point).
+  const extractPoints = (
+    match: ProtocolExportMeasurement,
+    stepPrimitive: string,
+  ): { x: number; y: number }[] => {
+    if (stepPrimitive === 'point' && match.type === 'perpendicular' && match.points.length >= 2) {
+      return [match.points[match.points.length - 1]];
+    }
+    return match.points;
+  };
+
+  const claim = (match: ProtocolExportMeasurement, step: { id: string; primitive: string }) => {
+    usedIds.add(match.id);
     result[step.id] = {
-      primitive: step.primitive,
-      points,
+      primitive: step.primitive as StepResult['primitive'],
+      points: extractPoints(match, step.primitive),
       slice: match.slice,
     };
+  };
+
+  // Pass 1 – exact workflowStepId match (most reliable; set by the viewer).
+  for (const step of protocol.steps) {
+    const match = measurements.find((m) => !usedIds.has(m.id) && m.workflowStepId === step.id);
+    if (match) claim(match, step);
+  }
+
+  // Pass 2 – label + primitive match (fallback when stepId not persisted).
+  for (const step of protocol.steps) {
+    if (result[step.id]) continue;
+    const match = [...measurements]
+      .reverse()
+      .find(
+        (m) =>
+          !usedIds.has(m.id) &&
+          m.label === step.label &&
+          measurementMatchesPrimitive(m, step.primitive),
+      );
+    if (match) claim(match, step);
+  }
+
+  // Pass 3 – primitive type match in step order (last resort; avoids double-claim).
+  // Iterates steps in declaration order so the first unmatched step gets the
+  // earliest available candidate, preventing two same-primitive steps from
+  // stealing each other's measurement.
+  for (const step of protocol.steps) {
+    if (result[step.id]) continue;
+    const match = [...measurements]
+      .reverse()
+      .find((m) => !usedIds.has(m.id) && measurementMatchesPrimitive(m, step.primitive));
+    if (match) claim(match, step);
   }
 
   return result;
@@ -159,6 +245,45 @@ export function exportProtocolMeasurementsToCsv(
     const current = byGroup.get(groupId) ?? [];
     current.push(measurement);
     byGroup.set(groupId, current);
+  }
+
+  // Cross-group supplement: if a protocol group is missing a step that is
+  // satisfied by a measurement belonging to a different group (e.g. the
+  // posterior femoral condyle line drawn during TT-TG being reused by Patellar
+  // Tilt), inject a shallow copy of that measurement into the borrowing group
+  // so inferProtocolStepResults can resolve the step and protocol.compute
+  // returns a result.  The original measurement stays in its own group; only a
+  // copy is added here, tagged with the borrowing groupId.
+  for (const [groupId, groupMeasurements] of byGroup) {
+    const protocolId = findProtocolIdFromGroupId(groupId);
+    const protocol = getProtocol(protocolId);
+    if (!protocol) continue;
+
+    for (const step of protocol.steps) {
+      // Step is already satisfied within this group — nothing to borrow.
+      const satisfied = groupMeasurements.some(
+        (m) =>
+          m.workflowStepId === step.id ||
+          (m.label === step.label && measurementMatchesPrimitive(m, step.primitive)),
+      );
+      if (satisfied) continue;
+
+      // Search every other measurement for a matching candidate.
+      for (const candidate of measurements) {
+        // Skip if already present in this group.
+        if (groupMeasurements.some((m) => m.id === candidate.id)) continue;
+
+        const matchesById = candidate.workflowStepId === step.id;
+        const matchesByLabel =
+          candidate.label === step.label && measurementMatchesPrimitive(candidate, step.primitive);
+
+        if (matchesById || matchesByLabel) {
+          // Shallow-clone so the original's groupId is unchanged.
+          groupMeasurements.push({ ...candidate, groupId });
+          break;
+        }
+      }
+    }
   }
 
   const rows: CsvValue[][] = [];
@@ -224,12 +349,24 @@ export function exportProtocolMeasurementsToCsv(
           '',
           '',
           '',
+          '',
+          '',
+          '',
+          '',
           JSON.stringify(stepMeasurementIds),
         ]);
       }
 
       for (const measurement of groupSorted) {
         const baseline = measurement.baseLineId ? baselineMap.get(measurement.baseLineId) : undefined;
+        const computed = computeMeasurementValue(measurement, spacing);
+        const measurementValueCell = computed.value != null ? computed.value.toFixed(4) : '';
+        const finalResultValue = finalResult ? finalResult.value.toFixed(4) : '';
+        const finalResultUnit = finalResult?.unit ?? '';
+        const finalResultSummary = finalResult?.summary ?? '';
+        const finalResultInterpretation = finalResult?.interpretation ?? '';
+        const measurementPointsJson = JSON.stringify(convertPointsToMm(measurement.points, spacing));
+        const baselinePointsJson = JSON.stringify(convertPointsToMm(baseline?.points ?? [], spacing));
         rows.push([
           'step_measurement',
           context.patientId ?? '',
@@ -248,18 +385,21 @@ export function exportProtocolMeasurementsToCsv(
           measurement.type,
           measurement.slice,
           measurement.points.length,
-          '',
-          '',
-          '',
-          '',
+          finalResultValue,
+          finalResultUnit,
+          finalResultSummary,
+          finalResultInterpretation,
           measurement.label ?? '',
-          '',
+          measurementValueCell,
+          computed.unit ?? '',
           String(measurement.propagateAcrossSlices ?? true),
-          ...formatPoints(measurement.points),
+          ...formatPoints(measurement.points, 4, spacing),
+          measurementPointsJson,
           measurement.baseLineId ?? '',
-          ...(baseline ? formatPoints(baseline.points, 2) : ['', '', '', '']),
-          JSON.stringify(measurement.points),
-          JSON.stringify(baseline?.points ?? []),
+          ...(baseline ? formatPoints(baseline.points, 2, spacing) : ['', '', '', '']),
+          baselinePointsJson,
+          measurementPointsJson,
+          baselinePointsJson,
           JSON.stringify([...completedStepIds]),
         ]);
       }
@@ -268,6 +408,10 @@ export function exportProtocolMeasurementsToCsv(
 
     // Non-protocol groups still export their raw geometry.
     for (const measurement of groupSorted) {
+      const measurementPointsJson = JSON.stringify(convertPointsToMm(measurement.points, spacing));
+      const baselinePointsJson = '[]';
+      const computed = computeMeasurementValue(measurement, spacing);
+      const measurementValueCell = computed.value != null ? computed.value.toFixed(4) : '';
       rows.push([
         'raw_measurement',
         context.patientId ?? '',
@@ -291,16 +435,19 @@ export function exportProtocolMeasurementsToCsv(
         '',
         '',
         measurement.label ?? '',
-        '',
+        measurementValueCell,
+        computed.unit ?? '',
         String(measurement.propagateAcrossSlices ?? true),
-        ...formatPoints(measurement.points),
+        ...formatPoints(measurement.points, 4, spacing),
+        measurementPointsJson,
         measurement.baseLineId ?? '',
         '',
         '',
         '',
         '',
-        JSON.stringify(measurement.points),
-        '[]',
+        baselinePointsJson,
+        measurementPointsJson,
+        baselinePointsJson,
         '[]',
       ]);
     }

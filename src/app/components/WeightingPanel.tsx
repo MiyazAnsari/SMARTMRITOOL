@@ -31,6 +31,7 @@ interface WeightingPanelProps {
   selectedMeasurementId?: string | null;
   onMeasurementSelect?: (id: string | null) => void;
   onStepRedo?: (stepId: string) => void;
+  onResetMeasurements?: () => void;
   pixelSpacing: { x: number; y: number };
   measurementUnits: MeasurementDisplayUnits;
   onMeasurementUnitsChange: (units: MeasurementDisplayUnits) => void;
@@ -55,6 +56,7 @@ export function WeightingPanel({
   selectedMeasurementId,
   onMeasurementSelect,
   onStepRedo,
+  onResetMeasurements,
   pixelSpacing,
   measurementUnits,
   onMeasurementUnitsChange,
@@ -129,6 +131,7 @@ export function WeightingPanel({
         selectedMeasurementId={selectedMeasurementId}
         onMeasurementSelect={onMeasurementSelect}
         onStepRedo={onStepRedo}
+        onResetMeasurements={onResetMeasurements}
         onPlaneRequest={onPlaneRequest}
       />
 

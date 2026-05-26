@@ -105,7 +105,7 @@ const TT_TG: MeasurementProtocol = {
   id: 'tt-tg',
   label: 'TT-TG',
   description:
-    'Tibial Tubercle – Trochlear Groove distance. Measured on axial knee MRI.',
+    'Tibial Tubercle – Trochlear Groove distance measured between the two perpendicular landmarks using the posterior condylar line as reference.',
   requiredPlane: 'axial',
   steps: [
     {
@@ -119,14 +119,14 @@ const TT_TG: MeasurementProtocol = {
       id: 'trochlear-groove',
       label: 'Deepest point of trochlear groove',
       instruction:
-        'Scroll to the slice showing the trochlear groove. Click on "Select" and click on the line you just made to create a perpendicular branch. Drag and adjust this branch to the deepest point of the groove.',
+        'Scroll to the slice showing the trochlear groove. Click on "Perpendicular" and click on the line you just made to create a perpendicular branch. Drag and adjust this branch to the deepest point of the groove.',
       primitive: 'point',
     },
     {
       id: 'tibial-tubercle',
       label: 'Most anterior point of tibial tubercle',
       instruction:
-        'Scroll down to the slice showing the tibial tubercle. Click on "Select" to create another perpendicular branch, parallel to the first. Drag and adjust to the most anterior point.',
+        'Scroll down to the slice showing the tibial tubercle. Click on "Perpendicular" and click on the line you just made to create another perpendicular branch, parallel to the first. Drag and adjust to the most anterior point.',
       primitive: 'point',
     },
   ],
@@ -138,24 +138,28 @@ const TT_TG: MeasurementProtocol = {
     if (!groove || groove.points.length < 1) return null;
     if (!tubercle || tubercle.points.length < 1) return null;
 
-    // Project both landmarks onto the condyle line; the TT-TG distance is the
-    // difference of those two projections measured *along* the condyle line.
     const [c1, c2] = cond.points;
     const c1p = toPhysical(c1, ps);
     const c2p = toPhysical(c2, ps);
     const dx = c2p.x - c1p.x;
     const dy = c2p.y - c1p.y;
     const len2 = dx * dx + dy * dy || 1;
+    const len = Math.sqrt(len2);
 
-    const projectAlong = (p: { x: number; y: number }) =>
-      (() => {
-        const pp = toPhysical(p, ps);
-        return ((pp.x - c1p.x) * dx + (pp.y - c1p.y) * dy) / len2;
-      })();
+    // A perpendicular branch stores [anchor-on-reference-line, actual-landmark].
+    // TT-TG is the shortest distance between the two parallel perpendicular
+    // branches, measured along the posterior condylar reference axis, so we use
+    // the branch anchors (the points on the condylar line).
+    const anchorOf = (r: StepResult): { x: number; y: number } => r.points[0] ?? r.points[r.points.length - 1];
 
-    const grooveT = projectAlong(groove.points[0]);
-    const tubercleT = projectAlong(tubercle.points[0]);
-    const value = Math.abs(tubercleT - grooveT) * Math.hypot(dx, dy);
+    const projectAlongCondyle = (p: { x: number; y: number }): number => {
+      const pp = toPhysical(p, ps);
+      return ((pp.x - c1p.x) * dx + (pp.y - c1p.y) * dy) / len2;
+    };
+
+    const grooveT = projectAlongCondyle(anchorOf(groove));
+    const tubercleT = projectAlongCondyle(anchorOf(tubercle));
+    const value = Math.abs(tubercleT - grooveT) * len;
     return {
       value,
       unit: 'mm',
@@ -315,4 +319,3 @@ export function getProtocol(id: string | undefined | null): MeasurementProtocol 
   if (!id) return null;
   return MEASUREMENT_PROTOCOLS.find((p) => p.id === id) || null;
 }
-

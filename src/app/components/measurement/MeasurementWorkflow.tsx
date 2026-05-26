@@ -34,6 +34,7 @@ interface MeasurementWorkflowProps {
   selectedMeasurementId?: string | null;
   onMeasurementSelect?: (id: string | null) => void;
   onStepRedo?: (stepId: string) => void;
+  onResetMeasurements?: () => void;
   /** Notify parent when the protocol's required plane needs to become active. */
   onPlaneRequest?: (plane: 'axial' | 'sagittal' | 'coronal') => void;
 }
@@ -46,6 +47,7 @@ export function MeasurementWorkflow({
   selectedMeasurementId = null,
   onMeasurementSelect,
   onStepRedo,
+  onResetMeasurements,
   onPlaneRequest,
 }: MeasurementWorkflowProps) {
   const [open, setOpen] = useState(true);
@@ -82,6 +84,7 @@ export function MeasurementWorkflow({
   };
 
   const reset = () => {
+    onResetMeasurements?.();
     onStateChange({
       protocolId: state.protocolId,
       activeStepIndex: 0,
