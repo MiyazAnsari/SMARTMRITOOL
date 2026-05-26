@@ -123,6 +123,10 @@ export interface Measurement {
   workflowStepId?: string;
   /** When true the measurement is shown on parallel slices and selection shouldn't force a slice jump. */
   propagateAcrossSlices?: boolean;
+  /** CSS-pixel → image-pixel scale factor at the time the measurement was captured.
+   *  Stored so protocol `compute` can convert overlay coordinates to physical mm
+   *  regardless of the current viewport display size. */
+  imageScale?: { x: number; y: number };
 }
 
 interface MedicalImageViewerExtras {
@@ -274,6 +278,49 @@ export function MedicalImageViewer({
 
   const [currentGroupId, setCurrentGroupId] = useState<string | null>(null);
   const currentGroupIdRef = useRef<string | null>(null);
+
+  // Track per-plane viewport display sizes so we can compute CSS→image-pixel
+  // scale factors for mm conversion in protocol calculations.
+  const [viewportDisplaySizes, setViewportDisplaySizes] = useState<Record<string, { width: number; height: number }>>({});
+  const handleViewportDisplaySizeChange = useCallback(
+    (plane: Plane, size: { width: number; height: number }) => {
+      setViewportDisplaySizes((prev) => {
+        if (prev[plane]?.width === size.width && prev[plane]?.height === size.height) return prev;
+        return { ...prev, [plane]: size };
+      });
+    },
+    [],
+  );
+
+  // Compute CSS→image-pixel scale for the protocol's required plane.
+  // Must match the spacing + dimension logic used by the Viewport's
+  // getPlaneGeometry so the draw area is identical.
+  const imageScale = useMemo(() => {
+    if (!protocol) return undefined;
+    const plane = protocol.requiredPlane;
+    const vol = studyData?.volumes[plane];
+    if (!vol || !vol.header) return undefined;
+    const dims = vol.header.dims;
+    const pixDims: number[] = vol.header.pixDims || vol.header.pixdim || [];
+    const imgW: number = plane === 'sagittal' ? dims[2] : dims[1];
+    const imgH: number = plane === 'axial' ? dims[2] : dims[3];
+    const p1: number = Number.isFinite(pixDims[1]) && pixDims[1] > 0 ? pixDims[1] : 1;
+    const p2: number = Number.isFinite(pixDims[2]) && pixDims[2] > 0 ? pixDims[2] : 1;
+    const dInPlane: number = Math.min(p1, p2);
+    let spcX: number;
+    let spcY: number;
+    if (plane === 'axial') { spcX = p1; spcY = p2; }
+    else if (plane === 'coronal') { spcX = p1; spcY = dInPlane; }
+    else { spcX = p2; spcY = dInPlane; }
+    const dSize = viewportDisplaySizes[plane];
+    if (!dSize || dSize.width === 0) return undefined;
+    const physicalW = Math.max(1, imgW * spcX);
+    const physicalH = Math.max(1, imgH * spcY);
+    const fitScale = Math.min(dSize.width / physicalW, dSize.height / physicalH);
+    const drawW = Math.max(1, Math.round(physicalW * fitScale));
+    const drawH = Math.max(1, Math.round(physicalH * fitScale));
+    return { x: imgW / drawW, y: imgH / drawH };
+  }, [protocol, studyData, viewportDisplaySizes]);
 
   useEffect(() => {
     if (workflow.protocolId) {
@@ -791,6 +838,7 @@ export function MedicalImageViewer({
             primitive: activeStep.primitive,
             points: recordedPoints,
             slice: groupedMeasurement.slice,
+            imageScale: groupedMeasurement.imageScale,
           }),
         );
       }
@@ -811,7 +859,7 @@ export function MedicalImageViewer({
   );
 
   const handleMeasurementUpdate = useCallback(
-    (id: string, newPoints: PointUpdater, newValue?: string) => {
+    (id: string, newPoints: PointUpdater, newValue?: string, imageScale?: { x: number; y: number }) => {
       const lengthValue = newValue;
 
       if (sessionMeasurementMode && onUpdateSessionAnnotation) {
@@ -831,6 +879,72 @@ export function MedicalImageViewer({
           };
         });
 
+        // Recalculate dependent perpendiculars in session mode so they
+        // follow the baseline (the repositioning effect skips perpendiculars
+        // whose baselines are remapped in the same batch to avoid conflicts).
+        const updatedBaseLine = measurements.find((m) => m.id === id);
+        if (
+          updatedBaseLine &&
+          (updatedBaseLine.type === 'distance' || updatedBaseLine.type === 'line') &&
+          updatedBaseLine.points.length >= 2
+        ) {
+          const resolvedNew = typeof newPoints === 'function' ? newPoints(updatedBaseLine.points) : updatedBaseLine.points;
+          const p0 = resolvedNew[0];
+          const p1 = resolvedNew[1];
+          const dx = p1.x - p0.x;
+          const dy = p1.y - p0.y;
+          const len = Math.hypot(dx, dy);
+          if (len > 0) {
+            const lineX = dx / len;
+            const lineY = dy / len;
+            const perpX = -dy / len;
+            const perpY = dx / len;
+
+            // Old baseline geometry to compute invariant t
+            const oldP0 = updatedBaseLine.points[0];
+            const oldP1 = updatedBaseLine.points[1];
+            const oldDx = oldP1.x - oldP0.x;
+            const oldDy = oldP1.y - oldP0.y;
+            const oldLen = Math.hypot(oldDx, oldDy) || 1;
+            const scaleFactor = len / oldLen;
+
+            const perps = measurements.filter(
+              (m) => m.type === 'perpendicular' && m.baseLineId === id && m.points.length >= 2,
+            );
+            for (const perp of perps) {
+              const oldAnchor = perp.points[0];
+              const t = oldLen > 0
+                ? Math.max(
+                    0,
+                    Math.min(
+                      1,
+                      ((oldAnchor.x - oldP0.x) * (oldDx / oldLen) +
+                        (oldAnchor.y - oldP0.y) * (oldDy / oldLen)) /
+                        oldLen,
+                    ),
+                  )
+                : 0.5;
+              const newAnchorX = p0.x + lineX * t * len;
+              const newAnchorY = p0.y + lineY * t * len;
+
+              const stubDx = perp.points[1].x - perp.points[0].x;
+              const stubDy = perp.points[1].y - perp.points[0].y;
+              const stubLen = Math.hypot(stubDx, stubDy) || 1;
+              const sign = stubDx * perpX + stubDy * perpY >= 0 ? 1 : -1;
+              const scaledStubLen = stubLen * scaleFactor;
+
+              onUpdateSessionAnnotation(perp.id, (row: SessionAnnotationRow) => ({
+                ...row,
+                points: [
+                  { x: newAnchorX, y: newAnchorY },
+                  { x: newAnchorX + perpX * scaledStubLen * sign, y: newAnchorY + perpY * scaledStubLen * sign },
+                ],
+                timestamp: new Date().toISOString(),
+              }));
+            }
+          }
+        }
+
         const target = measurements.find((m) => m.id === id);
         const matchedStep = protocol && target ? protocol.steps.find((step) => target.workflowStepId === step.id || (target.label === step.label && measurementMatchesPrimitive(target, step.primitive))) : null;
 
@@ -849,6 +963,7 @@ export function MedicalImageViewer({
                 primitive: matchedStep.primitive,
                 points: recordedPoints,
                 slice: target.slice,
+                imageScale,
               },
             },
           }));
@@ -877,6 +992,7 @@ export function MedicalImageViewer({
           return updated;
         }
 
+        // --- new baseline geometry (after remap) ---
         const p0 = baseLine.points[0];
         const p1 = baseLine.points[1];
         const dx = p1.x - p0.x;
@@ -891,16 +1007,36 @@ export function MedicalImageViewer({
         const perpX = -dy / len;
         const perpY = dx / len;
 
+        // --- old baseline geometry (before remap, from prev state) ---
+        const oldBaseLine = prev.find((m) => m.id === id);
+        const oldP0 = oldBaseLine?.points?.[0] ?? p0;
+        const oldP1 = oldBaseLine?.points?.[1] ?? p1;
+        const oldDx = oldP1.x - oldP0.x;
+        const oldDy = oldP1.y - oldP0.y;
+        const oldLen = Math.hypot(oldDx, oldDy) || 1;
+        const scaleFactor = len / oldLen;
+
         return updated.map((m) => {
           if (m.type !== 'perpendicular' || m.baseLineId !== id || m.points.length < 2) {
             return m;
           }
 
           const oldAnchor = m.points[0];
-          const t = Math.max(
-            0,
-            Math.min(1, ((oldAnchor.x - p0.x) * lineX + (oldAnchor.y - p0.y) * lineY) / len)
-          );
+
+          // Project old anchor onto the OLD baseline to find t (invariant fraction)
+          const t = oldLen > 0
+            ? Math.max(
+                0,
+                Math.min(
+                  1,
+                  ((oldAnchor.x - oldP0.x) * (oldDx / oldLen) +
+                    (oldAnchor.y - oldP0.y) * (oldDy / oldLen)) /
+                    oldLen,
+                ),
+              )
+            : 0.5;
+
+          // Apply t to the NEW baseline for the correct new anchor
           const newAnchorX = p0.x + lineX * t * len;
           const newAnchorY = p0.y + lineY * t * len;
 
@@ -909,11 +1045,14 @@ export function MedicalImageViewer({
           const stubLen = Math.hypot(stubDx, stubDy) || 1;
           const sign = stubDx * perpX + stubDy * perpY >= 0 ? 1 : -1;
 
+          // Scale the stub length to match the display size change
+          const scaledStubLen = stubLen * scaleFactor;
+
           return {
             ...m,
             points: [
               { x: newAnchorX, y: newAnchorY },
-              { x: newAnchorX + perpX * stubLen * sign, y: newAnchorY + perpY * stubLen * sign },
+              { x: newAnchorX + perpX * scaledStubLen * sign, y: newAnchorY + perpY * scaledStubLen * sign },
             ],
           };
         });
@@ -944,6 +1083,7 @@ export function MedicalImageViewer({
               primitive: matchedStep.primitive,
               points: recordedPoints,
               slice: target.slice,
+              imageScale,
             },
           },
         }));
@@ -1114,6 +1254,7 @@ export function MedicalImageViewer({
             onHideWindow={closeStudyPlaneViewport}
             onResetViewport={handleResetViewport}
             pixelSpacing={pixelSpacing}
+            onDisplaySizeChange={handleViewportDisplaySizeChange}
           />
         ) : (
           <div className="h-full flex items-center justify-center">
@@ -1283,6 +1424,7 @@ export function MedicalImageViewer({
           measurementUnits={measurementUnits}
           onMeasurementUnitsChange={setMeasurementUnits}
           onPlaneRequest={handlePlaneRequest}
+          imageScale={imageScale}
         />
       </div>
     </div>

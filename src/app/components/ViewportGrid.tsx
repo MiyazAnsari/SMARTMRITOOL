@@ -25,7 +25,7 @@ interface ViewportGridProps {
   activeTool: MeasurementTool;
   measurements: Measurement[];
   onMeasurementAdd: (measurement: Measurement) => void;
-  onMeasurementUpdate?: (id: string, newPoints: { x: number; y: number }[], value?: string) => void;
+  onMeasurementUpdate?: (id: string, newPoints: { x: number; y: number }[], value?: string, imageScale?: { x: number; y: number }) => void;
   pixelSpacing?: { x: number; y: number };
   measurementUnits?: 'mm' | 'px';
   selectedMeasurementId?: string | null;
@@ -38,6 +38,8 @@ interface ViewportGridProps {
   onHideWindow?: (plane: Plane) => void;
   /** Restore defaults for the given acquisition plane / viewer only. */
   onResetViewport?: (plane: Plane) => void;
+  /** Per-plane display size callback for px↔mm conversion. */
+  onDisplaySizeChange?: (plane: Plane, size: { width: number; height: number }) => void;
 }
 
 type Rect = { top: number; left: number; width: number; height: number; z?: number };
@@ -63,6 +65,7 @@ export function ViewportGrid({
   onWindowFocus,
   onHideWindow,
   onResetViewport,
+  onDisplaySizeChange,
 }: ViewportGridProps) {
   // pixelSpacing is optional and provided by parent when available
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -190,6 +193,7 @@ export function ViewportGrid({
               applyWeighting={applyWeighting}
               showCrosshair={showCrosshair}
               onViewportReset={() => onResetViewport?.(viewPlane)}
+              onDisplaySizeChange={(size) => onDisplaySizeChange?.(viewPlane, size)}
             />
           </div>
         </div>
@@ -272,6 +276,7 @@ export function ViewportGrid({
                 parentWindowHeight={pos.height}
                 onViewportReset={() => onResetViewport?.(w.id)}
                 onClose={() => onHideWindow?.(w.id)}
+                onDisplaySizeChange={(size) => onDisplaySizeChange?.(w.id, size)}
               />
               <div
                 onMouseDown={(e) => startResize(w.id, e)}

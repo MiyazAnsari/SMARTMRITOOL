@@ -37,6 +37,8 @@ interface MeasurementWorkflowProps {
   onResetMeasurements?: () => void;
   /** Notify parent when the protocol's required plane needs to become active. */
   onPlaneRequest?: (plane: 'axial' | 'sagittal' | 'coronal') => void;
+  /** CSS→image-pixel scale factor for px↔mm conversion in protocol calculations. */
+  imageScale?: { x: number; y: number };
 }
 
 export function MeasurementWorkflow({
@@ -49,6 +51,7 @@ export function MeasurementWorkflow({
   onStepRedo,
   onResetMeasurements,
   onPlaneRequest,
+  imageScale,
 }: MeasurementWorkflowProps) {
   const [open, setOpen] = useState(true);
   const protocol = getProtocol(state.protocolId);
@@ -70,7 +73,7 @@ export function MeasurementWorkflow({
   }, []);
 
   const result: MeasurementResult | null = protocol
-    ? protocol.compute(state.stepResults, pixelSpacing)
+    ? protocol.compute(state.stepResults, pixelSpacing, imageScale)
     : null;
 
   const handleSelect = (id: string) => {

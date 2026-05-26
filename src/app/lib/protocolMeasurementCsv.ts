@@ -33,6 +33,8 @@ type ProtocolExportContext = {
   sessionUserEmail?: string;
   laterality?: string;
   sequenceName?: string;
+  /** CSS→image-pixel scale factor for accurate px↔mm conversion. */
+  imageScale?: { x: number; y: number };
 };
 
 const CSV_COLUMNS = [
@@ -134,13 +136,16 @@ function formatPoints(
   points: { x: number; y: number }[],
   maxPoints = 4,
   spacing: { x: number; y: number } = { x: 1, y: 1 },
+  imageScale?: { x: number; y: number },
 ): (string | number)[] {
+  const sx = (imageScale?.x ?? 1) * spacing.x;
+  const sy = (imageScale?.y ?? 1) * spacing.y;
   const flattened: (string | number)[] = [];
   for (let index = 0; index < maxPoints; index += 1) {
     const point = points[index];
     if (point) {
-      const xmm = point.x * spacing.x;
-      const ymm = point.y * spacing.y;
+      const xmm = point.x * sx;
+      const ymm = point.y * sy;
       flattened.push(Number.isFinite(xmm) ? xmm.toFixed(4) : '');
       flattened.push(Number.isFinite(ymm) ? ymm.toFixed(4) : '');
     } else {
@@ -151,27 +156,36 @@ function formatPoints(
   return flattened;
 }
 
-function convertPointsToMm(points: { x: number; y: number }[], spacing: { x: number; y: number }) {
-  return points.map((p) => ({ x: Number((p.x * spacing.x).toFixed(4)), y: Number((p.y * spacing.y).toFixed(4)) }));
+function convertPointsToMm(
+  points: { x: number; y: number }[],
+  spacing: { x: number; y: number },
+  imageScale?: { x: number; y: number },
+) {
+  const sx = (imageScale?.x ?? 1) * spacing.x;
+  const sy = (imageScale?.y ?? 1) * spacing.y;
+  return points.map((p) => ({ x: Number((p.x * sx).toFixed(4)), y: Number((p.y * sy).toFixed(4)) }));
 }
 
 function computeMeasurementValue(
   measurement: ProtocolExportMeasurement,
   spacing: { x: number; y: number },
+  imageScale?: { x: number; y: number },
 ): { value: number | null; unit: string | null } {
+  const sx = (imageScale?.x ?? 1) * spacing.x;
+  const sy = (imageScale?.y ?? 1) * spacing.y;
   const pts = measurement.points;
   if (!pts || pts.length < 2) return { value: null, unit: null };
-  const dx = (pts[1].x - pts[0].x) * spacing.x;
-  const dy = (pts[1].y - pts[0].y) * spacing.y;
+  const dx = (pts[1].x - pts[0].x) * sx;
+  const dy = (pts[1].y - pts[0].y) * sy;
   const dist = Math.sqrt(dx * dx + dy * dy);
   if (measurement.type === 'line' || measurement.type === 'distance' || measurement.type === 'perpendicular') {
     return { value: dist, unit: 'mm' };
   }
   if (measurement.type === 'angle' && pts.length >= 3) {
-    const ax = (pts[0].x - pts[1].x) * spacing.x;
-    const ay = (pts[0].y - pts[1].y) * spacing.y;
-    const bx = (pts[2].x - pts[1].x) * spacing.x;
-    const by = (pts[2].y - pts[1].y) * spacing.y;
+    const ax = (pts[0].x - pts[1].x) * sx;
+    const ay = (pts[0].y - pts[1].y) * sy;
+    const bx = (pts[2].x - pts[1].x) * sx;
+    const by = (pts[2].y - pts[1].y) * sy;
     const adotb = ax * bx + ay * by;
     const alen = Math.sqrt(ax * ax + ay * ay);
     const blen = Math.sqrt(bx * bx + by * by);
@@ -184,7 +198,7 @@ function computeMeasurementValue(
   return { value: null, unit: null };
 }
 
-function getPlaneSpacing(study: DicomStudyView | null | undefined, plane: Plane): { x: number; y: number } {
+export function getPlaneSpacing(study: DicomStudyView | null | undefined, plane: Plane): { x: number; y: number } {
   const volume = study?.volumes?.[plane];
   const header = volume?.header as any;
   const pixDims = header?.pixDims || header?.pixdim || [];
@@ -341,7 +355,7 @@ export function exportProtocolMeasurementsToCsv(
 
     if (protocol) {
       const stepResults = inferProtocolStepResults(protocol, groupSorted);
-      const finalResult = protocol.compute(stepResults, spacing);
+      const finalResult = protocol.compute(stepResults, spacing, context.imageScale);
       const completedStepIds = new Set(Object.keys(stepResults));
       const stepMeasurementIds = [...groupSorted.map((m) => m.id)];
 
@@ -395,14 +409,14 @@ export function exportProtocolMeasurementsToCsv(
 
       for (const measurement of groupSorted) {
         const baseline = measurement.baseLineId ? baselineMap.get(measurement.baseLineId) : undefined;
-        const computed = computeMeasurementValue(measurement, spacing);
+        const computed = computeMeasurementValue(measurement, spacing, context.imageScale);
         const measurementValueCell = computed.value != null ? computed.value.toFixed(4) : '';
         const finalResultValue = finalResult ? finalResult.value.toFixed(4) : '';
         const finalResultUnit = finalResult?.unit ?? '';
         const finalResultSummary = finalResult?.summary ?? '';
         const finalResultInterpretation = finalResult?.interpretation ?? '';
-        const measurementPointsJson = JSON.stringify(convertPointsToMm(measurement.points, spacing));
-        const baselinePointsJson = JSON.stringify(convertPointsToMm(baseline?.points ?? [], spacing));
+        const measurementPointsJson = JSON.stringify(convertPointsToMm(measurement.points, spacing, context.imageScale));
+        const baselinePointsJson = JSON.stringify(convertPointsToMm(baseline?.points ?? [], spacing, context.imageScale));
         const rowContext = resolveExportContext(measurement, context);
         rows.push([
           'step_measurement',
@@ -430,10 +444,10 @@ export function exportProtocolMeasurementsToCsv(
           measurementValueCell,
           computed.unit ?? '',
           String(measurement.propagateAcrossSlices ?? true),
-          ...formatPoints(measurement.points, 4, spacing),
+          ...formatPoints(measurement.points, 4, spacing, context.imageScale),
           measurementPointsJson,
           measurement.baseLineId ?? '',
-          ...(baseline ? formatPoints(baseline.points, 2, spacing) : ['', '', '', '']),
+          ...(baseline ? formatPoints(baseline.points, 2, spacing, context.imageScale) : ['', '', '', '']),
           baselinePointsJson,
           measurementPointsJson,
           baselinePointsJson,
@@ -445,9 +459,9 @@ export function exportProtocolMeasurementsToCsv(
 
     // Non-protocol groups still export their raw geometry.
     for (const measurement of groupSorted) {
-      const measurementPointsJson = JSON.stringify(convertPointsToMm(measurement.points, spacing));
+      const measurementPointsJson = JSON.stringify(convertPointsToMm(measurement.points, spacing, context.imageScale));
       const baselinePointsJson = '[]';
-      const computed = computeMeasurementValue(measurement, spacing);
+      const computed = computeMeasurementValue(measurement, spacing, context.imageScale);
       const measurementValueCell = computed.value != null ? computed.value.toFixed(4) : '';
       const rowContext = resolveExportContext(measurement, context);
       rows.push([
@@ -476,7 +490,7 @@ export function exportProtocolMeasurementsToCsv(
         measurementValueCell,
         computed.unit ?? '',
         String(measurement.propagateAcrossSlices ?? true),
-        ...formatPoints(measurement.points, 4, spacing),
+        ...formatPoints(measurement.points, 4, spacing, context.imageScale),
         measurementPointsJson,
         measurement.baseLineId ?? '',
         '',

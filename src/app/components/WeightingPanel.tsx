@@ -37,6 +37,8 @@ interface WeightingPanelProps {
   onMeasurementUnitsChange: (units: MeasurementDisplayUnits) => void;
   onPlaneRequest?: (plane: Plane) => void;
   onOverflowChange?: (overflowing: boolean) => void;
+  /** CSS→image-pixel scale factor for converting overlay coordinates to physical mm. */
+  imageScale?: { x: number; y: number };
 }
 
 export function WeightingPanel({ 
@@ -62,6 +64,7 @@ export function WeightingPanel({
   onMeasurementUnitsChange,
   onPlaneRequest,
   onOverflowChange,
+  imageScale,
 }: WeightingPanelProps) {
   const [uploadOpen, setUploadOpen] = useState(true);
   return (
@@ -133,6 +136,7 @@ export function WeightingPanel({
         onStepRedo={onStepRedo}
         onResetMeasurements={onResetMeasurements}
         onPlaneRequest={onPlaneRequest}
+        imageScale={imageScale}
       />
 
       <div className="mb-3 rounded border border-gray-800 bg-gray-950/60 px-2 py-2 text-xs text-gray-300">

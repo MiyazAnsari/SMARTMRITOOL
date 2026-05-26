@@ -34,47 +34,62 @@ export interface MeasurementProtocol {
   requiredPlane: Plane;
   steps: ProtocolStep[];
   /**
-   * Given the completed step results (keyed by step id) and pixel spacing in
-   * mm/pixel, return the clinical measurement. Returns null if not enough data.
+   * Given the completed step results (keyed by step id), pixel spacing in
+   * mm/image-pixel, and optionally the CSS→image-pixel scale factor, return
+   * the clinical measurement. Returns null if not enough data.
    */
   compute: (
     results: Record<string, StepResult>,
     pixelSpacing: { x: number; y: number },
+    imageScale?: { x: number; y: number },
   ) => MeasurementResult | null;
 }
 
 export interface StepResult {
   primitive: Primitive;
-  /** Image-coordinate points that define the primitive (in pixels). */
+  /** CSS-pixel coordinate points from the viewport overlay (NOT image pixels). */
   points: { x: number; y: number }[];
   /** Slice index the primitive was drawn on. */
   slice: number;
+  /** CSS→image-pixel scale factor at the moment these points were captured/remapped.
+   *  Stored atomically with points so protocol `compute` always has the correct
+   *  conversion regardless of display-size change timing. */
+  imageScale?: { x: number; y: number };
 }
 
 const toPhysical = (
   p: { x: number; y: number },
   pixelSpacing: { x: number; y: number },
-) => ({ x: p.x * pixelSpacing.x, y: p.y * pixelSpacing.y });
+  imageScale?: { x: number; y: number },
+) => ({
+  x: p.x * (imageScale?.x ?? 1) * pixelSpacing.x,
+  y: p.y * (imageScale?.y ?? 1) * pixelSpacing.y,
+});
 
 const dist = (
   a: { x: number; y: number },
   b: { x: number; y: number },
   pixelSpacing: { x: number; y: number },
-) => Math.hypot((a.x - b.x) * pixelSpacing.x, (a.y - b.y) * pixelSpacing.y);
+  imageScale?: { x: number; y: number },
+) => {
+  const sx = (imageScale?.x ?? 1) * pixelSpacing.x;
+  const sy = (imageScale?.y ?? 1) * pixelSpacing.y;
+  return Math.hypot((a.x - b.x) * sx, (a.y - b.y) * sy);
+};
 
 /**
- * Perpendicular distance, in pixels, from a point to a line defined by two
- * points (p1, p2).
+ * Perpendicular distance, in mm, from a point to a line defined by two points.
  */
 function perpDistance(
   pt: { x: number; y: number },
   p1: { x: number; y: number },
   p2: { x: number; y: number },
   pixelSpacing: { x: number; y: number },
+  imageScale?: { x: number; y: number },
 ): number {
-  const a = toPhysical(pt, pixelSpacing);
-  const b1 = toPhysical(p1, pixelSpacing);
-  const b2 = toPhysical(p2, pixelSpacing);
+  const a = toPhysical(pt, pixelSpacing, imageScale);
+  const b1 = toPhysical(p1, pixelSpacing, imageScale);
+  const b2 = toPhysical(p2, pixelSpacing, imageScale);
   const dx = b2.x - b1.x;
   const dy = b2.y - b1.y;
   const len = Math.hypot(dx, dy) || 1;
@@ -87,11 +102,12 @@ function angleBetweenLines(
   p3: { x: number; y: number },
   p4: { x: number; y: number },
   pixelSpacing: { x: number; y: number },
+  imageScale?: { x: number; y: number },
 ): number {
-  const a1 = toPhysical(p1, pixelSpacing);
-  const a2 = toPhysical(p2, pixelSpacing);
-  const b1 = toPhysical(p3, pixelSpacing);
-  const b2 = toPhysical(p4, pixelSpacing);
+  const a1 = toPhysical(p1, pixelSpacing, imageScale);
+  const a2 = toPhysical(p2, pixelSpacing, imageScale);
+  const b1 = toPhysical(p3, pixelSpacing, imageScale);
+  const b2 = toPhysical(p4, pixelSpacing, imageScale);
   const v1x = a2.x - a1.x;
   const v1y = a2.y - a1.y;
   const v2x = b2.x - b1.x;
@@ -136,7 +152,7 @@ const TT_TG: MeasurementProtocol = {
       primitive: 'point',
     },
   ],
-  compute: (results, ps) => {
+  compute: (results, ps, paramImageScale) => {
     const cond = results['condyle-line'];
     const groove = results['trochlear-groove'];
     const tubercle = results['tibial-tubercle'];
@@ -144,9 +160,13 @@ const TT_TG: MeasurementProtocol = {
     if (!groove || groove.points.length < 1) return null;
     if (!tubercle || tubercle.points.length < 1) return null;
 
+    // Prefer per-StepResult imageScale (atomically stored with points)
+    // over the separately-threaded parameter.
+    const imageScale = cond.imageScale ?? groove.imageScale ?? tubercle.imageScale ?? paramImageScale;
+
     const [c1, c2] = cond.points;
-    const c1p = toPhysical(c1, ps);
-    const c2p = toPhysical(c2, ps);
+    const c1p = toPhysical(c1, ps, imageScale);
+    const c2p = toPhysical(c2, ps, imageScale);
     const dx = c2p.x - c1p.x;
     const dy = c2p.y - c1p.y;
     const len2 = dx * dx + dy * dy || 1;
@@ -159,7 +179,7 @@ const TT_TG: MeasurementProtocol = {
     const anchorOf = (r: StepResult): { x: number; y: number } => r.points[0] ?? r.points[r.points.length - 1];
 
     const projectAlongCondyle = (p: { x: number; y: number }): number => {
-      const pp = toPhysical(p, ps);
+      const pp = toPhysical(p, ps, imageScale);
       return ((pp.x - c1p.x) * dx + (pp.y - c1p.y) * dy) / len2;
     };
 
@@ -204,12 +224,13 @@ const INSALL_SALVATI: MeasurementProtocol = {
       primitive: 'distance',
     },
   ],
-  compute: (results, ps) => {
+  compute: (results, ps, paramImageScale) => {
     const lp = results['patella-length'];
     const lt = results['tendon-length'];
     if (!lp || lp.points.length < 2 || !lt || lt.points.length < 2) return null;
-    const lpMm = dist(lp.points[0], lp.points[1], ps);
-    const ltMm = dist(lt.points[0], lt.points[1], ps);
+    const imageScale = lp.imageScale ?? lt.imageScale ?? paramImageScale;
+    const lpMm = dist(lp.points[0], lp.points[1], ps, imageScale);
+    const ltMm = dist(lt.points[0], lt.points[1], ps, imageScale);
     if (lpMm === 0) return null;
     const ratio = ltMm / lpMm;
     return {
@@ -252,16 +273,18 @@ const PATELLAR_TILT: MeasurementProtocol = {
       primitive: 'line',
     },
   ],
-  compute: (results, ps) => {
+  compute: (results, ps, paramImageScale) => {
     const cond = results['condyle-line'];
     const pat = results['patella-axis'];
     if (!cond || cond.points.length < 2 || !pat || pat.points.length < 2) return null;
+    const imageScale = cond.imageScale ?? pat.imageScale ?? paramImageScale;
     const angle = angleBetweenLines(
       cond.points[0],
       cond.points[1],
       pat.points[0],
       pat.points[1],
       ps,
+      imageScale,
     );
     // The clinical convention reports the acute angle.
     const acute = angle > 90 ? 180 - angle : angle;
@@ -303,11 +326,12 @@ const SULCUS_ANGLE: MeasurementProtocol = {
       primitive: 'line',
     },
   ],
-  compute: (results, ps) => {
+  compute: (results, ps, paramImageScale) => {
     const m = results['medial-line'];
     const l = results['lateral-line'];
     if (!m || m.points.length < 2 || !l || l.points.length < 2) return null;
-    const angle = angleBetweenLines(m.points[0], m.points[1], l.points[1], l.points[0], ps);
+    const imageScale = m.imageScale ?? l.imageScale ?? paramImageScale;
+    const angle = angleBetweenLines(m.points[0], m.points[1], l.points[1], l.points[0], ps, imageScale);
     return {
       value: angle,
       unit: '°',

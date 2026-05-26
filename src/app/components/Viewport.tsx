@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useCallback } from 'react';
+import { useRef, useEffect, useLayoutEffect, useState, useCallback } from 'react';
 import type { WindowLevel, MeasurementTool, Measurement, PointUpdater } from './MedicalImageViewer';
 import { Slider } from './ui/slider';
 
@@ -36,7 +36,7 @@ interface ViewportProps {
   activeTool: MeasurementTool;
   measurements: Measurement[];
   onMeasurementAdd: (measurement: Measurement) => void;
-  onMeasurementUpdate?: (id: string, newPoints: PointUpdater, value?: string) => void;
+  onMeasurementUpdate?: (id: string, newPoints: PointUpdater, value?: string, imageScale?: { x: number; y: number }) => void;
   selectedMeasurementId?: string | null;
   onMeasurementSelect?: (id: string | null) => void;
   applyWeighting: (pixelValue: number) => number;
@@ -48,6 +48,9 @@ interface ViewportProps {
   onViewportReset?: () => void;
   /** Multi-viewer: hide this viewer (same as window chrome close). */
   onClose?: () => void;
+  /** Reports the viewport's display size when it changes so the parent can
+   *  compute the CSS→image-pixel scale for physical-unit conversions. */
+  onDisplaySizeChange?: (size: { width: number; height: number }) => void;
 }
 
 export function Viewport({
@@ -72,6 +75,7 @@ export function Viewport({
   onClose,
   measurementUnits = 'mm',
   pixelSpacing,
+  onDisplaySizeChange,
 }: ViewportProps) {
   const [wl, setWl] = useState<WindowLevel>(() =>
     sanitizeWindowLevel(defaultWindowLevel.window, defaultWindowLevel.level, defaultWindowLevel),
@@ -104,6 +108,15 @@ export function Viewport({
   const containerRef = useRef<HTMLDivElement>(null);
   const [displaySize, setDisplaySize] = useState({ width: 0, height: 0 });
   const displaySizeRef = useRef(displaySize);
+  // Propagate display size to parent so imageScale can be computed for protocol mm conversions.
+  // useLayoutEffect fires synchronously (before paint) so the parent's viewportDisplaySizes
+  // state is guaranteed to be updated before any useEffect (e.g. repositioning) runs,
+  // eliminating a one-frame flicker in protocol-computed values like TT-TG.
+  useLayoutEffect(() => {
+    if (displaySize.width > 0 && displaySize.height > 0) {
+      onDisplaySizeChange?.({ width: displaySize.width, height: displaySize.height });
+    }
+  }, [displaySize, onDisplaySizeChange]);
   // for debugging: container rect seen by ResizeObserver
   const [containerRect, setContainerRect] = useState({ width: 0, height: 0 });
   const [ancestorRects, setAncestorRects] = useState<{ parent: { width: number; height: number } | null; grandParent: { width: number; height: number } | null }>({ parent: null, grandParent: null });
@@ -411,19 +424,39 @@ export function Viewport({
     };
   }, [getPlaneGeometry]);
 
-  const emitMeasurementUpdate = useCallback((id: string, newPoints: PointUpdater, value?: string) => {
-    onMeasurementUpdate?.(id, newPoints, value);
+  const emitMeasurementUpdate = useCallback((id: string, newPoints: PointUpdater, value?: string, imageScale?: { x: number; y: number }) => {
+    onMeasurementUpdate?.(id, newPoints, value, imageScale);
     try {
       lastBaselineUpdateRef.current.set(id, Date.now());
     } catch {}
   }, [onMeasurementUpdate]);
 
+  // Compute the current CSS→image-pixel scale factor from displaySize.
+  // Mirrors the draw-area logic in the repositioning effect and
+  // calculateMeasurementValue so it's always consistent.
+  const computeImageScale = useCallback((): { x: number; y: number } => {
+    const { width: imgW, height: imgH, spacingX: geomSpacingX, spacingY: geomSpacingY } = getPlaneGeometry();
+    const spcX = (pixelSpacing && pixelSpacing.x > 0 ? pixelSpacing.x : geomSpacingX) || 1;
+    const spcY = (pixelSpacing && pixelSpacing.y > 0 ? pixelSpacing.y : geomSpacingY) || 1;
+    const dW = displaySize.width || imgW || 1;
+    const dH = displaySize.height || imgH || 1;
+    const physicalW = Math.max(1, imgW * spcX);
+    const physicalH = Math.max(1, imgH * spcY);
+    const fitScale = Math.min(dW / physicalW, dH / physicalH);
+    const drawW = Math.max(1, Math.round(physicalW * fitScale));
+    const drawH = Math.max(1, Math.round(physicalH * fitScale));
+    return { x: imgW / drawW, y: imgH / drawH };
+  }, [displaySize, getPlaneGeometry, pixelSpacing]);
+
   const emitMeasurementAdd = useCallback((m: Measurement) => {
-    onMeasurementAdd(m);
+    // Stamp the current imageScale on every new measurement so protocol
+    // step results always have the correct px→mm conversion factor.
+    const withScale: Measurement = { ...m, imageScale: m.imageScale ?? computeImageScale() };
+    onMeasurementAdd(withScale);
     try {
       lastBaselineUpdateRef.current.set(m.id, Date.now());
     } catch {}
-  }, [onMeasurementAdd]);
+  }, [onMeasurementAdd, computeImageScale]);
 
   const prevDisplaySizeRef = useRef<{ width: number; height: number } | null>(null);
   useEffect(() => {
@@ -463,9 +496,13 @@ export function Viewport({
     // scale corrupts positions when the aspect ratio changes.  We map each
     // point through image-fraction space instead:
     //   canvas px  →  fraction of draw area  →  new canvas px
-    const { width: imgW, height: imgH, spacingX, spacingY } = getPlaneGeometry();
-    const physicalW = Math.max(1, imgW * spacingX);
-    const physicalH = Math.max(1, imgH * spacingY);
+    const { width: imgW, height: imgH, spacingX: geomSpacingX, spacingY: geomSpacingY } = getPlaneGeometry();
+    // Match the spacing source used by calculateMeasurementValue so the draw
+    // area is identical to the one used for px↔mm conversion.
+    const spcX = (pixelSpacing && pixelSpacing.x > 0 ? pixelSpacing.x : geomSpacingX) || 1;
+    const spcY = (pixelSpacing && pixelSpacing.y > 0 ? pixelSpacing.y : geomSpacingY) || 1;
+    const physicalW = Math.max(1, imgW * spcX);
+    const physicalH = Math.max(1, imgH * spcY);
 
     const drawArea = (dW: number, dH: number) => {
       const scale = Math.min(dW / physicalW, dH / physicalH);
@@ -476,18 +513,43 @@ export function Viewport({
 
     const oldArea = drawArea(prev.width, prev.height);
     const newArea = drawArea(cur.width, cur.height);
+    const currentImageScale = computeImageScale();
 
+    // Only remap baselines (distance / line / angle).  Perpendicular anchors
+    // are automatically recalculated by handleMeasurementUpdate when their
+    // parent baseline is moved, so emitting a second update for the same
+    // perpendicular would conflict with the baseline’s update inside React’s
+    // batched state processing and leave the baseline at its old coordinates.
     for (const m of measurements) {
+      if (m.type === 'perpendicular') continue;
       emitMeasurementUpdate(m.id, (oldPoints) =>
         oldPoints.map((p) => ({
           x: ((p.x - oldArea.offsetX) / oldArea.drawW) * newArea.drawW + newArea.offsetX,
           y: ((p.y - oldArea.offsetY) / oldArea.drawH) * newArea.drawH + newArea.offsetY,
         })),
+        undefined,
+        currentImageScale,
+      );
+    }
+
+    // Remap any perpendiculars whose baseline was NOT processed above
+    // (e.g. the baseline belongs to a different plane / is hidden).
+    const remappedIds = new Set(measurements.filter(m => m.type !== 'perpendicular').map(m => m.id));
+    for (const m of measurements) {
+      if (m.type !== 'perpendicular') continue;
+      if (m.baseLineId && remappedIds.has(m.baseLineId)) continue;
+      emitMeasurementUpdate(m.id, (oldPoints) =>
+        oldPoints.map((p) => ({
+          x: ((p.x - oldArea.offsetX) / oldArea.drawW) * newArea.drawW + newArea.offsetX,
+          y: ((p.y - oldArea.offsetY) / oldArea.drawH) * newArea.drawH + newArea.offsetY,
+        })),
+        undefined,
+        currentImageScale,
       );
     }
 
     prevDisplaySizeRef.current = cur;
-  }, [displaySize, measurements, onMeasurementUpdate, isPanning, isDrawing, emitMeasurementUpdate, getPlaneGeometry]);
+  }, [displaySize, measurements, onMeasurementUpdate, isPanning, isDrawing, emitMeasurementUpdate, getPlaneGeometry, pixelSpacing]);
 
   // New volume buffer → reset this viewer’s W/L and brightness only (no cross-viewport state).
   const prevImageDataRef = useRef<Uint8Array | null>(null);
@@ -1306,13 +1368,23 @@ export function Viewport({
   // Calculate measurement value (prefer physical units mm when possible)
   const calculateMeasurementValue = (type: MeasurementTool, points: { x: number; y: number }[]): string => {
     const { width: imgW, height: imgH, spacingX: geomSpacingX, spacingY: geomSpacingY } = getPlaneGeometry();
-    const displayW = displaySize.width || imgW || 1;
-    const displayH = displaySize.height || imgH || 1;
     const spacingX = pixelSpacing && pixelSpacing.x > 0 ? pixelSpacing.x : geomSpacingX || 1;
     const spacingY = pixelSpacing && pixelSpacing.y > 0 ? pixelSpacing.y : geomSpacingY || 1;
-    const pxPerCssX = imgW / displayW;
-    const pxPerCssY = imgH / displayH;
-    // mm per CSS pixel = (image_pixels * spacing_mm_per_image_pixel) / display_css_pixels
+
+    // The image is letterboxed / pillarboxed inside the display canvas.
+    // Measurement CSS-pixel coordinates are relative to the draw area, not
+    // the full display, so px↔mm conversion must use drawW / drawH.
+    const dW = displaySize.width || imgW || 1;
+    const dH = displaySize.height || imgH || 1;
+    const physicalW = Math.max(1, imgW * spacingX);
+    const physicalH = Math.max(1, imgH * spacingY);
+    const fitScale = Math.min(dW / physicalW, dH / physicalH);
+    const drawW = Math.max(1, Math.round(physicalW * fitScale));
+    const drawH = Math.max(1, Math.round(physicalH * fitScale));
+
+    const pxPerCssX = imgW / drawW;
+    const pxPerCssY = imgH / drawH;
+    // mm per CSS pixel = (image_pixels * spacing_mm_per_image_pixel) / draw_css_pixels
     const mmPerCssX = pxPerCssX * spacingX;
     const mmPerCssY = pxPerCssY * spacingY;
 
@@ -1882,13 +1954,16 @@ export function Viewport({
             const perpX = len > 0 ? -dy / len : 0;
             const perpY = len > 0 ? dx / len : 0;
             const stubLen = 40;
+            const stubPoints = [
+              { x: midX, y: midY },
+              { x: midX + perpX * stubLen, y: midY + perpY * stubLen },
+            ];
+            const stubValue = calculateMeasurementValue('perpendicular', stubPoints);
             emitMeasurementAdd({
               id: Date.now().toString(),
               type: 'perpendicular',
-              points: [
-                { x: midX, y: midY },
-                { x: midX + perpX * stubLen, y: midY + perpY * stubLen },
-              ],
+              points: stubPoints,
+              value: stubValue,
               slice: currentSlice,
               plane: measurementPlane,
               baseLineId: targetLineId,
