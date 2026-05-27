@@ -331,7 +331,12 @@ const SULCUS_ANGLE: MeasurementProtocol = {
     const l = results['lateral-line'];
     if (!m || m.points.length < 2 || !l || l.points.length < 2) return null;
     const imageScale = m.imageScale ?? l.imageScale ?? paramImageScale;
-    const angle = angleBetweenLines(m.points[0], m.points[1], l.points[1], l.points[0], ps, imageScale);
+    // Both lines share the groove point as their second endpoint (points[1]).
+    // Vectors groove→condyle naturally point posteriorly in similar directions
+    // and yield an acute angle; the clinical sulcus angle is the supplement
+    // (the obtuse angle opening posteriorly between the trochlear facets).
+    const raw = angleBetweenLines(m.points[1], m.points[0], l.points[1], l.points[0], ps, imageScale);
+    const angle = raw < 90 ? 180 - raw : raw;
     return {
       value: angle,
       unit: '°',

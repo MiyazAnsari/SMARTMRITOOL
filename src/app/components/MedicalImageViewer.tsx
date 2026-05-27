@@ -327,11 +327,18 @@ export function MedicalImageViewer({
       const id = `${workflow.protocolId}-${Date.now()}`;
       setCurrentGroupId(id);
       currentGroupIdRef.current = id;
+      // Reset per-group measurement counter when starting a new protocol.
+      groupCountsRef.current = { distanceCount: 0, perpCount: 0 };
     } else {
       setCurrentGroupId(null);
       currentGroupIdRef.current = null;
+      groupCountsRef.current = { distanceCount: 0, perpCount: 0 };
     }
   }, [workflow.protocolId]);
+
+  // Synchronously-tracked measurement counts per group so the limiting
+  // check in handleMeasurementAdd never sees stale React state.
+  const groupCountsRef = useRef<{ distanceCount: number; perpCount: number }>({ distanceCount: 0, perpCount: 0 });
 
   useEffect(() => {
     console.debug('[MedicalImageViewer] currentGroupId changed', currentGroupId);
@@ -746,14 +753,20 @@ export function MedicalImageViewer({
   const handleMeasurementAdd = useCallback(
     (measurement: Measurement) => {
       if (currentGroupIdRef.current && protocol) {
-        const groupMeasurements = measurements.filter((m) => m.groupId === currentGroupIdRef.current);
         const lineStepCount = protocol.steps.filter((step) => step.primitive === 'line' || step.primitive === 'distance').length;
         const pointStepCount = protocol.steps.filter((step) => step.primitive === 'point').length;
-        const distanceCount = groupMeasurements.filter((m) => m.type === 'distance' || m.type === 'line').length;
-        const perpCount = groupMeasurements.filter((m) => m.type === 'perpendicular').length;
+        const counts = groupCountsRef.current;
 
-        if ((measurement.type === 'distance' || measurement.type === 'line') && distanceCount >= lineStepCount) return;
-        if (measurement.type === 'perpendicular' && perpCount >= pointStepCount) return;
+        if ((measurement.type === 'distance' || measurement.type === 'line') && counts.distanceCount >= lineStepCount) return;
+        if (measurement.type === 'perpendicular' && counts.perpCount >= pointStepCount) return;
+
+        // Increment synchronously so the next invocation sees the updated count
+        // regardless of whether React has committed the state update yet.
+        if (measurement.type === 'distance' || measurement.type === 'line') {
+          counts.distanceCount += 1;
+        } else if (measurement.type === 'perpendicular') {
+          counts.perpCount += 1;
+        }
       }
 
       const stamped: Measurement = {
@@ -1113,6 +1126,15 @@ export function MedicalImageViewer({
         setLocalMeasurements(updater);
       }
 
+      // Decrement the ref-based counter so the limiting check stays accurate.
+      if (target) {
+        if (target.type === 'distance' || target.type === 'line') {
+          groupCountsRef.current.distanceCount = Math.max(0, groupCountsRef.current.distanceCount - 1);
+        } else if (target.type === 'perpendicular') {
+          groupCountsRef.current.perpCount = Math.max(0, groupCountsRef.current.perpCount - 1);
+        }
+      }
+
       if (protocol && target) {
         const stepId =
           target.workflowStepId ||
@@ -1174,6 +1196,7 @@ export function MedicalImageViewer({
     }
 
     setWorkflow((prev) => ({ ...prev, protocolId: protocol.id, activeStepIndex: 0, stepResults: {} }));
+    groupCountsRef.current = { distanceCount: 0, perpCount: 0 };
   }, [
     archiveMeasurementMode,
     measurements,
