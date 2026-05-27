@@ -2178,56 +2178,6 @@ export function Viewport({
             </button>
             <button
               type="button"
-              className={`px-1.5 py-0.5 rounded border text-[10px] ${
-                isZoomMode
-                  ? 'bg-blue-600 border-blue-500 text-white'
-                  : 'bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700'
-              }`}
-              onClick={(e) => {
-                e.stopPropagation();
-                setIsZoomMode((v) => {
-                  const next = !v;
-                  if (next) dismissCanvasToolModes();
-                  return next;
-                });
-              }}
-              title="Zoom: wheel zooms toward cursor; use +/− for trackpad (this viewer only)"
-              aria-expanded={isZoomMode}
-            >
-              Zoom{isZoomMode ? ' ▼' : ''}
-            </button>
-            {isZoomMode ? (
-              <>
-                <button
-                  type="button"
-                  className="min-w-[1.35rem] px-1 py-0.5 rounded border text-[11px] font-semibold leading-none bg-gray-800 border-gray-700 text-gray-100 hover:bg-gray-700 disabled:opacity-35 disabled:pointer-events-none"
-                  disabled={zoomScale >= VIEWPORT_ZOOM_MAX - 0.02}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    zoomInStep();
-                  }}
-                  title="Zoom in (viewport center)"
-                  aria-label="Zoom in"
-                >
-                  +
-                </button>
-                <button
-                  type="button"
-                  className="min-w-[1.35rem] px-1 py-0.5 rounded border text-[11px] font-semibold leading-none bg-gray-800 border-gray-700 text-gray-100 hover:bg-gray-700 disabled:opacity-35 disabled:pointer-events-none"
-                  disabled={zoomScale <= VIEWPORT_ZOOM_MIN + 0.02}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    zoomOutStep();
-                  }}
-                  title="Zoom out (viewport center)"
-                  aria-label="Zoom out"
-                >
-                  −
-                </button>
-              </>
-            ) : null}
-            <button
-              type="button"
               className="px-1.5 py-0.5 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-[10px] text-gray-100"
               onClick={(e) => {
                 e.stopPropagation();
@@ -2365,9 +2315,7 @@ export function Viewport({
                 ref={overlayCanvasRef}
                 className="absolute inset-0 w-full h-full"
                 style={{
-                  cursor: isZoomMode
-                      ? 'zoom-in'
-                      : isAxial && isRotateMode
+                  cursor: isAxial && isRotateMode
                         ? 'ew-resize'
                         : activeTool === 'pan'
                           ? (isPanning ? 'grabbing' : 'grab')
