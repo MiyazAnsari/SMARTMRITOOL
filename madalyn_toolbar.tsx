@@ -6,7 +6,6 @@ import {
   Trash2,
   MousePointer
 } from 'lucide-react';
-import { CornerDownLeft } from 'lucide-react';
 import { MeasurementTool, type Measurement } from './MedicalImageViewer';
 import { ScrollArea } from '@/app/components/ui/scroll-area';
 import { useState } from 'react';
@@ -16,8 +15,6 @@ interface ToolbarProps {
   onToolChange: (tool: MeasurementTool) => void;
   measurements: Measurement[];
   onMeasurementDelete: (id: string) => void;
-  selectedMeasurementId?: string | null;
-  onMeasurementSelect?: (id: string | null) => void;
   /** show/hide crosshair in viewport */
   showCrosshair: boolean;
   onToggleCrosshair: () => void;
@@ -25,21 +22,10 @@ interface ToolbarProps {
   onAutoWindowLevel: () => void;
 }
 
-export function Toolbar({
-  activeTool,
-  onToolChange,
-  measurements,
-  onMeasurementDelete,
-  selectedMeasurementId,
-  onMeasurementSelect,
-  showCrosshair,
-  onToggleCrosshair,
-  onAutoWindowLevel,
-}: ToolbarProps) {
+export function Toolbar({ activeTool, onToolChange, measurements, onMeasurementDelete, showCrosshair, onToggleCrosshair, onAutoWindowLevel }: ToolbarProps) {
   const tools: { id: MeasurementTool; icon: any; label: string }[] = [
     { id: 'none', icon: MousePointer, label: 'Select' },
     { id: 'distance', icon: Ruler, label: 'Distance' },
-    { id: 'perpendicular', icon: CornerDownLeft, label: 'Perp' },
     { id: 'angle', icon: Triangle, label: 'Angle' },
   ];
   // Group measurements by groupId
@@ -118,51 +104,18 @@ export function Toolbar({
                   </button>
                   {!collapsedGroups[groupId] && (
                     <div className="space-y-2">
-                      {groupMeasurements.map((measurement) => {
-                        const selected = selectedMeasurementId === measurement.id;
-                        return (
-                          <div
-                            key={measurement.id}
-                            className={`flex items-stretch justify-between rounded border px-2 py-2 text-xs transition-colors ${
-                              selected
-                                ? 'border-blue-500 bg-blue-950/60 ring-1 ring-blue-400/70'
-                                : 'border-gray-700 bg-gray-800 hover:border-gray-500 hover:bg-gray-750'
-                            }`}
-                          >
-                            <button
-                              type="button"
-                              className="flex-1 min-w-0 text-left pr-2"
-                              onClick={() => onMeasurementSelect?.(measurement.id)}
-                            >
-                              <div className={`font-semibold capitalize ${selected ? 'text-blue-100' : 'text-gray-100'}`}>
-                                {measurement.label || measurement.type}
-                              </div>
-                              <div className="text-gray-400 mt-0.5">{measurement.plane} · slice {measurement.slice}</div>
-                              {measurement.value && <div className="mt-1 text-blue-300 font-medium">{measurement.value}</div>}
-                            </button>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className={`h-8 px-2 self-start text-[10px] ${
-                                selected ? 'text-blue-200 hover:bg-blue-900/40' : 'text-gray-300 hover:bg-gray-700 hover:text-white'
-                              }`}
-                              onClick={() => onMeasurementSelect?.(measurement.id)}
-                              aria-label={`Select measurement ${measurement.id}`}
-                            >
-                              {selected ? 'Selected' : 'Select'}
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-8 w-8 p-0 self-start text-gray-500 hover:text-red-400 hover:bg-gray-700"
-                              onClick={() => onMeasurementDelete(measurement.id)}
-                              aria-label={`Delete measurement ${measurement.id}`}
-                            >
-                              <Trash2 className="h-3 w-3" />
-                            </Button>
+                      {groupMeasurements.map((measurement) => (
+                        <div key={measurement.id} className="flex items-start justify-between bg-gray-800 p-2 rounded text-xs">
+                          <div className="flex-1 mr-2">
+                            <div className="font-medium text-gray-300 capitalize">{measurement.label || measurement.type}</div>
+                            <div className="text-gray-500 mt-0.5">{measurement.plane} - Slice {measurement.slice}</div>
+                            {measurement.value && <div className="text-blue-400 mt-1">{measurement.value}</div>}
                           </div>
-                        );
-                      })}
+                          <Button variant="ghost" size="sm" className="h-6 w-6 p-0 text-gray-500 hover:text-red-400 hover:bg-gray-700" onClick={() => onMeasurementDelete(measurement.id)}>
+                            <Trash2 className="h-3 w-3" />
+                          </Button>
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>

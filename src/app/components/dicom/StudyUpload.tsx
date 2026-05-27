@@ -48,12 +48,39 @@ export function StudyUpload({ onNiftiLoad, onStudyLoad }: StudyUploadProps) {
     if (!files || !files.length) return;
     try {
       setBusy(true);
-      setProgress(`Parsing ${files.length} DICOM files…`);
-      const study = await loadDicomStudy(files, (m) => setProgress(m));
-      if (!studyHasVolumes(study)) {
-        alert('No DICOM volumes could be loaded from that folder.');
-      } else {
+      const dicomFiles = Array.from(files).filter((f) => f.name);
+      const patientGroups = new Map<string, File[]>();
+      for (const file of dicomFiles) {
+        const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
+        const trimmedRel = rel.includes('/') ? rel.split('/').slice(1).join('/') : rel;
+        const patientKey = trimmedRel.split('/')[0] || rel.split('/')[0] || file.name;
+        const group = patientGroups.get(patientKey) || [];
+        const normalizedFile = new File([file], file.name, {
+          type: file.type,
+          lastModified: file.lastModified,
+        }) as File & { webkitRelativePath?: string };
+        Object.defineProperty(normalizedFile, 'webkitRelativePath', {
+          value: trimmedRel,
+          enumerable: true,
+          configurable: true,
+        });
+        group.push(normalizedFile);
+        patientGroups.set(patientKey, group);
+      }
+
+      setProgress(`Parsing ${patientGroups.size} patient folder(s)…`);
+
+      let loadedStudies = 0;
+      for (const [patientKey, patientFiles] of patientGroups) {
+        setProgress(`Parsing ${patientKey} (${patientFiles.length} files)…`);
+        const study = await loadDicomStudy(patientFiles, (m) => setProgress(`${patientKey}: ${m}`));
+        if (!studyHasVolumes(study)) continue;
         onStudyLoad(study);
+        loadedStudies += 1;
+      }
+
+      if (loadedStudies === 0) {
+        alert('No DICOM volumes could be loaded from that folder.');
       }
     } catch (err) {
       console.error(err);

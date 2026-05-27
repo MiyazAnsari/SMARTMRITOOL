@@ -25,6 +25,11 @@ interface ViewportGridProps {
   activeTool: MeasurementTool;
   measurements: Measurement[];
   onMeasurementAdd: (measurement: Measurement) => void;
+  onMeasurementUpdate?: (id: string, newPoints: { x: number; y: number }[], value?: string, imageScale?: { x: number; y: number }) => void;
+  pixelSpacing?: { x: number; y: number };
+  measurementUnits?: 'mm' | 'px';
+  selectedMeasurementId?: string | null;
+  onMeasurementSelect?: (id: string | null) => void;
   applyWeighting: (pixelValue: number) => number;
   showCrosshair?: boolean;
   /** Multi-sequence mode (study): one draggable window per sequence. */
@@ -33,6 +38,8 @@ interface ViewportGridProps {
   onHideWindow?: (plane: Plane) => void;
   /** Restore defaults for the given acquisition plane / viewer only. */
   onResetViewport?: (plane: Plane) => void;
+  /** Per-plane display size callback for px↔mm conversion. */
+  onDisplaySizeChange?: (plane: Plane, size: { width: number; height: number }) => void;
 }
 
 type Rect = { top: number; left: number; width: number; height: number; z?: number };
@@ -47,13 +54,20 @@ export function ViewportGrid({
   activeTool,
   measurements,
   onMeasurementAdd,
+  onMeasurementUpdate,
+  pixelSpacing,
+  measurementUnits,
+  selectedMeasurementId,
+  onMeasurementSelect,
   applyWeighting,
   showCrosshair = false,
   sequenceWindows,
   onWindowFocus,
   onHideWindow,
   onResetViewport,
+  onDisplaySizeChange,
 }: ViewportGridProps) {
+  // pixelSpacing is optional and provided by parent when available
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [positions, setPositions] = useState<Record<string, Rect>>({});
   const zCounterRef = useRef<number>(100);
@@ -148,7 +162,13 @@ export function ViewportGrid({
   if (!sequenceMode) {
     const planeSlice =
       viewPlane === 'axial' ? currentSlice.axial : viewPlane === 'sagittal' ? currentSlice.sagittal : currentSlice.coronal;
-    const planeMeasurements = measurements.filter((m) => m.plane === viewPlane);
+    const planeMeasurements = measurements.filter((m) => {
+      if ((m.plane ?? viewPlane) !== viewPlane) return false;
+      // If propagation is disabled for this measurement, only show on the exact slice
+      const propagate = m.propagateAcrossSlices ?? true;
+      if (propagate) return true;
+      return m.slice === planeSlice;
+    });
 
     return (
       <div ref={containerRef} className="flex-1 min-h-0 min-w-0 flex flex-col bg-gray-950 relative">
@@ -165,9 +185,15 @@ export function ViewportGrid({
               activeTool={activeTool}
               measurements={planeMeasurements}
               onMeasurementAdd={onMeasurementAdd}
+              onMeasurementUpdate={onMeasurementUpdate}
+              pixelSpacing={pixelSpacing}
+              measurementUnits={measurementUnits}
+              selectedMeasurementId={selectedMeasurementId}
+              onMeasurementSelect={onMeasurementSelect}
               applyWeighting={applyWeighting}
               showCrosshair={showCrosshair}
               onViewportReset={() => onResetViewport?.(viewPlane)}
+              onDisplaySizeChange={(size) => onDisplaySizeChange?.(viewPlane, size)}
             />
           </div>
         </div>
@@ -223,7 +249,7 @@ export function ViewportGrid({
               </div>
             </div>
             <div className="flex-1 min-h-0 min-w-0 relative flex flex-col">
-              <Viewport
+                <Viewport
                 imageData={w.imageData}
                 header={w.header}
                 plane="axial"
@@ -233,13 +259,24 @@ export function ViewportGrid({
                 onSliceChange={(slice) => onSliceChange(w.id, slice)}
                 defaultWindowLevel={w.defaultWindowLevel}
                 activeTool={activeTool}
-                measurements={measurements.filter((m) => m.plane === w.id)}
+                measurements={measurements.filter((m) => {
+                  if ((m.plane ?? w.id) !== w.id) return false;
+                  const propagate = m.propagateAcrossSlices ?? true;
+                  if (propagate) return true;
+                  return m.slice === sequenceSlice;
+                })}
                 onMeasurementAdd={onMeasurementAdd}
+                onMeasurementUpdate={onMeasurementUpdate}
+                pixelSpacing={pixelSpacing}
+                measurementUnits={measurementUnits}
+                selectedMeasurementId={selectedMeasurementId}
+                onMeasurementSelect={onMeasurementSelect}
                 applyWeighting={applyWeighting}
                 showCrosshair={showCrosshair}
                 parentWindowHeight={pos.height}
                 onViewportReset={() => onResetViewport?.(w.id)}
                 onClose={() => onHideWindow?.(w.id)}
+                onDisplaySizeChange={(size) => onDisplaySizeChange?.(w.id, size)}
               />
               <div
                 onMouseDown={(e) => startResize(w.id, e)}
