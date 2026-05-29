@@ -1,8 +1,11 @@
 import { useRef, useState } from 'react';
 import * as pako from 'pako';
+// @ts-ignore - dicom-parser ships its own .d.ts but JS module shape varies
+import dicomParser from 'dicom-parser';
 import { Upload, FolderOpen, Loader2 } from 'lucide-react';
 import { Button } from '../ui/button';
 import { loadDicomStudy, type DicomStudy } from './DicomStudy';
+import { groupFilesByDirectory, isProbablyDicom } from './DicomLoader';
 import { studyHasVolumes } from './patientStudy';
 
 interface StudyUploadProps {
@@ -10,6 +13,23 @@ interface StudyUploadProps {
   onNiftiLoad: (data: ArrayBuffer, name: string) => void;
   /** Called when a DICOM study (one or more series) finishes loading. */
   onStudyLoad: (study: DicomStudy) => void;
+}
+
+// ---------------------------------------------------------------------------
+// Lightweight DICOM metadata peek (reads a single tag without parsing pixels)
+// ---------------------------------------------------------------------------
+
+const TAG_PATIENT_ID = 'x00100020';
+
+function peekPatientId(buffer: ArrayBuffer): string | null {
+  try {
+    const byteArray = new Uint8Array(buffer);
+    const dataSet = dicomParser.parseDicom(byteArray);
+    const v = dataSet.string(TAG_PATIENT_ID);
+    return v ? v.trim() : null;
+  } catch {
+    return null;
+  }
 }
 
 export function StudyUpload({ onNiftiLoad, onStudyLoad }: StudyUploadProps) {
@@ -49,31 +69,49 @@ export function StudyUpload({ onNiftiLoad, onStudyLoad }: StudyUploadProps) {
     try {
       setBusy(true);
       const dicomFiles = Array.from(files).filter((f) => f.name);
+
+      // ---- group files by DICOM PatientID --------------------------------
+      // 1. Split files by their immediate parent directory (same as
+      //    loadDicomStudy does internally).
+      // 2. Peek at the first file in each directory to read PatientID.
+      // 3. Merge directories that share the same PatientID into one study.
+      // This uses authoritative DICOM metadata instead of fragile folder-name
+      // heuristics — works with any naming convention (LeftKnee, Knee_MRI_Lt,
+      // 9001695, etc.).
+      const dirGroups = groupFilesByDirectory(dicomFiles);
       const patientGroups = new Map<string, File[]>();
-      for (const file of dicomFiles) {
-        const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
-        const trimmedRel = rel.includes('/') ? rel.split('/').slice(1).join('/') : rel;
-        const patientKey = trimmedRel.split('/')[0] || rel.split('/')[0] || file.name;
-        const group = patientGroups.get(patientKey) || [];
-        const normalizedFile = new File([file], file.name, {
-          type: file.type,
-          lastModified: file.lastModified,
-        }) as File & { webkitRelativePath?: string };
-        Object.defineProperty(normalizedFile, 'webkitRelativePath', {
-          value: trimmedRel,
-          enumerable: true,
-          configurable: true,
-        });
-        group.push(normalizedFile);
-        patientGroups.set(patientKey, group);
+
+      for (const [, dirFiles] of dirGroups) {
+        // Peek at the first DICOM-looking file in this directory
+        const dicomFile = dirFiles.find((f) => isProbablyDicom(f.name));
+        let patientId = 'unknown';
+        if (dicomFile) {
+          const buf = await dicomFile.arrayBuffer();
+          const id = peekPatientId(buf);
+          if (id) patientId = id;
+        }
+
+        const group = patientGroups.get(patientId) || [];
+        for (const f of dirFiles) group.push(f);
+        patientGroups.set(patientId, group);
       }
 
-      setProgress(`Parsing ${patientGroups.size} patient folder(s)…`);
+      // All studies loaded in this batch share a token so handleStudyLoad
+      // never merges different patients from the same top-level pick.
+      const batchId = `batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+      setProgress(`Parsing ${patientGroups.size} patient(s)…`);
 
       let loadedStudies = 0;
-      for (const [patientKey, patientFiles] of patientGroups) {
-        setProgress(`Parsing ${patientKey} (${patientFiles.length} files)…`);
-        const study = await loadDicomStudy(patientFiles, (m) => setProgress(`${patientKey}: ${m}`));
+      for (const [patientId, patientFiles] of patientGroups) {
+        setProgress(`Parsing patient ${patientId} (${patientFiles.length} files)…`);
+        const study = await loadDicomStudy(
+          patientFiles,
+          (m) => setProgress(`${patientId}: ${m}`),
+          patientId !== 'unknown' ? patientId : undefined,
+        );
+        study.batchId = batchId;
+
         if (!studyHasVolumes(study)) continue;
         onStudyLoad(study);
         loadedStudies += 1;

@@ -53,23 +53,27 @@ export function lateralityFromDicomTag(value: string | undefined): Laterality | 
   return null;
 }
 
-/** Resolve laterality for a volume using series name, then path, then DICOM tag. */
+/** Resolve laterality for a volume using DICOM metadata first, then series
+ *  description text, with folder-name / path heuristics as the last resort. */
 export function detectSeriesLaterality(
   ...parts: (string | undefined | null)[]
 ): Laterality | null {
   const texts = parts.filter((p): p is string => Boolean(p && p.trim()));
 
-  const fromSeries = lateralityFromSeriesText(texts[0]);
-  if (fromSeries) return fromSeries;
-
-  for (const t of texts) {
-    const fromPath = lateralityFromPath(t);
-    if (fromPath) return fromPath;
-  }
-
+  // 1. DICOM Laterality tag (0020,0060) — authoritative
   for (const t of texts) {
     const fromTag = lateralityFromDicomTag(t);
     if (fromTag) return fromTag;
+  }
+
+  // 2. SeriesDescription text (often contains "LEFT", "RIGHT", "RT KNEE", etc.)
+  const fromSeries = lateralityFromSeriesText(texts[0]);
+  if (fromSeries) return fromSeries;
+
+  // 3. Path / folder-name heuristics (lowest priority)
+  for (const t of texts) {
+    const fromPath = lateralityFromPath(t);
+    if (fromPath) return fromPath;
   }
 
   return null;
@@ -79,9 +83,10 @@ export function lateralityForVolume(vol: {
   seriesDescription?: string;
   laterality?: Laterality;
 }): Laterality | null {
+  // DICOM Laterality tag first, then SeriesDescription text
   return (
-    lateralityFromSeriesText(vol.seriesDescription) ??
-    (vol.laterality === 'left' || vol.laterality === 'right' ? vol.laterality : null)
+    (vol.laterality === 'left' || vol.laterality === 'right' ? vol.laterality : null) ??
+    lateralityFromSeriesText(vol.seriesDescription)
   );
 }
 

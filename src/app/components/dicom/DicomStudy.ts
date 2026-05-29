@@ -22,6 +22,10 @@ export interface DicomStudy {
   patientId: string;
   patientName: string;
   studyInstanceUID: string;
+  /** Opaque token shared by every study loaded in the same top-level folder
+   *  pick.  Two studies with the same batchId are guaranteed to be different
+   *  patients and must never be merged via PatientID matching. */
+  batchId?: string;
   knees: {
     left: KneeSequences;
     right: KneeSequences;
@@ -53,6 +57,7 @@ export function mergeStudies(existing: DicomStudy, incoming: DicomStudy): DicomS
     patientId: incoming.patientId || existing.patientId,
     patientName: incoming.patientName || existing.patientName,
     studyInstanceUID: incoming.studyInstanceUID || existing.studyInstanceUID,
+    batchId: existing.batchId || incoming.batchId,
     knees,
   };
 }
@@ -126,12 +131,22 @@ function rebalanceKneesFromMetadata(knees: DicomStudy['knees']): void {
 export async function loadDicomStudy(
   fileList: FileList | File[],
   onProgress?: (msg: string) => void,
+  studyNameOverride?: string,
 ): Promise<DicomStudy> {
   const files = Array.from(fileList).filter((f) => isProbablyDicom(f.name));
   const groups = groupFilesByDirectory(files);
 
   const firstRel = (files[0] as File & { webkitRelativePath?: string })?.webkitRelativePath || files[0]?.name || 'Study';
-  const studyName = firstRel.split('/')[0] || 'Study';
+  let studyName = studyNameOverride || firstRel.split('/')[0] || 'Study';
+
+  // If the folder-derived name looks like a laterality folder (LeftKnee /
+  // RightKnee), a DICOM plane folder (A_DICOM / S_DICOM / C_DICOM), or a bare
+  // filename with an extension, defer to the DICOM PatientName (or PatientID)
+  // which we will have after parsing the series below.
+  const isGenericFolderName =
+    /^(left|right)[\s_-]*knee|knee[\s_-]*(left|right)|^(lk|rk)$/i.test(studyName) ||
+    /^[asc][_\s-]*dicom$/i.test(studyName) ||
+    /\.[a-z0-9]{1,6}$/i.test(studyName);
 
   const knees = emptyKnees();
 
@@ -145,13 +160,23 @@ export async function loadDicomStudy(
       (dirFiles[0] as File & { webkitRelativePath?: string })?.webkitRelativePath || dirFiles[0]?.name || '';
     const dirHint = planeFromName(dir.split('/').pop() || dir);
     const pathHint = planeHintFromRelativePath(firstRelPath);
-    const seriesHint = dirHint ?? pathHint;
 
-    const vol = await loadDicomSeries(buffers, seriesHint || undefined);
+    // Pass folder-name hints to loadDicomSeries — detectPlane will use them
+    // only as a last resort after IOP and SeriesDescription.
+    const vol = await loadDicomSeries(buffers, (dirHint ?? pathHint) || undefined);
     if (!vol) continue;
 
-    const finalPlane = dirHint ?? pathHint ?? vol.plane;
-    vol.plane = finalPlane;
+    // DICOM-determined plane (from IOP) is authoritative; folder hints are
+    // already incorporated by detectPlane as a fallback — don't override.
+    // Only use the raw folder hint if vol.plane is still the hardcoded
+    // default (meaning IOP was absent AND SeriesDescription had no clue).
+    if (
+      vol.plane === 'axial' &&
+      !vol.seriesDescription &&
+      (dirHint || pathHint)
+    ) {
+      vol.plane = (dirHint ?? pathHint)!;
+    }
 
     const dicomLat = buffers[0] ? readLateralityFromDicomBuffer(buffers[0].buffer) : null;
     const latHint = detectSeriesLaterality(
@@ -161,11 +186,11 @@ export async function loadDicomStudy(
       dicomLat ?? undefined,
     );
     const occupied = {
-      left: Boolean(knees.left.volumes[finalPlane]),
-      right: Boolean(knees.right.volumes[finalPlane]),
+      left: Boolean(knees.left.volumes[vol.plane]),
+      right: Boolean(knees.right.volumes[vol.plane]),
     };
-    const laterality = resolveLateralityForPlane(latHint, finalPlane, occupied);
-    assignVolume(knees, laterality, finalPlane, vol);
+    const laterality = resolveLateralityForPlane(latHint, vol.plane, occupied);
+    assignVolume(knees, laterality, vol.plane, vol);
   }
 
   rebalanceKneesFromMetadata(knees);
@@ -174,11 +199,22 @@ export async function loadDicomStudy(
     .flatMap((lat) => (['axial', 'sagittal', 'coronal'] as Plane[]).map((p) => knees[lat].volumes[p]))
     .find(Boolean);
 
+  // When the folder-derived study name is a generic label (laterality folder,
+  // plane folder, or bare filename), use the DICOM PatientName / PatientID
+  // instead so the UI shows something meaningful.
+  const resolvedStudyName =
+    isGenericFolderName && representative
+      ? representative.patientName && representative.patientName !== 'Unknown Patient'
+        ? representative.patientName
+        : representative.patientId || studyName
+      : studyName;
+
   return {
-    studyName,
-    patientId: representative?.patientId || `unknown-${studyName}`,
+    studyName: resolvedStudyName,
+    patientId: representative?.patientId || `unknown-${resolvedStudyName}`,
     patientName: representative?.patientName || 'Unknown Patient',
     studyInstanceUID: representative?.studyInstanceUID || '',
+    batchId: undefined, // set by caller when loading multiple patients in one batch
     knees,
   };
 }

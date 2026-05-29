@@ -437,14 +437,49 @@ function App() {
 
   const handleStudyLoad = (study: DicomStudy) => {
     const uid = study.studyInstanceUID?.trim();
-    const baseKey =
-      uid ||
-      `${study.patientId || 'unknown'}::${(study.studyName || 'Study').replace(/[|]+/g, '_')}`;
     const prev = patientStudiesRef.current;
-    let key = baseKey;
-    if (!uid && prev.some((r) => r.key === key)) {
-      key = `${baseKey}__${Date.now()}`;
+
+    // Determine whether this study carries a real (non-placeholder) patient id.
+    const realPatientId =
+      study.patientId &&
+      study.patientId !== 'unknown' &&
+      !study.patientId.startsWith('unknown-')
+        ? study.patientId
+        : null;
+
+    // ---- resolve the merge key -------------------------------------------
+    // Priority:
+    //  1. Same StudyInstanceUID (most reliable)
+    //  2. Same real PatientID AND different batchId — handles left-knee /
+    //     right-knee loaded in separate folder-pick operations.  Studies
+    //     loaded together in the same batch share a batchId token and are
+    //     guaranteed to be different patients — never merge them.
+    //  3. Fallback: patientId::studyName
+    let existingKey: string | undefined;
+
+    if (uid) {
+      existingKey = prev.find((r) => r.study.studyInstanceUID === uid)?.key;
     }
+    if (!existingKey && realPatientId) {
+      existingKey = prev.find(
+        (r) =>
+          r.study.patientId === realPatientId &&
+          !(study.batchId && r.study.batchId === study.batchId),
+      )?.key;
+    }
+
+    let key: string;
+    if (existingKey) {
+      key = existingKey;
+    } else if (uid) {
+      key = uid;
+    } else {
+      key = `${study.patientId || 'unknown'}::${(study.studyName || 'Study').replace(/[|]+/g, '_')}`;
+      if (prev.some((r) => r.key === key)) {
+        key = `${key}__${Date.now()}`;
+      }
+    }
+
     const loadedKnee = firstAvailableLaterality(study);
     setPatientStudies((p) => {
       const idx = p.findIndex((r) => r.key === key);

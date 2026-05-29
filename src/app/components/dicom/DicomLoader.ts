@@ -207,15 +207,11 @@ function parseDicomFile(buffer: ArrayBuffer): ParsedSlice | null {
 }
 
 /**
- * Decide plane from folder hint + SeriesDescription first (reliable for A_/S_/C_DICOM),
- * then ImageOrientationPatient, then axial default.
+ * Decide plane using DICOM metadata first (most reliable), then
+ * SeriesDescription text, with folder-name hints as the last resort.
  */
 function detectPlane(slice: ParsedSlice, hint?: string): Plane {
-  const text = `${hint || ''} ${slice.seriesDescription || ''}`.toLowerCase();
-  if (/sag|sagittal|s_dicom\b|^s\b/.test(text)) return 'sagittal';
-  if (/cor|coronal|c_dicom\b|^c\b/.test(text)) return 'coronal';
-  if (/ax|axial|tra|transverse|a_dicom\b|^a\b/.test(text)) return 'axial';
-
+  // 1. ImageOrientationPatient — authoritative DICOM geometry
   const iop = slice.imageOrientationPatient;
   if (iop && iop.length === 6) {
     const r = [iop[0], iop[1], iop[2]];
@@ -231,6 +227,20 @@ function detectPlane(slice: ParsedSlice, hint?: string): Plane {
     if (az >= ax && az >= ay) return 'axial';
     if (ax >= ay && ax >= az) return 'sagittal';
     return 'coronal';
+  }
+
+  // 2. SeriesDescription text (often contains "axial", "sagittal", "coronal")
+  const desc = (slice.seriesDescription || '').toLowerCase();
+  if (/\bsag(?:ittal)?\b/.test(desc)) return 'sagittal';
+  if (/\bcor(?:onal)?\b/.test(desc)) return 'coronal';
+  if (/\bax(?:ial)?\b|\btra(?:nsverse)?\b/.test(desc)) return 'axial';
+
+  // 3. Folder-name hint (lowest priority — only when DICOM metadata is absent)
+  if (hint) {
+    const h = hint.toLowerCase();
+    if (/sag|sagittal|s_dicom\b|^s\b/.test(h)) return 'sagittal';
+    if (/cor|coronal|c_dicom\b|^c\b/.test(h)) return 'coronal';
+    if (/ax|axial|tra|transverse|a_dicom\b|^a\b/.test(h)) return 'axial';
   }
 
   return 'axial';
