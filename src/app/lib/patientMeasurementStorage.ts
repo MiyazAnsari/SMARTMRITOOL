@@ -12,7 +12,7 @@ const MEASUREMENT_TOOLS = new Set<MeasurementTool>([
   'point',
 ]);
 
-export const PATIENT_MEASUREMENTS_STORAGE_KEY = 'smartmritool-patient-measurements-v1';
+export const PATIENT_MEASUREMENTS_STORAGE_KEY = 'msk-annotation-suite-patient-measurements-v1';
 
 export type PatientMeasurementArchive = Record<string, Measurement[]>;
 
