@@ -124,6 +124,29 @@ function parseDicomFile(buffer: ArrayBuffer): ParsedSlice | null {
   const windowWidth = readFloatString(dataSet, tag.windowWidth);
   const pixelSpacingArr = readFloatArray(dataSet, tag.pixelSpacing) ?? [1, 1];
   const sliceThickness = readFloatString(dataSet, tag.sliceThickness) ?? 1;
+
+  // Audit: warn if pixel spacing is missing or implausible so users know
+  // whether mm measurements can be trusted.
+  const psX = pixelSpacingArr[0] ?? 0;
+  const psY = pixelSpacingArr[1] ?? 0;
+  const psMissing = !readFloatArray(dataSet, tag.pixelSpacing);
+  const psSuspicious =
+    !psMissing &&
+    (psX <= 0 || psY <= 0 || psX > 50 || psY > 50 || psX * psY < 1e-6);
+  const psFallback = psMissing || psSuspicious;
+  if (psMissing) {
+    console.warn(
+      '[DICOM] Pixel Spacing (0028,0030) is missing — measurements will use 1 mm/pixel (unreliable for clinical use).',
+    );
+  } else if (psSuspicious) {
+    console.warn(
+      `[DICOM] Pixel Spacing (0028,0030) is implausible ([${psX.toFixed(3)}, ${psY.toFixed(3)}] mm) — measurements may be inaccurate.`,
+    );
+  } else {
+    console.log(
+      `[DICOM] Pixel Spacing: [${psX.toFixed(3)}, ${psY.toFixed(3)}] mm — measurements should be reliable.`,
+    );
+  }
   const instanceNumber = parseInt(dataSet.string(tag.instanceNumber) || '0', 10) || 0;
   const sliceLocation = readFloatString(dataSet, tag.sliceLocation) ?? instanceNumber;
   const imagePositionPatient = readFloatArray(dataSet, tag.imagePositionPatient) as

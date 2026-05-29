@@ -2114,6 +2114,24 @@ export function Viewport({
             <span className="tabular-nums shrink-0 whitespace-nowrap text-gray-200" title="Zoom scale (this viewer only)">
               Z {Math.round(zoomScale * 100)}%
             </span>
+            <span className="text-gray-600 shrink-0" aria-hidden>
+              |
+            </span>
+            {(() => {
+              const { spacingX: gsx, spacingY: gsy } = getPlaneGeometry();
+              const sx = (pixelSpacing && pixelSpacing.x > 0 ? pixelSpacing.x : gsx) || 1;
+              const sy = (pixelSpacing && pixelSpacing.y > 0 ? pixelSpacing.y : gsy) || 1;
+              const isFallback = (!pixelSpacing || pixelSpacing.x <= 0 || pixelSpacing.y <= 0) &&
+                (gsx === 1 || gsy === 1);
+              return (
+                <span
+                  className={`tabular-nums shrink-0 whitespace-nowrap ${isFallback ? 'text-amber-400' : 'text-gray-400'}`}
+                  title={`Pixel spacing: ${sx.toFixed(3)} × ${sy.toFixed(3)} mm/pixel${isFallback ? ' (FALLBACK — measurements approximate)' : ''}`}
+                >
+                  {sx.toFixed(2)}×{sy.toFixed(2)} mm/px
+                </span>
+              );
+            })()}
           </div>
           <div className="flex flex-wrap items-center justify-end gap-0.5 shrink-0">
             <button
