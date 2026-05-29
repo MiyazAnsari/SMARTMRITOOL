@@ -1444,8 +1444,6 @@ export function MedicalImageViewer({
           onStepRedo={handleWorkflowStepRedo}
           onResetMeasurements={handleWorkflowReset}
           pixelSpacing={pixelSpacing}
-          measurementUnits={measurementUnits}
-          onMeasurementUnitsChange={setMeasurementUnits}
           onPlaneRequest={handlePlaneRequest}
           imageScale={imageScale}
         />

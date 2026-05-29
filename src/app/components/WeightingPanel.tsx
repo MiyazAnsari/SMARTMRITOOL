@@ -9,7 +9,6 @@ import {
   MeasurementWorkflow,
   WorkflowState,
 } from './measurement/MeasurementWorkflow';
-import type { MeasurementDisplayUnits } from './MedicalImageViewer';
 import type { Measurement } from './MedicalImageViewer';
 
 interface WeightingPanelProps {
@@ -33,8 +32,6 @@ interface WeightingPanelProps {
   onStepRedo?: (stepId: string) => void;
   onResetMeasurements?: () => void;
   pixelSpacing: { x: number; y: number };
-  measurementUnits: MeasurementDisplayUnits;
-  onMeasurementUnitsChange: (units: MeasurementDisplayUnits) => void;
   onPlaneRequest?: (plane: Plane) => void;
   onOverflowChange?: (overflowing: boolean) => void;
   /** CSS→image-pixel scale factor for converting overlay coordinates to physical mm. */
@@ -60,8 +57,6 @@ export function WeightingPanel({
   onStepRedo,
   onResetMeasurements,
   pixelSpacing,
-  measurementUnits,
-  onMeasurementUnitsChange,
   onPlaneRequest,
   onOverflowChange,
   imageScale,
@@ -138,34 +133,6 @@ export function WeightingPanel({
         onPlaneRequest={onPlaneRequest}
         imageScale={imageScale}
       />
-
-      <div className="mb-3 rounded border border-gray-800 bg-gray-950/60 px-2 py-2 text-xs text-gray-300">
-        <div className="mb-1 font-medium text-gray-200">Measurement units</div>
-        <div className="flex gap-2">
-          <button
-            type="button"
-            className={`rounded px-2 py-1 border transition-colors ${measurementUnits === 'mm' ? 'bg-blue-600 text-white border-blue-500' : 'bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-700'}`}
-            onClick={() => onMeasurementUnitsChange('mm')}
-          >
-            mm
-          </button>
-          <button
-            type="button"
-            className={`rounded px-2 py-1 border transition-colors ${measurementUnits === 'px' ? 'bg-blue-600 text-white border-blue-500' : 'bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-700'}`}
-            onClick={() => onMeasurementUnitsChange('px')}
-          >
-            px
-          </button>
-        </div>
-      </div>
-
-      <p className="mb-3 text-[10px] leading-snug text-gray-500 border border-gray-800 rounded px-2 py-1.5 bg-gray-950/60">
-        Per-viewport tools: <span className="text-gray-300">WL</span>, <span className="text-gray-300">WW</span>,{' '}
-        <span className="text-gray-300">Bright</span>,{' '}
-        <span className="text-gray-300">Zoom</span> (opens <span className="text-gray-300">+</span> /{' '}
-        <span className="text-gray-300">−</span> for trackpads; wheel zoom unchanged), <span className="text-gray-300">Reset</span>,{' '}
-        <span className="text-gray-300">Close</span>.
-      </p>
 
     </div>
   );

@@ -1883,14 +1883,13 @@ export function Viewport({
     }
 
     // Allow creating a perpendicular either by using the select tool (none)
-    // when clicking the midpoint, or by using the perpendicular tool and
-    // clicking near a line. This makes the behavior more discoverable and
-    // robust across tool states.
-    if ((activeTool === 'none' || activeTool === 'perpendicular')) {
-      // Prefer hovered/selected line, otherwise try to find a nearby line when
-      // the explicit perpendicular tool is selected.
+    // when clicking near a line's midpoint, or by using the perpendicular
+    // tool and clicking anywhere near a line.  In select mode we also fall
+    // back to spatial hit-testing so the user can click the midpoint of any
+    // visible line without needing to hover or select it first.
+    if (activeTool === 'none' || activeTool === 'perpendicular') {
       let targetLineId: string | null = hoveredLineId ?? selectedLineId ?? null;
-      if (!targetLineId && activeTool === 'perpendicular') {
+      if (!targetLineId) {
         const nearby = findNearbyLine(x, y);
         targetLineId = nearby?.id ?? null;
       }
