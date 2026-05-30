@@ -454,6 +454,20 @@ export function MedicalImageViewer({
         activeStepIndex: nextActiveIndex >= 0 ? nextActiveIndex : Math.max(0, protocol.steps.length - 1),
       };
     });
+
+    // Keep the per-group measurement counter in sync with reused steps so
+    // the limit in handleMeasurementAdd doesn't let the user draw extra
+    // lines/points beyond what the protocol specifies.
+    const reusedDistanceCount = Object.values(existingResults).filter(
+      (r) => r.primitive === 'line' || r.primitive === 'distance',
+    ).length;
+    const reusedPerpCount = Object.values(existingResults).filter(
+      (r) => r.primitive === 'point',
+    ).length;
+    groupCountsRef.current = {
+      distanceCount: reusedDistanceCount,
+      perpCount: reusedPerpCount,
+    };
   }, [measurements, protocol]);
 
   const onMeasurementSelectRef = useRef(onMeasurementSelect);
