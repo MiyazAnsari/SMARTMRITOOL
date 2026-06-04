@@ -1569,25 +1569,26 @@ export function Viewport({
       }
     }
 
-    // ── Point dragging — allowed with any tool so placed landmarks can
-    // always be adjusted (e.g. joint-line point in sulcus-angle-3cm).
-    for (const m of measurementsRef.current) {
-      if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
-      if (m.points.length === 0) continue;
-      for (let i = 0; i < m.points.length; i++) {
-        const p = m.points[i];
-        const dist = Math.sqrt((x - p.x) ** 2 + (y - p.y) ** 2);
-        if (dist < 10) {
-          draggingPointRef.current = { measurementId: m.id, pointIndex: i };
-          setDraggingPoint({ measurementId: m.id, pointIndex: i });
-          setIsDrawing(false);
-          setDrawingPoints([]);
-          return;
+    if (activeTool === 'none') {
+      // Point dragging — only in Select mode to avoid stealing clicks from
+      // creation tools (distance/line/point/angle) that need to snap to
+      // existing endpoints.
+      for (const m of measurementsRef.current) {
+        if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
+        if (m.points.length === 0) continue;
+        for (let i = 0; i < m.points.length; i++) {
+          const p = m.points[i];
+          const dist = Math.sqrt((x - p.x) ** 2 + (y - p.y) ** 2);
+          if (dist < 10) {
+            draggingPointRef.current = { measurementId: m.id, pointIndex: i };
+            setDraggingPoint({ measurementId: m.id, pointIndex: i });
+            setIsDrawing(false);
+            setDrawingPoints([]);
+            return;
+          }
         }
       }
-    }
 
-    if (activeTool === 'none') {
       for (const m of measurementsRef.current) {
         if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
         if (m.type !== 'perpendicular' || m.points.length < 2) continue;

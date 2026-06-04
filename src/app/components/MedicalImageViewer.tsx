@@ -502,13 +502,23 @@ export function MedicalImageViewer({
       return match;
     };
 
+    const protocolStepIds = new Set(protocol.steps.map((s) => s.id));
+
     for (const step of protocol.steps) {
       // 1) exact workflowStepId match
       let match = claimMatch((m) => m.workflowStepId === step.id);
       // 2) prefer measurements that belong to the current protocol group
+      //    BUT do NOT claim a measurement whose workflowStepId targets a
+      //    different step in the same protocol — that would let drawing
+      //    step 3 first incorrectly mark step 2 as complete.
       if (!match && currentGroupIdRef.current) {
         match = claimMatch(
-          (m) => m.groupId === currentGroupIdRef.current && measurementMatchesPrimitive(m, step.primitive),
+          (m) =>
+            m.groupId === currentGroupIdRef.current &&
+            measurementMatchesPrimitive(m, step.primitive) &&
+            // If the measurement already has a workflowStepId for a different
+            // step in this protocol, skip it — it belongs to that other step.
+            (!m.workflowStepId || !protocolStepIds.has(m.workflowStepId) || m.workflowStepId === step.id),
         );
       }
       // 3) fallback to label+primitive (legacy behavior)
@@ -865,6 +875,10 @@ export function MedicalImageViewer({
         if ((measurement.type === 'distance' || measurement.type === 'line') && counts.distanceCount >= lineStepCount) return;
         if (measurement.type === 'perpendicular' && counts.perpCount >= pointStepCount) return;
 
+        // If the active step already has a completed result, block duplicate
+        // creation.  The user must click "Redo" on the step to replace it.
+        if (activeStep && workflow.stepResults[activeStep.id]) return;
+
         // Increment synchronously so the next invocation sees the updated count
         // regardless of whether React has committed the state update yet.
         if (measurement.type === 'distance' || measurement.type === 'line') {
@@ -973,6 +987,7 @@ export function MedicalImageViewer({
       onPatientMeasurementsUpdate,
       measurements,
       currentGroupId,
+      workflow,
     ],
   );
 

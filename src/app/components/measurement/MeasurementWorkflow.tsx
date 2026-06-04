@@ -312,8 +312,10 @@ export function recordStepResult(
   const step = protocol.steps[state.activeStepIndex];
   if (!step) return state;
   const stepResults = { ...state.stepResults, [step.id]: result };
-  // Find the next not-yet-completed step
-  let nextIdx = state.activeStepIndex + 1;
+  // Find the earliest not-yet-completed step so the user is always
+  // guided to the next missing measurement, even if they completed
+  // a later step first.
+  let nextIdx = 0;
   while (nextIdx < protocol.steps.length && stepResults[protocol.steps[nextIdx].id]) {
     nextIdx++;
   }

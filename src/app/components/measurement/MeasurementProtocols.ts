@@ -223,15 +223,15 @@ const INSALL_SALVATI: MeasurementProtocol = {
   requiredPlane: 'sagittal',
   steps: [
     {
-      id: 'patella-length',
+      id: 'is-patella-length',
       label: 'Patella length (LP)',
       instruction:
-        'Use Distance. Draw a line along the longest patellar axis.',
+        'Use Distance. Draw a line along the longest patellar axis (includes non-articular portions).',
       tool: 'distance',
       primitive: 'distance',
     },
     {
-      id: 'tendon-length',
+      id: 'is-tendon-length',
       label: 'Patellar tendon length (LT)',
       instruction:
         'Use Distance. Draw a line from the lower patellar pole to the tibial tuberosity.',
@@ -240,8 +240,8 @@ const INSALL_SALVATI: MeasurementProtocol = {
     },
   ],
   compute: (results, ps, paramImageScale) => {
-    const lp = results['patella-length'];
-    const lt = results['tendon-length'];
+    const lp = results['is-patella-length'];
+    const lt = results['is-tendon-length'];
     if (!lp || lp.points.length < 2 || !lt || lt.points.length < 2) return null;
     const imageScale = lp.imageScale ?? lt.imageScale ?? paramImageScale;
     const lpMm = dist(lp.points[0], lp.points[1], ps, imageScale);
@@ -428,12 +428,71 @@ const SULCUS_ANGLE_3CM: MeasurementProtocol = {
   },
 };
 
+/**
+ * Caton–Deschamps Index (CDI).
+ *
+ * Measured on a sagittal slice through the central patellofemoral joint.
+ *   A = patellar articular surface length (superior → inferior margin)
+ *   B = distance from inferior patellar articular margin to anterior
+ *       tibial articular margin
+ *   CDI = B / A
+ *
+ * Normal ≈ 1.0.  > 1.3 → patella alta.  < 0.6 → patella baja.
+ */
+const CATON_DESCHAMPS: MeasurementProtocol = {
+  id: 'caton-deschamps',
+  label: 'Caton–Deschamps',
+  description:
+    'Ratio of patellar height to patellar articular surface length. Less affected by knee flexion than Insall–Salvati.',
+  requiredPlane: 'sagittal',
+  steps: [
+    {
+      id: 'cdi-patella-surface',
+      label: 'Patellar articular surface length (A)',
+      instruction:
+        'Use Distance. Draw a line from the superior to the inferior margin of the patellar articular surface (cartilage-bearing portion only).',
+      tool: 'distance',
+      primitive: 'distance',
+    },
+    {
+      id: 'cdi-patellar-height',
+      label: 'Patellar height (B)',
+      instruction:
+        'Use Distance. Draw a line from the inferior margin of the patellar articular surface to the anterior margin of the tibial articular surface.',
+      tool: 'distance',
+      primitive: 'distance',
+    },
+  ],
+  compute: (results, ps, paramImageScale) => {
+    const a = results['cdi-patella-surface'];
+    const b = results['cdi-patellar-height'];
+    if (!a || a.points.length < 2 || !b || b.points.length < 2) return null;
+    const imageScale = a.imageScale ?? b.imageScale ?? paramImageScale;
+    const aMm = dist(a.points[0], a.points[1], ps, imageScale);
+    const bMm = dist(b.points[0], b.points[1], ps, imageScale);
+    if (aMm === 0) return null;
+    const ratio = bMm / aMm;
+    return {
+      value: ratio,
+      unit: '',
+      summary: `Caton–Deschamps = ${ratio.toFixed(2)} (B ${bMm.toFixed(1)} mm / A ${aMm.toFixed(1)} mm)`,
+      interpretation:
+        ratio > 1.3
+          ? 'Patella alta (>1.3).'
+          : ratio < 0.6
+            ? 'Patella baja (<0.6).'
+            : 'Normal (0.6–1.3).',
+    };
+  },
+};
+
 export const MEASUREMENT_PROTOCOLS: MeasurementProtocol[] = [
   TT_TG,
   INSALL_SALVATI,
   PATELLAR_TILT,
   SULCUS_ANGLE,
   SULCUS_ANGLE_3CM,
+  CATON_DESCHAMPS,
 ];
 
 export function getProtocol(id: string | undefined | null): MeasurementProtocol | null {
