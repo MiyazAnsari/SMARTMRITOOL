@@ -76,6 +76,98 @@ export function MeasurementWorkflow({
     ? protocol.compute(state.stepResults, pixelSpacing, imageScale)
     : null;
 
+  // ── Per-step display values (px + mm for distance/line steps) ─────
+  const stepValues = useMemo(() => {
+    if (!protocol) return {} as Record<string, string>;
+    const values: Record<string, string> = {};
+    for (const step of protocol.steps) {
+      const sr = state.stepResults[step.id];
+      if (!sr || sr.points.length < 1) continue;
+      // Distance / line / perpendicular need at least 2 points; angle needs 3.
+      if (step.primitive !== 'point' && sr.points.length < 2) continue;
+      if (step.primitive === 'angle' && sr.points.length < 3) continue;
+      const is = sr.imageScale ?? imageScale;
+      const sx = (is?.x ?? 1) * pixelSpacing.x;
+      const sy = (is?.y ?? 1) * pixelSpacing.y;
+      const ixx = (is?.x ?? 1);
+      const ixy = (is?.y ?? 1);
+
+      if (step.primitive === 'distance' || step.primitive === 'line') {
+        const dx = sr.points[1].x - sr.points[0].x;
+        const dy = sr.points[1].y - sr.points[0].y;
+        const pxDist = Math.hypot(dx * ixx, dy * ixy);
+        const mmDist = Math.hypot(dx * sx, dy * sy);
+        values[step.id] = `${pxDist.toFixed(1)} px / ${mmDist.toFixed(1)} mm`;
+      } else if (step.primitive === 'angle' && sr.points.length >= 3) {
+        // Simple CSS-pixel angle (invariant to spacing)
+        const v1x = sr.points[0].x - sr.points[1].x;
+        const v1y = sr.points[0].y - sr.points[1].y;
+        const v2x = sr.points[2].x - sr.points[1].x;
+        const v2y = sr.points[2].y - sr.points[1].y;
+        const dot = v1x * v2x + v1y * v2y;
+        const m1 = Math.hypot(v1x, v1y);
+        const m2 = Math.hypot(v2x, v2y);
+        if (m1 > 0 && m2 > 0) {
+          const deg = (Math.acos(Math.max(-1, Math.min(1, dot / (m1 * m2)))) * 180) / Math.PI;
+          values[step.id] = `${deg.toFixed(1)}°`;
+        }
+      } else if (step.primitive === 'point') {
+        values[step.id] = `${sr.points[0].x.toFixed(1)}, ${sr.points[0].y.toFixed(1)} px`;
+      }
+    }
+    return values;
+  }, [protocol, state.stepResults, pixelSpacing, imageScale]);
+
+  // ── Raw measurement values (shown for all measurements) ────────────
+  const rawMeasurementValues = useMemo(() => {
+    const rows: { id: string; label: string; type: string; value: string }[] = [];
+    for (const m of measurements) {
+      const is = m.imageScale ?? imageScale;
+      const sx = (is?.x ?? 1) * pixelSpacing.x;
+      const sy = (is?.y ?? 1) * pixelSpacing.y;
+      const ixx = (is?.x ?? 1);
+      const ixy = (is?.y ?? 1);
+      let value = '';
+
+      if ((m.type === 'distance' || m.type === 'line' || m.type === 'perpendicular') && m.points.length >= 2) {
+        const dx = m.points[1].x - m.points[0].x;
+        const dy = m.points[1].y - m.points[0].y;
+        const pxDist = Math.hypot(dx * ixx, dy * ixy);
+        const mmDist = Math.hypot(dx * sx, dy * sy);
+        value = `${pxDist.toFixed(1)} px / ${mmDist.toFixed(1)} mm`;
+      } else if (m.type === 'angle' && m.points.length >= 3) {
+        const v1x = m.points[0].x - m.points[1].x;
+        const v1y = m.points[0].y - m.points[1].y;
+        const v2x = m.points[2].x - m.points[1].x;
+        const v2y = m.points[2].y - m.points[1].y;
+        const dot = v1x * v2x + v1y * v2y;
+        const m1 = Math.hypot(v1x, v1y);
+        const m2 = Math.hypot(v2x, v2y);
+        if (m1 > 0 && m2 > 0) {
+          const deg = (Math.acos(Math.max(-1, Math.min(1, dot / (m1 * m2)))) * 180) / Math.PI;
+          value = `${deg.toFixed(1)}°`;
+        }
+      } else if (m.type === 'point' && m.points.length >= 1) {
+        value = `${m.points[0].x.toFixed(1)}, ${m.points[0].y.toFixed(1)} px`;
+      }
+
+      // Fallback: show at minimum the point count so nothing is silently hidden.
+      if (!value && m.points.length > 0) {
+        value = `${m.points.length} pt${m.points.length > 1 ? 's' : ''}`;
+      } else if (!value) {
+        value = '(empty)';
+      }
+
+      rows.push({
+        id: m.id,
+        label: m.label || m.type,
+        type: m.type,
+        value,
+      });
+    }
+    return rows;
+  }, [measurements, pixelSpacing, imageScale]);
+
   const handleSelect = (id: string) => {
     const p = getProtocol(id);
     onStateChange({
@@ -259,15 +351,22 @@ export function MeasurementWorkflow({
                           </div>
                         )}
                         {isDone && (
-                          <button
-                            className="text-[10px] text-blue-400 hover:text-blue-300 mt-1"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              clearStep(step.id, idx);
-                            }}
-                          >
-                            Redo
-                          </button>
+                          <>
+                            {stepValues[step.id] && (
+                              <div className="text-[10px] text-emerald-300 mt-1 font-mono">
+                                {stepValues[step.id]}
+                              </div>
+                            )}
+                            <button
+                              className="text-[10px] text-blue-400 hover:text-blue-300 mt-1"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                clearStep(step.id, idx);
+                              }}
+                            >
+                              Redo
+                            </button>
+                          </>
                         )}
                       </div>
                     </div>
@@ -294,6 +393,34 @@ export function MeasurementWorkflow({
               <RotateCcw className="w-3 h-3 mr-1" /> Reset measurement
             </Button>
           </>
+        )}
+
+        {/* ── All measurements (px + mm) ─────────────────────────────── */}
+        {rawMeasurementValues.length > 0 && (
+          <div className="border-t border-gray-800 pt-3 mt-3">
+            <h4 className="text-[10px] font-semibold uppercase tracking-wide text-gray-500 mb-2">
+              All measurements
+            </h4>
+            <div className="space-y-1">
+              {rawMeasurementValues.map((row) => (
+                <div
+                  key={row.id}
+                  className={`rounded p-1.5 text-[10px] cursor-pointer transition-colors ${
+                    selectedMeasurementId === row.id
+                      ? 'bg-blue-900/40 border border-blue-700'
+                      : 'bg-gray-800/30 hover:bg-gray-800/60'
+                  }`}
+                  onClick={() => onMeasurementSelect?.(row.id)}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="text-gray-300 truncate">{row.label}</span>
+                    <span className="text-[9px] uppercase text-gray-500 flex-shrink-0">{row.type}</span>
+                  </div>
+                  <div className="text-emerald-300 font-mono mt-0.5">{row.value}</div>
+                </div>
+              ))}
+            </div>
+          </div>
         )}
       </CollapsibleContent>
     </Collapsible>

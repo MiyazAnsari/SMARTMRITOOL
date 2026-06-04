@@ -33,6 +33,37 @@ import {
 } from '@/app/lib/sessionAnnotationCsv';
 import { exportProtocolMeasurementsToCsv } from '@/app/lib/protocolMeasurementCsv';
 
+/** Compute the image-pixel distance for a distance/line/perpendicular measurement. */
+function computePxDistance(
+  points: { x: number; y: number }[],
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number } | null,
+): string | null {
+  if (points.length < 2) return null;
+  const sx = imageScale?.x ?? 1;
+  const sy = imageScale?.y ?? 1;
+  const dx = points[1].x - points[0].x;
+  const dy = points[1].y - points[0].y;
+  const px = Math.hypot(dx * sx, dy * sy);
+  if (!Number.isFinite(px) || px === 0) return null;
+  return `${px.toFixed(1)} px`;
+}
+
+/** Compute mm distance from points + imageScale + pixel spacing. */
+function computeMmValue(
+  points: { x: number; y: number }[],
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number } | null,
+  spacing?: { x: number; y: number } | null,
+): string | null {
+  if (points.length < 2) return null;
+  const sx = (imageScale?.x ?? 1) * (spacing?.x ?? 1);
+  const sy = (imageScale?.y ?? 1) * (spacing?.y ?? 1);
+  const dx = points[1].x - points[0].x;
+  const dy = points[1].y - points[0].y;
+  const mm = Math.hypot(dx * sx, dy * sy);
+  if (!Number.isFinite(mm) || mm === 0) return null;
+  return `${mm.toFixed(2)} mm`;
+}
+
 interface PatientStudyRecord {
   key: string;
   study: DicomStudy;
@@ -206,6 +237,15 @@ function App() {
     if (!activePatientRecord) return null;
     return studyViewForLaterality(activePatientRecord.study, activeLaterality);
   }, [activePatientRecord, activeLaterality]);
+
+  const activePixelSpacing = useMemo(() => {
+    if (!activeStudy) return null;
+    // Use the first available plane's pixel spacing.
+    const vol = activeStudy.volumes.axial ?? activeStudy.volumes.sagittal ?? activeStudy.volumes.coronal;
+    if (!vol?.header?.pixDims) return null;
+    const pd = vol.header.pixDims;
+    return { x: Number.isFinite(pd[1]) && pd[1] > 0 ? pd[1] : 1, y: Number.isFinite(pd[2]) && pd[2] > 0 ? pd[2] : 1 };
+  }, [activeStudy]);
 
   const activeMeasurementKey = useMemo(() => {
     if (!activePatientKey) return null;
@@ -848,6 +888,16 @@ function App() {
                                 {r.units ? ` ${r.units}` : ''}
                               </div>
                             )}
+                            {computeMmValue(r.points, r.imageScale, activePixelSpacing) && (
+                              <div className="text-blue-300 mt-0.5 font-medium">
+                                {computeMmValue(r.points, r.imageScale, activePixelSpacing)}
+                              </div>
+                            )}
+                            {computePxDistance(r.points, r.imageScale) && (
+                              <div className="text-emerald-300 text-[10px] font-mono mt-0.5">
+                                {computePxDistance(r.points, r.imageScale)}
+                              </div>
+                            )}
                             <div className="text-[10px] text-gray-500 mt-0.5">
                               {r.timestamp ? new Date(r.timestamp).toLocaleString() : '—'}
                             </div>
@@ -1002,6 +1052,16 @@ function App() {
                                             {m.plane} · slice index {m.slice}
                                           </div>
                                           {m.value ? <div className="text-blue-300 mt-1 font-medium">{m.value}</div> : null}
+                                          {computeMmValue(m.points, m.imageScale, activePixelSpacing) && (
+                                            <div className="text-blue-300 mt-1 font-medium">
+                                              {computeMmValue(m.points, m.imageScale, activePixelSpacing)}
+                                            </div>
+                                          )}
+                                          {computePxDistance(m.points, m.imageScale) && (
+                                            <div className="text-emerald-300 text-[10px] font-mono mt-0.5">
+                                              {computePxDistance(m.points, m.imageScale)}
+                                            </div>
+                                          )}
                                           <div className="text-[10px] text-gray-500 mt-0.5">
                                             {m.timestamp ? new Date(m.timestamp).toLocaleString() : '—'}
                                           </div>

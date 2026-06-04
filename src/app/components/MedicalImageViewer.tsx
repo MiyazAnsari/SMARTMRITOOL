@@ -483,7 +483,7 @@ export function MedicalImageViewer({
   useEffect(() => {
     if (!protocol) return;
 
-    const existingResults: Record<string, { primitive: Primitive; points: { x: number; y: number }[]; slice: number }> = {};
+    const existingResults: Record<string, { primitive: Primitive; points: { x: number; y: number }[]; slice: number; imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number } }> = {};
     const consumedMeasurementIds = new Set<string>();
 
     const samePoints = (
@@ -532,6 +532,7 @@ export function MedicalImageViewer({
           primitive: step.primitive,
           points: isPointFromPerp ? [{ x: match.points[1].x, y: match.points[1].y }] : match.points.map((p) => ({ x: p.x, y: p.y })),
           slice: match.slice,
+          imageScale: match.imageScale,
         };
       }
     }
