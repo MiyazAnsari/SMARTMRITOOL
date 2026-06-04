@@ -349,11 +349,121 @@ const SULCUS_ANGLE: MeasurementProtocol = {
   },
 };
 
+const CONGRUENCE_ANGLE: MeasurementProtocol = {
+  id: 'congruence-angle',
+  label: 'Congruence Angle',
+  description:
+    'Angle between the bisector of the trochlear sulcus and a line from the trochlear sulcus to the patellar median ridge. Negative = lateral, Positive = medial patellar displacement.',
+  requiredPlane: 'axial',
+  steps: [
+    {
+      // Intentionally same id/label as SULCUS_ANGLE so measurements auto-transfer
+      id: 'medial-line',
+      label: 'Line from medial condyle peak to sulcus',
+      instruction:
+        'Use Distance. Click the medial condyle peak, then the deepest trochlear groove point.',
+      tool: 'distance',
+      primitive: 'line',
+    },
+    {
+      id: 'lateral-line',
+      label: 'Line from lateral condyle peak to sulcus',
+      instruction:
+        'Use Distance. Click the lateral condyle peak, then the same groove point.',
+      tool: 'distance',
+      primitive: 'line',
+    },
+    {
+      id: 'patella-ridge',
+      label: 'Line from patellar median ridge to trochlear sulcus',
+      instruction:
+        'Use Distance. Click the apex of the patellar median ridge, then the deepest trochlear groove point.',
+      tool: 'distance',
+      primitive: 'line',
+    },
+  ],
+  compute: (results, ps, paramImageScale) => {
+  const m = results['medial-line'];
+  const l = results['lateral-line'];
+  const r = results['patella-ridge'];
+  if (!m || m.points.length < 2 || !l || l.points.length < 2 || !r || r.points.length < 2) return null;
+
+  const imageScale = m.imageScale ?? l.imageScale ?? r.imageScale ?? paramImageScale;
+
+  // Find the shared sulcus point by finding which endpoint of medial-line
+  // is closest to an endpoint of lateral-line
+  const mp0 = toPhysical(m.points[0], ps, imageScale);
+  const mp1 = toPhysical(m.points[1], ps, imageScale);
+  const lp0 = toPhysical(l.points[0], ps, imageScale);
+  const lp1 = toPhysical(l.points[1], ps, imageScale);
+
+  const d00 = Math.hypot(mp0.x - lp0.x, mp0.y - lp0.y);
+  const d01 = Math.hypot(mp0.x - lp1.x, mp0.y - lp1.y);
+  const d10 = Math.hypot(mp1.x - lp0.x, mp1.y - lp0.y);
+  const d11 = Math.hypot(mp1.x - lp1.x, mp1.y - lp1.y);
+
+  const minD = Math.min(d00, d01, d10, d11);
+  let sulcus: { x: number; y: number };
+  let medialPeak: { x: number; y: number };
+  let lateralPeak: { x: number; y: number };
+
+  if (minD === d00) { sulcus = mp0; medialPeak = mp1; lateralPeak = lp1; }
+  else if (minD === d01) { sulcus = mp0; medialPeak = mp1; lateralPeak = lp0; }
+  else if (minD === d10) { sulcus = mp1; medialPeak = mp0; lateralPeak = lp1; }
+  else { sulcus = mp1; medialPeak = mp0; lateralPeak = lp0; }
+
+  // Vectors from sulcus → each condyle peak
+  const mVec = { x: medialPeak.x - sulcus.x, y: medialPeak.y - sulcus.y };
+  const lVec = { x: lateralPeak.x - sulcus.x, y: lateralPeak.y - sulcus.y };
+  const mLen = Math.hypot(mVec.x, mVec.y) || 1;
+  const lLen = Math.hypot(lVec.x, lVec.y) || 1;
+
+  // Bisector points toward condyles (away from sulcus)
+  const bisector = { x: mVec.x / mLen + lVec.x / lLen, y: mVec.y / mLen + lVec.y / lLen };
+  const bisectorLen = Math.hypot(bisector.x, bisector.y) || 1;
+  // Flip to point INTO sulcus (toward patella)
+  const bisectorUnit = { x: -(bisector.x / bisectorLen), y: -(bisector.y / bisectorLen) };
+
+  // Patella ridge line: find which end is closer to sulcus = that's the sulcus end
+  const rp0 = toPhysical(r.points[0], ps, imageScale);
+  const rp1 = toPhysical(r.points[1], ps, imageScale);
+  const rd0 = Math.hypot(rp0.x - sulcus.x, rp0.y - sulcus.y);
+  const rd1 = Math.hypot(rp1.x - sulcus.x, rp1.y - sulcus.y);
+  const ridgePeak = rd0 < rd1 ? rp1 : rp0; // the far end = patellar ridge
+
+  // Vector from sulcus → patellar ridge
+  const pVec = { x: ridgePeak.x - sulcus.x, y: ridgePeak.y - sulcus.y };
+  const pLen = Math.hypot(pVec.x, pVec.y) || 1;
+  const pUnit = { x: pVec.x / pLen, y: pVec.y / pLen };
+
+  // Angle between bisector (into sulcus) and patella vector (sulcus → ridge)
+  const dot = bisectorUnit.x * pUnit.x + bisectorUnit.y * pUnit.y;
+  const angle = (Math.acos(Math.max(-1, Math.min(1, dot))) * 180) / Math.PI;
+
+  // Sign via cross product
+  const cross = bisectorUnit.x * pUnit.y - bisectorUnit.y * pUnit.x;
+  const signed = cross >= 0 ? angle : -angle;
+
+  return {
+    value: signed,
+    unit: '°',
+    summary: `Congruence angle = ${signed.toFixed(1)}°`,
+    interpretation:
+      signed > 16
+        ? 'Abnormal medial displacement (>16°).'
+        : signed < -6
+          ? 'Lateral displacement (<-6°) — may indicate lateral patellar tilt.'
+          : 'Within normal range (-6° to 16°).',
+    }
+  },
+};
+
 export const MEASUREMENT_PROTOCOLS: MeasurementProtocol[] = [
   TT_TG,
   INSALL_SALVATI,
   PATELLAR_TILT,
   SULCUS_ANGLE,
+  CONGRUENCE_ANGLE,
 ];
 
 export function getProtocol(id: string | undefined | null): MeasurementProtocol | null {

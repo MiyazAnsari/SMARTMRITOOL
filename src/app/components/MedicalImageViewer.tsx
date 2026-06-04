@@ -271,6 +271,52 @@ export function MedicalImageViewer({
   const previousMeasurementsRef = useRef<Measurement[]>([]);
 
   const protocol = useMemo(() => getProtocol(workflow.protocolId), [workflow.protocolId]);
+  // Synthetic bisector line for the congruence angle protocol
+  const bisectorMeasurement = useMemo((): Measurement | null => {
+    if (workflow.protocolId !== 'congruence-angle') return null;
+    const m = workflow.stepResults['medial-line'];
+    const l = workflow.stepResults['lateral-line'];
+    if (!m || m.points.length < 2 || !l || l.points.length < 2) return null;
+
+    const sulcus = m.points[1]; // shared groove point
+
+    // Unit vectors from sulcus → each condyle peak
+    const mVec = { x: m.points[0].x - sulcus.x, y: m.points[0].y - sulcus.y };
+    const lVec = { x: l.points[0].x - sulcus.x, y: l.points[0].y - sulcus.y };
+    const mLen = Math.hypot(mVec.x, mVec.y) || 1;
+    const lLen = Math.hypot(lVec.x, lVec.y) || 1;
+
+    // Bisector direction
+    const bisector = {
+      x: mVec.x / mLen + lVec.x / lLen,
+      y: mVec.y / mLen + lVec.y / lLen,
+    };
+    const bisectorLen = Math.hypot(bisector.x, bisector.y) || 1;
+    const bUnit = { x: -(bisector.x / bisectorLen), y: -(bisector.y / bisectorLen) };
+
+    // Extend 80px in each direction from sulcus for visibility
+    const extend = 80;
+    return {
+      id: '__bisector__',
+      type: 'line',
+      points: [
+        { x: sulcus.x - bUnit.x * extend, y: sulcus.y - bUnit.y * extend },
+        { x: sulcus.x + bUnit.x * extend, y: sulcus.y + bUnit.y * extend },
+      ],
+      slice: m.slice,
+      plane: 'axial',
+      label: 'Bisector',
+      propagateAcrossSlices: false,
+    };
+  }, [workflow.protocolId, workflow.stepResults]);
+
+  const displayMeasurements = useMemo(
+    () => bisectorMeasurement
+      ? [...measurements, bisectorMeasurement]
+      : measurements,
+    [measurements, bisectorMeasurement],
+  );
+
   const activeStep = protocol?.steps[workflow.activeStepIndex] ?? null;
   // When a workflow step is active, override the user-selected tool so the
   // correct primitive is always armed unless the user manually picks another tool.
@@ -1262,7 +1308,7 @@ export function MedicalImageViewer({
             onSliceChange={handleSliceChange}
             resolveDefaultWindowLevel={resolveDefaultWindowLevel}
             activeTool={effectiveTool}
-            measurements={measurements}
+            measurements={displayMeasurements}
             onMeasurementAdd={handleMeasurementAdd}
             onMeasurementUpdate={handleMeasurementUpdate}
             selectedMeasurementId={selectedMeasurementId}
