@@ -278,35 +278,45 @@ export function MedicalImageViewer({
     const l = workflow.stepResults['lateral-line'];
     if (!m || m.points.length < 2 || !l || l.points.length < 2) return null;
 
-    const sulcus = m.points[1]; // shared groove point
+    // Find shared sulcus point (closest pair of endpoints)
+    const mp0 = m.points[0], mp1 = m.points[1];
+    const lp0 = l.points[0], lp1 = l.points[1];
+    const d00 = Math.hypot(mp0.x - lp0.x, mp0.y - lp0.y);
+    const d01 = Math.hypot(mp0.x - lp1.x, mp0.y - lp1.y);
+    const d10 = Math.hypot(mp1.x - lp0.x, mp1.y - lp0.y);
+    const d11 = Math.hypot(mp1.x - lp1.x, mp1.y - lp1.y);
+    const minD = Math.min(d00, d01, d10, d11);
 
-    // Unit vectors from sulcus → each condyle peak
-    const mVec = { x: m.points[0].x - sulcus.x, y: m.points[0].y - sulcus.y };
-    const lVec = { x: l.points[0].x - sulcus.x, y: l.points[0].y - sulcus.y };
+    let sulcus: { x: number; y: number };
+    let medialPeak: { x: number; y: number };
+    let lateralPeak: { x: number; y: number };
+    if (minD === d00) { sulcus = mp0; medialPeak = mp1; lateralPeak = lp1; }
+    else if (minD === d01) { sulcus = mp0; medialPeak = mp1; lateralPeak = lp0; }
+    else if (minD === d10) { sulcus = mp1; medialPeak = mp0; lateralPeak = lp1; }
+    else { sulcus = mp1; medialPeak = mp0; lateralPeak = lp0; }
+
+    const mVec = { x: medialPeak.x - sulcus.x, y: medialPeak.y - sulcus.y };
+    const lVec = { x: lateralPeak.x - sulcus.x, y: lateralPeak.y - sulcus.y };
     const mLen = Math.hypot(mVec.x, mVec.y) || 1;
     const lLen = Math.hypot(lVec.x, lVec.y) || 1;
 
-    // Bisector direction
-    const bisector = {
-      x: mVec.x / mLen + lVec.x / lLen,
-      y: mVec.y / mLen + lVec.y / lLen,
-    };
+    const bisector = { x: mVec.x / mLen + lVec.x / lLen, y: mVec.y / mLen + lVec.y / lLen };
     const bisectorLen = Math.hypot(bisector.x, bisector.y) || 1;
+    // Point INTO sulcus (flip direction)
     const bUnit = { x: -(bisector.x / bisectorLen), y: -(bisector.y / bisectorLen) };
 
-    // Extend 80px in each direction from sulcus for visibility
     const extend = 80;
     return {
       id: '__bisector__',
       type: 'line',
       points: [
-        { x: sulcus.x - bUnit.x * extend, y: sulcus.y - bUnit.y * extend },
         { x: sulcus.x + bUnit.x * extend, y: sulcus.y + bUnit.y * extend },
+        { x: sulcus.x - bUnit.x * extend, y: sulcus.y - bUnit.y * extend },
       ],
       slice: m.slice,
       plane: 'axial',
       label: 'Bisector',
-      propagateAcrossSlices: false,
+      propagateAcrossSlices: true,
     };
   }, [workflow.protocolId, workflow.stepResults]);
 
