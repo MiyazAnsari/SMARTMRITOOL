@@ -41,7 +41,7 @@ export interface MeasurementProtocol {
   compute: (
     results: Record<string, StepResult>,
     pixelSpacing: { x: number; y: number },
-    imageScale?: { x: number; y: number },
+    imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
   ) => MeasurementResult | null;
 }
 
@@ -54,23 +54,23 @@ export interface StepResult {
   /** CSS→image-pixel scale factor at the moment these points were captured/remapped.
    *  Stored atomically with points so protocol `compute` always has the correct
    *  conversion regardless of display-size change timing. */
-  imageScale?: { x: number; y: number };
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
 }
 
 const toPhysical = (
   p: { x: number; y: number },
   pixelSpacing: { x: number; y: number },
-  imageScale?: { x: number; y: number },
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
 ) => ({
-  x: p.x * (imageScale?.x ?? 1) * pixelSpacing.x,
-  y: p.y * (imageScale?.y ?? 1) * pixelSpacing.y,
+  x: (p.x - (imageScale?.offsetX ?? 0)) * (imageScale?.x ?? 1) * pixelSpacing.x,
+  y: (p.y - (imageScale?.offsetY ?? 0)) * (imageScale?.y ?? 1) * pixelSpacing.y,
 });
 
 const dist = (
   a: { x: number; y: number },
   b: { x: number; y: number },
   pixelSpacing: { x: number; y: number },
-  imageScale?: { x: number; y: number },
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
 ) => {
   const sx = (imageScale?.x ?? 1) * pixelSpacing.x;
   const sy = (imageScale?.y ?? 1) * pixelSpacing.y;
@@ -85,7 +85,7 @@ function perpDistance(
   p1: { x: number; y: number },
   p2: { x: number; y: number },
   pixelSpacing: { x: number; y: number },
-  imageScale?: { x: number; y: number },
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
 ): number {
   const a = toPhysical(pt, pixelSpacing, imageScale);
   const b1 = toPhysical(p1, pixelSpacing, imageScale);
@@ -102,7 +102,7 @@ function angleBetweenLines(
   p3: { x: number; y: number },
   p4: { x: number; y: number },
   pixelSpacing: { x: number; y: number },
-  imageScale?: { x: number; y: number },
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
 ): number {
   const a1 = toPhysical(p1, pixelSpacing, imageScale);
   const a2 = toPhysical(p2, pixelSpacing, imageScale);

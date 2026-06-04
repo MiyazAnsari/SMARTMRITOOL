@@ -126,7 +126,7 @@ export interface Measurement {
   /** CSS-pixel → image-pixel scale factor at the time the measurement was captured.
    *  Stored so protocol `compute` can convert overlay coordinates to physical mm
    *  regardless of the current viewport display size. */
-  imageScale?: { x: number; y: number };
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
 }
 
 interface MedicalImageViewerExtras {
@@ -211,6 +211,7 @@ function buildSessionAnnotationRow(
     units,
     sliceIndex: m.slice,
     propagateAcrossSlices: m.propagateAcrossSlices ?? true,
+    imageScale: m.imageScale,
     annotatedBy: annotator.name,
     annotatorEmail: annotator.email,
     timestamp: ts,
@@ -886,7 +887,7 @@ export function MedicalImageViewer({
   );
 
   const handleMeasurementUpdate = useCallback(
-    (id: string, newPoints: PointUpdater, newValue?: string, imageScale?: { x: number; y: number }) => {
+    (id: string, newPoints: PointUpdater, newValue?: string, imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number }) => {
       const lengthValue = newValue;
 
       if (sessionMeasurementMode && onUpdateSessionAnnotation) {
@@ -903,6 +904,7 @@ export function MedicalImageViewer({
             value: parsed ? parsed.value : row.value,
             units: parsed ? parsed.units : row.units,
             timestamp: new Date().toISOString(),
+            imageScale: imageScale ?? row.imageScale,
           };
         });
 
@@ -967,6 +969,7 @@ export function MedicalImageViewer({
                   { x: newAnchorX + perpX * scaledStubLen * sign, y: newAnchorY + perpY * scaledStubLen * sign },
                 ],
                 timestamp: new Date().toISOString(),
+                imageScale: imageScale ?? row.imageScale,
               }));
             }
           }
@@ -1007,6 +1010,9 @@ export function MedicalImageViewer({
             points: resolvedPoints,
             // Fallback generically to old m.value if we don't have a new explicit text value
             value: lengthValue !== undefined ? lengthValue : m.value,
+            // Always stamp the latest imageScale so CSV export / protocol compute
+            // recovers the same image-pixel positions regardless of viewport size.
+            imageScale: imageScale ?? m.imageScale,
           };
         });
 
@@ -1081,6 +1087,9 @@ export function MedicalImageViewer({
               { x: newAnchorX, y: newAnchorY },
               { x: newAnchorX + perpX * scaledStubLen * sign, y: newAnchorY + perpY * scaledStubLen * sign },
             ],
+            // Recalculated at the same display size as the baseline update;
+            // stamp the same imageScale so CSV export stays invariant.
+            imageScale: imageScale ?? m.imageScale,
           };
         });
       };

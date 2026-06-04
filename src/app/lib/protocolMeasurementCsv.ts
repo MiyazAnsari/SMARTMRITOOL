@@ -22,6 +22,8 @@ export type ProtocolExportMeasurement = {
   label?: string;
   workflowStepId?: string;
   propagateAcrossSlices?: boolean;
+  /** CSS→image-pixel scale + offset so coordinates can be converted to native image px regardless of viewport size. */
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
 };
 
 type CsvValue = string | number | boolean | null | undefined;
@@ -34,7 +36,7 @@ type ProtocolExportContext = {
   laterality?: string;
   sequenceName?: string;
   /** CSS→image-pixel scale factor for accurate px↔mm conversion. */
-  imageScale?: { x: number; y: number };
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
 };
 
 const CSV_COLUMNS = [
@@ -136,16 +138,18 @@ function formatPoints(
   points: { x: number; y: number }[],
   maxPoints = 4,
   spacing: { x: number; y: number } = { x: 1, y: 1 },
-  imageScale?: { x: number; y: number },
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
 ): (string | number)[] {
   const sx = (imageScale?.x ?? 1) * spacing.x;
   const sy = (imageScale?.y ?? 1) * spacing.y;
+  const ox = imageScale?.offsetX ?? 0;
+  const oy = imageScale?.offsetY ?? 0;
   const flattened: (string | number)[] = [];
   for (let index = 0; index < maxPoints; index += 1) {
     const point = points[index];
     if (point) {
-      const xmm = point.x * sx;
-      const ymm = point.y * sy;
+      const xmm = (point.x - ox) * sx;
+      const ymm = (point.y - oy) * sy;
       flattened.push(Number.isFinite(xmm) ? xmm.toFixed(4) : '');
       flattened.push(Number.isFinite(ymm) ? ymm.toFixed(4) : '');
     } else {
@@ -159,22 +163,28 @@ function formatPoints(
 function convertPointsToMm(
   points: { x: number; y: number }[],
   spacing: { x: number; y: number },
-  imageScale?: { x: number; y: number },
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
 ) {
   const sx = (imageScale?.x ?? 1) * spacing.x;
   const sy = (imageScale?.y ?? 1) * spacing.y;
-  return points.map((p) => ({ x: Number((p.x * sx).toFixed(4)), y: Number((p.y * sy).toFixed(4)) }));
+  const ox = imageScale?.offsetX ?? 0;
+  const oy = imageScale?.offsetY ?? 0;
+  return points.map((p) => ({ x: Number(((p.x - ox) * sx).toFixed(4)), y: Number(((p.y - oy) * sy).toFixed(4)) }));
 }
 
 function computeMeasurementValue(
   measurement: ProtocolExportMeasurement,
   spacing: { x: number; y: number },
-  imageScale?: { x: number; y: number },
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
 ): { value: number | null; unit: string | null } {
   const sx = (imageScale?.x ?? 1) * spacing.x;
   const sy = (imageScale?.y ?? 1) * spacing.y;
+  const ox = imageScale?.offsetX ?? 0;
+  const oy = imageScale?.offsetY ?? 0;
   const pts = measurement.points;
   if (!pts || pts.length < 2) return { value: null, unit: null };
+  // The distance between two points does not change with offset subtraction: 
+  // (x1 - ox) - (x0 - ox) = x1 - x0. So dx and dy calculation is unchanged!
   const dx = (pts[1].x - pts[0].x) * sx;
   const dy = (pts[1].y - pts[0].y) * sy;
   const dist = Math.sqrt(dx * dx + dy * dy);
@@ -254,6 +264,7 @@ function inferProtocolStepResults(
       primitive: step.primitive as StepResult['primitive'],
       points: extractPoints(match, step.primitive),
       slice: match.slice,
+      imageScale: match.imageScale,
     };
   };
 
@@ -409,14 +420,18 @@ export function exportProtocolMeasurementsToCsv(
 
       for (const measurement of groupSorted) {
         const baseline = measurement.baseLineId ? baselineMap.get(measurement.baseLineId) : undefined;
-        const computed = computeMeasurementValue(measurement, spacing, context.imageScale);
+        // Use each measurement's own imageScale so exported coordinates are
+        // invariant to the viewport size at export time.
+        const msImageScale = measurement.imageScale ?? context.imageScale;
+        const blImageScale = baseline?.imageScale ?? context.imageScale;
+        const computed = computeMeasurementValue(measurement, spacing, msImageScale);
         const measurementValueCell = computed.value != null ? computed.value.toFixed(4) : '';
         const finalResultValue = finalResult ? finalResult.value.toFixed(4) : '';
         const finalResultUnit = finalResult?.unit ?? '';
         const finalResultSummary = finalResult?.summary ?? '';
         const finalResultInterpretation = finalResult?.interpretation ?? '';
-        const measurementPointsJson = JSON.stringify(convertPointsToMm(measurement.points, spacing, context.imageScale));
-        const baselinePointsJson = JSON.stringify(convertPointsToMm(baseline?.points ?? [], spacing, context.imageScale));
+        const measurementPointsJson = JSON.stringify(convertPointsToMm(measurement.points, spacing, msImageScale));
+        const baselinePointsJson = JSON.stringify(convertPointsToMm(baseline?.points ?? [], spacing, blImageScale));
         const rowContext = resolveExportContext(measurement, context);
         rows.push([
           'step_measurement',
@@ -444,10 +459,10 @@ export function exportProtocolMeasurementsToCsv(
           measurementValueCell,
           computed.unit ?? '',
           String(measurement.propagateAcrossSlices ?? true),
-          ...formatPoints(measurement.points, 4, spacing, context.imageScale),
+          ...formatPoints(measurement.points, 4, spacing, msImageScale),
           measurementPointsJson,
           measurement.baseLineId ?? '',
-          ...(baseline ? formatPoints(baseline.points, 2, spacing, context.imageScale) : ['', '', '', '']),
+          ...(baseline ? formatPoints(baseline.points, 2, spacing, blImageScale) : ['', '', '', '']),
           baselinePointsJson,
           measurementPointsJson,
           baselinePointsJson,
@@ -459,9 +474,10 @@ export function exportProtocolMeasurementsToCsv(
 
     // Non-protocol groups still export their raw geometry.
     for (const measurement of groupSorted) {
-      const measurementPointsJson = JSON.stringify(convertPointsToMm(measurement.points, spacing, context.imageScale));
+      const msImageScale = measurement.imageScale ?? context.imageScale;
+      const measurementPointsJson = JSON.stringify(convertPointsToMm(measurement.points, spacing, msImageScale));
       const baselinePointsJson = '[]';
-      const computed = computeMeasurementValue(measurement, spacing, context.imageScale);
+      const computed = computeMeasurementValue(measurement, spacing, msImageScale);
       const measurementValueCell = computed.value != null ? computed.value.toFixed(4) : '';
       const rowContext = resolveExportContext(measurement, context);
       rows.push([
@@ -490,7 +506,7 @@ export function exportProtocolMeasurementsToCsv(
         measurementValueCell,
         computed.unit ?? '',
         String(measurement.propagateAcrossSlices ?? true),
-        ...formatPoints(measurement.points, 4, spacing, context.imageScale),
+        ...formatPoints(measurement.points, 4, spacing, msImageScale),
         measurementPointsJson,
         measurement.baseLineId ?? '',
         '',

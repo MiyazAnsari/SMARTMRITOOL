@@ -25,7 +25,7 @@ interface ViewportGridProps {
   activeTool: MeasurementTool;
   measurements: Measurement[];
   onMeasurementAdd: (measurement: Measurement) => void;
-  onMeasurementUpdate?: (id: string, newPoints: { x: number; y: number }[], value?: string, imageScale?: { x: number; y: number }) => void;
+  onMeasurementUpdate?: (id: string, newPoints: { x: number; y: number }[], value?: string, imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number }) => void;
   pixelSpacing?: { x: number; y: number };
   measurementUnits?: 'mm' | 'px';
   selectedMeasurementId?: string | null;

@@ -38,7 +38,7 @@ interface MeasurementWorkflowProps {
   /** Notify parent when the protocol's required plane needs to become active. */
   onPlaneRequest?: (plane: 'axial' | 'sagittal' | 'coronal') => void;
   /** CSS→image-pixel scale factor for px↔mm conversion in protocol calculations. */
-  imageScale?: { x: number; y: number };
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
 }
 
 export function MeasurementWorkflow({

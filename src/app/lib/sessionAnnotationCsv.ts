@@ -17,6 +17,8 @@ export type SessionMeasurementView = {
   label?: string;
   workflowStepId?: string;
   propagateAcrossSlices?: boolean;
+  /** CSS→image-pixel scale + offset so coordinates can be converted to native image px regardless of viewport size. */
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
 };
 
 /** In-memory row: CSV-exportable fields plus geometry for viewport overlays (not CSV columns). */
@@ -47,6 +49,8 @@ export interface SessionAnnotationRow {
   sliceIndex: number;
   /** Whether the annotation should be shown across slices in the same plane. Default true. */
   propagateAcrossSlices?: boolean;
+  /** CSS→image-pixel scale + offset so coordinates can be converted to native image px regardless of viewport size. */
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
   annotatedBy: string;
   annotatorEmail: string;
   timestamp: string;
@@ -107,6 +111,7 @@ export function sessionRowToMeasurement(row: SessionAnnotationRow): SessionMeasu
     label: row.label,
     workflowStepId: row.workflowStepId,
     propagateAcrossSlices: row.propagateAcrossSlices ?? true,
+    imageScale: row.imageScale,
   };
 }
 

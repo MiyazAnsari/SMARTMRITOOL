@@ -35,7 +35,7 @@ interface WeightingPanelProps {
   onPlaneRequest?: (plane: Plane) => void;
   onOverflowChange?: (overflowing: boolean) => void;
   /** CSS→image-pixel scale factor for converting overlay coordinates to physical mm. */
-  imageScale?: { x: number; y: number };
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
 }
 
 export function WeightingPanel({ 

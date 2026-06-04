@@ -36,7 +36,7 @@ interface ViewportProps {
   activeTool: MeasurementTool;
   measurements: Measurement[];
   onMeasurementAdd: (measurement: Measurement) => void;
-  onMeasurementUpdate?: (id: string, newPoints: PointUpdater, value?: string, imageScale?: { x: number; y: number }) => void;
+  onMeasurementUpdate?: (id: string, newPoints: PointUpdater, value?: string, imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number }) => void;
   selectedMeasurementId?: string | null;
   onMeasurementSelect?: (id: string | null) => void;
   applyWeighting: (pixelValue: number) => number;
@@ -424,7 +424,7 @@ export function Viewport({
     };
   }, [getPlaneGeometry]);
 
-  const emitMeasurementUpdate = useCallback((id: string, newPoints: PointUpdater, value?: string, imageScale?: { x: number; y: number }) => {
+  const emitMeasurementUpdate = useCallback((id: string, newPoints: PointUpdater, value?: string, imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number }) => {
     onMeasurementUpdate?.(id, newPoints, value, imageScale);
     try {
       lastBaselineUpdateRef.current.set(id, Date.now());
@@ -434,7 +434,7 @@ export function Viewport({
   // Compute the current CSS→image-pixel scale factor from displaySize.
   // Mirrors the draw-area logic in the repositioning effect and
   // calculateMeasurementValue so it's always consistent.
-  const computeImageScale = useCallback((): { x: number; y: number } => {
+  const computeImageScale = useCallback((): { x: number; y: number; offsetX: number; offsetY: number } => {
     const { width: imgW, height: imgH, spacingX: geomSpacingX, spacingY: geomSpacingY } = getPlaneGeometry();
     const spcX = (pixelSpacing && pixelSpacing.x > 0 ? pixelSpacing.x : geomSpacingX) || 1;
     const spcY = (pixelSpacing && pixelSpacing.y > 0 ? pixelSpacing.y : geomSpacingY) || 1;
@@ -445,7 +445,9 @@ export function Viewport({
     const fitScale = Math.min(dW / physicalW, dH / physicalH);
     const drawW = Math.max(1, Math.round(physicalW * fitScale));
     const drawH = Math.max(1, Math.round(physicalH * fitScale));
-    return { x: imgW / drawW, y: imgH / drawH };
+    const offsetX = (dW - drawW) / 2;
+    const offsetY = (dH - drawH) / 2;
+    return { x: imgW / drawW, y: imgH / drawH, offsetX, offsetY };
   }, [displaySize, getPlaneGeometry, pixelSpacing]);
 
   const emitMeasurementAdd = useCallback((m: Measurement) => {
