@@ -1393,6 +1393,7 @@ export function MedicalImageViewer({
             onDisplaySizeChange={handleViewportDisplaySizeChange}
             referenceLineByPlane={referenceLineByPlane}
             onReferenceLineClick={handleReferenceLineClick}
+            allowedDrawPlane={activeStep?.plane ?? protocol?.requiredPlane}
           />
         ) : (
           <div className="h-full flex items-center justify-center">

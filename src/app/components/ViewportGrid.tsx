@@ -52,6 +52,10 @@ interface ViewportGridProps {
    *  in image-pixels and the Z extent so the parent can map to the axial
    *  volume's actual slice count. */
   onReferenceLineClick?: (refImgY: number, imgH: number) => void;
+  /** When set, only viewports whose measurementPlane matches this value may
+   *  create new measurements.  Existing measurements can still be selected
+   *  and dragged on any viewport. */
+  allowedDrawPlane?: Plane;
 }
 
 type Rect = { top: number; left: number; width: number; height: number; z?: number };
@@ -80,6 +84,7 @@ export function ViewportGrid({
   onDisplaySizeChange,
   referenceLineByPlane,
   onReferenceLineClick,
+  allowedDrawPlane,
 }: ViewportGridProps) {
   // pixelSpacing is optional and provided by parent when available
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -210,6 +215,7 @@ export function ViewportGrid({
               onDisplaySizeChange={(size) => onDisplaySizeChange?.(viewPlane, size)}
               referenceLine={referenceLineByPlane?.[viewPlane] ?? null}
               onReferenceLineClick={onReferenceLineClick}
+              allowNewMeasurements={!allowedDrawPlane || viewPlane === allowedDrawPlane}
             />
           </div>
         </div>
@@ -295,6 +301,7 @@ export function ViewportGrid({
                 onDisplaySizeChange={(size) => onDisplaySizeChange?.(w.id, size)}
                 referenceLine={referenceLineByPlane?.[w.id] ?? null}
                 onReferenceLineClick={onReferenceLineClick}
+                allowNewMeasurements={!allowedDrawPlane || w.id === allowedDrawPlane}
               />
               <div
                 onMouseDown={(e) => startResize(w.id, e)}

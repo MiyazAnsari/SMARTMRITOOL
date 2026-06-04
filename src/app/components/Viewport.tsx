@@ -66,6 +66,10 @@ interface ViewportProps {
    *  image pixels so the parent can map to the axial volume's actual slice
    *  count.  For non-sagittal planes both values are -1. */
   onReferenceLineClick?: (refImgY: number, imgH: number) => void;
+  /** When false, creating new measurements (lines, points, angles) is
+   *  blocked on this viewport.  Existing measurements can still be selected
+   *  and dragged.  Defaults to true. */
+  allowNewMeasurements?: boolean;
 }
 
 export function Viewport({
@@ -93,6 +97,7 @@ export function Viewport({
   onDisplaySizeChange,
   referenceLine,
   onReferenceLineClick,
+  allowNewMeasurements = true,
 }: ViewportProps) {
   const [wl, setWl] = useState<WindowLevel>(() =>
     sanitizeWindowLevel(defaultWindowLevel.window, defaultWindowLevel.level, defaultWindowLevel),
@@ -2020,6 +2025,10 @@ export function Viewport({
       lineDragMovedRef.current = false;
       return;
     }
+
+    // Block new measurement creation when this viewport's plane doesn't
+    // match the active protocol step's required plane.
+    if (!allowNewMeasurements) return;
 
     // Allow creating a perpendicular either by using the select tool (none)
     // when clicking near a line's midpoint, or by using the perpendicular
