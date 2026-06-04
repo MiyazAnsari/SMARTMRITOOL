@@ -1,4 +1,4 @@
-import { useRef, useEffect, useLayoutEffect, useState, useCallback } from 'react';
+import { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo } from 'react';
 import type { WindowLevel, MeasurementTool, Measurement, PointUpdater } from './MedicalImageViewer';
 import { Slider } from './ui/slider';
 
@@ -51,6 +51,21 @@ interface ViewportProps {
   /** Reports the viewport's display size when it changes so the parent can
    *  compute the CSS→image-pixel scale for physical-unit conversions. */
   onDisplaySizeChange?: (size: { width: number; height: number }) => void;
+  /** When set, renders a horizontal dotted reference line at a given mm offset
+   *  above a measurement point.  Used for cross-plane protocols (e.g. 3 cm
+   *  superior to the joint line).  The viewport computes the Y position and,
+   *  for sagittal planes, the corresponding axial slice for navigation. */
+  referenceLine?: {
+    fromPoint: { x: number; y: number };
+    offsetMm: number;
+    label: string;
+    imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
+  } | null;
+  /** Called when the user clicks the reference line.  For sagittal viewports
+   *  the callback receives the Z-position fraction (0–1) and the Z extent in
+   *  image pixels so the parent can map to the axial volume's actual slice
+   *  count.  For non-sagittal planes both values are -1. */
+  onReferenceLineClick?: (refImgY: number, imgH: number) => void;
 }
 
 export function Viewport({
@@ -76,6 +91,8 @@ export function Viewport({
   measurementUnits = 'mm',
   pixelSpacing,
   onDisplaySizeChange,
+  referenceLine,
+  onReferenceLineClick,
 }: ViewportProps) {
   const [wl, setWl] = useState<WindowLevel>(() =>
     sanitizeWindowLevel(defaultWindowLevel.window, defaultWindowLevel.level, defaultWindowLevel),
@@ -459,6 +476,42 @@ export function Viewport({
       lastBaselineUpdateRef.current.set(m.id, Date.now());
     } catch {}
   }, [onMeasurementAdd, computeImageScale]);
+
+  // ── Reference line computation (cross-plane protocol support) ──────────
+  // When the active protocol step defines a referenceLineMm offset, compute
+  // the CSS-pixel Y position of the reference line.  For sagittal viewports
+  // the Y-axis is the Z-direction (superior-inferior); the spacing is the
+  // row spacing of the sagittal acquisition (pixDims[2]), which is typically
+  // the in-plane resolution (~0.35 mm), NOT the slice thickness.
+  const computedReferenceLine = useMemo(() => {
+    if (!referenceLine) return null;
+    const { fromPoint, offsetMm, imageScale: rlImageScale } = referenceLine;
+    const is = rlImageScale ?? computeImageScale();
+
+    // Row spacing of this volume (Z-direction for sagittal, Y for axial).
+    const pixDims: number[] = header.pixDims || header?.pixdim || [];
+    const rowSpacing = Number.isFinite(pixDims[2]) && pixDims[2] > 0 ? pixDims[2] : 1;
+    const { height: imgH } = getPlaneGeometry();
+
+    const isSagittal = measurementPlane === 'sagittal';
+
+    // Convert the source point from CSS to image-pixel coordinates.
+    const imgY = (fromPoint.y - (is.offsetY ?? 0)) * (is.y || 1);
+
+    // Compute the offset in image pixels (superior = smaller Y in image space).
+    const offsetImgPx = offsetMm / rowSpacing;
+    const refImgY = imgY - offsetImgPx;
+
+    // Convert back to CSS coordinates.
+    const refCssY = refImgY / (is.y || 1) + (is.offsetY ?? 0);
+
+    return {
+      cssY: refCssY,
+      refImgY: isSagittal ? refImgY : -1,
+      imgH: isSagittal ? imgH : -1,
+      isSagittal,
+    };
+  }, [referenceLine, computeImageScale, getPlaneGeometry, measurementPlane, header]);
 
   const prevDisplaySizeRef = useRef<{ width: number; height: number } | null>(null);
   useEffect(() => {
@@ -1365,7 +1418,61 @@ export function Viewport({
         ctx.stroke();
       }
     }
-  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool, selectedLineId, overlayTick]);
+
+    // ── Reference line (cross-plane protocol guide) ──────────────────────
+    if (computedReferenceLine) {
+      const rl = computedReferenceLine;
+      const y = rl.cssY;
+
+      // Only draw if within the visible canvas bounds.
+      if (y >= 0 && y <= clearH) {
+        ctx.save();
+        // Dashed yellow line spanning the full draw width.
+        ctx.setLineDash([8, 5]);
+        ctx.strokeStyle = 'rgba(250, 204, 21, 0.85)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(clearW, y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Label on the left side.
+        const labelText = referenceLine?.label ?? 'Reference';
+        const rlLabel = computedReferenceLine.isSagittal
+          ? `${labelText} (click to navigate axial)`
+          : labelText;
+
+        ctx.font = 'bold 10px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'bottom';
+        const labelW = ctx.measureText(rlLabel).width + 10;
+
+        // Background pill.
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+        ctx.beginPath();
+        ctx.roundRect(6, y - 6, labelW, 18, 6);
+        ctx.fill();
+
+        // Label text.
+        ctx.fillStyle = '#facc15';
+        ctx.fillText(rlLabel, 12, y + 6);
+
+        // Click target indicator (small arrow or circle on the right).
+        ctx.fillStyle = 'rgba(250, 204, 21, 0.6)';
+        ctx.beginPath();
+        ctx.arc(clearW - 16, y, 6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#000';
+        ctx.font = 'bold 10px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('↕', clearW - 16, y);
+
+        ctx.restore();
+      }
+    }
+  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool, selectedLineId, overlayTick, computedReferenceLine, referenceLine, plane]);
 
   // Calculate measurement value (prefer physical units mm when possible)
   const calculateMeasurementValue = (type: MeasurementTool, points: { x: number; y: number }[]): string => {
@@ -1441,23 +1548,41 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    if (activeTool === 'none') {
-      for (const m of measurementsRef.current) {
-        if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
-        if (m.points.length === 0) continue;
-        for (let i = 0; i < m.points.length; i++) {
-          const p = m.points[i];
-          const dist = Math.sqrt((x - p.x) ** 2 + (y - p.y) ** 2);
-          if (dist < 10) {
-            draggingPointRef.current = { measurementId: m.id, pointIndex: i };
-            setDraggingPoint({ measurementId: m.id, pointIndex: i });
-            setIsDrawing(false);
-            setDrawingPoints([]);
-            return;
-          }
+    // ── Reference line click (cross-plane navigation) ───────────────────
+    // Check BEFORE any tool-specific logic so the reference line is always
+    // clickable regardless of the active tool (point, distance, select, etc.).
+    if (computedReferenceLine && onReferenceLineClick) {
+      const rl = computedReferenceLine;
+      const distToLine = Math.abs(y - rl.cssY);
+      const nearLabel = x <= 120 && Math.abs(y - rl.cssY) < 18;
+      if (distToLine < 14 || nearLabel) {
+        onReferenceLineClick(rl.refImgY, rl.imgH);
+        // Consume the event so it doesn't also trigger a tool action.
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+    }
+
+    // ── Point dragging — allowed with any tool so placed landmarks can
+    // always be adjusted (e.g. joint-line point in sulcus-angle-3cm).
+    for (const m of measurementsRef.current) {
+      if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
+      if (m.points.length === 0) continue;
+      for (let i = 0; i < m.points.length; i++) {
+        const p = m.points[i];
+        const dist = Math.sqrt((x - p.x) ** 2 + (y - p.y) ** 2);
+        if (dist < 10) {
+          draggingPointRef.current = { measurementId: m.id, pointIndex: i };
+          setDraggingPoint({ measurementId: m.id, pointIndex: i });
+          setIsDrawing(false);
+          setDrawingPoints([]);
+          return;
         }
       }
+    }
 
+    if (activeTool === 'none') {
       for (const m of measurementsRef.current) {
         if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
         if (m.type !== 'perpendicular' || m.points.length < 2) continue;
@@ -1877,6 +2002,18 @@ export function Viewport({
         return;
       }
     }
+
+    // ── Reference line click (cross-plane navigation) ───────────────────
+    if (computedReferenceLine && onReferenceLineClick) {
+      const rl = computedReferenceLine;
+      const distToLine = Math.abs(y - rl.cssY);
+      const nearLabel = x <= 120 && Math.abs(y - rl.cssY) < 18;
+      if (distToLine < 14 || nearLabel) {
+        onReferenceLineClick(rl.refImgY, rl.imgH);
+        return;
+      }
+    }
+
     const snappedPoint = findSnapPoint(x, y);
 
     if (lineDragMovedRef.current) {

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, useEffect, useRef } from 'react';
 import { CheckCircle2, Circle, RotateCcw } from 'lucide-react';
 import { Button } from '../ui/button';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../ui/collapsible';
@@ -83,8 +83,27 @@ export function MeasurementWorkflow({
       activeStepIndex: 0,
       stepResults: {},
     });
-    if (p && onPlaneRequest) onPlaneRequest(p.requiredPlane);
+    if (p && onPlaneRequest) {
+      // Use the first step's plane override if present, otherwise the protocol's requiredPlane.
+      const firstStepPlane = p.steps[0]?.plane ?? p.requiredPlane;
+      onPlaneRequest(firstStepPlane);
+    }
   };
+
+  // When the active step changes, request its plane if it differs from
+  // the protocol default (cross-plane protocol support).
+  const prevActiveStepIdx = useRef(state.activeStepIndex);
+  useEffect(() => {
+    if (!protocol || !onPlaneRequest) return;
+    const step = protocol.steps[state.activeStepIndex];
+    if (!step) return;
+    const stepPlane = step.plane ?? protocol.requiredPlane;
+    // Only request when the index actually changed (not on initial render).
+    if (prevActiveStepIdx.current !== state.activeStepIndex) {
+      onPlaneRequest(stepPlane);
+    }
+    prevActiveStepIdx.current = state.activeStepIndex;
+  }, [state.activeStepIndex, protocol, onPlaneRequest]);
 
   const reset = () => {
     onResetMeasurements?.();
@@ -173,11 +192,13 @@ export function MeasurementWorkflow({
               <div className="font-medium text-blue-200">{protocol.label}</div>
               <div className="mt-1 text-gray-400">{protocol.description}</div>
               <div className="mt-2 text-blue-300">
-                Required plane:{' '}
-                <span className="capitalize font-medium text-blue-100">{protocol.requiredPlane}</span>
+                Active step plane:{' '}
+                <span className="capitalize font-medium text-blue-100">
+                  {activeStep?.plane ?? protocol.requiredPlane}
+                </span>
                 {onPlaneRequest && (
                   <button
-                    onClick={() => onPlaneRequest(protocol.requiredPlane)}
+                    onClick={() => onPlaneRequest(activeStep?.plane ?? protocol.requiredPlane)}
                     className="ml-2 underline hover:text-blue-200"
                   >
                     show
@@ -226,6 +247,11 @@ export function MeasurementWorkflow({
                           }`}
                         >
                           {idx + 1}. {step.label}
+                          {step.plane && step.plane !== protocol.requiredPlane && (
+                            <span className="ml-1 text-[10px] uppercase text-gray-500">
+                              ({step.plane})
+                            </span>
+                          )}
                         </div>
                         {isActive && (
                           <div className="text-gray-300 mt-1 leading-snug">

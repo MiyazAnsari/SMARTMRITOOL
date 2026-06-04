@@ -164,7 +164,7 @@ function workflowToolToMeasurementTool(tool: WorkflowTool): MeasurementTool {
     case 'none':
       return 'none';
     case 'point':
-      return 'none';
+      return 'point'; // standalone point placement — distinct from Select
     case 'distance':
     default:
       return 'distance';
@@ -322,6 +322,96 @@ export function MedicalImageViewer({
     const drawH = Math.max(1, Math.round(physicalH * fitScale));
     return { x: imgW / drawW, y: imgH / drawH };
   }, [protocol, studyData, viewportDisplaySizes]);
+
+  // ── Cross-plane reference line computation ─────────────────────────
+  // When any completed protocol step defines a `referenceLineMm` offset and
+  // its result exists, compute reference line data for the viewport that
+  // hosts the step's plane.  The line persists across steps so the user can
+  // click it to navigate even after advancing to later steps.
+  const referenceLineByPlane = useMemo(() => {
+    if (!protocol) return undefined;
+    const result: Record<string, {
+      fromPoint: { x: number; y: number };
+      offsetMm: number;
+      label: string;
+      imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
+    } | null> = {};
+
+    for (const step of protocol.steps) {
+      if (!step.referenceLineMm) continue;
+      const stepResult = workflow.stepResults[step.id];
+      if (!stepResult || stepResult.points.length < 1) continue;
+
+      const refPlane = step.plane ?? protocol.requiredPlane;
+      const point = stepResult.points[stepResult.points.length - 1];
+      const is = stepResult.imageScale;
+
+      result[refPlane] = {
+        fromPoint: point,
+        offsetMm: step.referenceLineMm,
+        label: `${(step.referenceLineMm / 10).toFixed(1)} cm above joint line`,
+        imageScale: is,
+      };
+    }
+    return Object.keys(result).length > 0 ? result : undefined;
+  }, [protocol, workflow.stepResults]);
+
+  // ── Reference line click → navigate axial viewer ──────────────────
+  // The Viewport passes the Z-position in sagittal image-pixels and the
+  // Z extent.  We map the fraction to the axial volume's actual slice count.
+  const navigateToAxialFraction = useCallback(
+    (refImgY: number, imgH: number) => {
+      if (refImgY < 0 || imgH <= 0) return;
+      const axialVol = studyData?.volumes?.axial;
+      const axialSliceCount = axialVol?.sliceCount ?? (axialVol?.header?.dims?.[3] ?? 0);
+      if (axialSliceCount <= 0) return;
+      const fraction = Math.max(0, Math.min(1, refImgY / imgH));
+      const axialSlice = Math.round(fraction * (axialSliceCount - 1));
+      setCurrentSlice((prev) => ({ ...prev, axial: axialSlice }));
+      if (studyData) {
+        setStudyViewport((s) => ({
+          open: s.open.includes('axial') ? s.open : [...s.open, 'axial'],
+          active: 'axial',
+        }));
+      }
+    },
+    [studyData],
+  );
+
+  const handleReferenceLineClick = useCallback(
+    (refImgY: number, imgH: number) => {
+      navigateToAxialFraction(refImgY, imgH);
+    },
+    [navigateToAxialFraction],
+  );
+
+  // ── Auto-navigate on first reference line appearance ──────────────
+  // When the user places the joint-line point and the reference line data
+  // first becomes available, automatically jump the axial viewer to the
+  // computed 3‑cm‑above slice so the user can immediately start drawing
+  // the sulcus angle lines without an extra click.
+  const prevHadReferenceLine = useRef(false);
+  useEffect(() => {
+    const hasNow = referenceLineByPlane != null;
+    if (hasNow && !prevHadReferenceLine.current) {
+      // First time the reference line appears — auto-navigate.
+      const sagData = referenceLineByPlane!['sagittal'];
+      if (sagData && protocol) {
+        // Recompute the Z fraction using the sagittal volume's geometry.
+        const sagVol = studyData?.volumes?.sagittal;
+        const pixDims: number[] = sagVol?.header?.pixDims || sagVol?.header?.pixdim || [];
+        const rowSpacing = Number.isFinite(pixDims[2]) && pixDims[2] > 0 ? pixDims[2] : 1;
+        const imgH = sagVol?.header?.dims?.[2] ?? 0; // sagittal image height = Z extent
+        const is = sagData.imageScale;
+        if (imgH > 0 && is) {
+          const imgY = (sagData.fromPoint.y - (is.offsetY ?? 0)) * (is.y || 1);
+          const refImgY = imgY - sagData.offsetMm / rowSpacing;
+          navigateToAxialFraction(refImgY, imgH);
+        }
+      }
+    }
+    prevHadReferenceLine.current = hasNow;
+  }, [referenceLineByPlane, protocol, studyData, navigateToAxialFraction]);
 
   useEffect(() => {
     if (workflow.protocolId) {
@@ -1301,6 +1391,8 @@ export function MedicalImageViewer({
             onResetViewport={handleResetViewport}
             pixelSpacing={pixelSpacing}
             onDisplaySizeChange={handleViewportDisplaySizeChange}
+            referenceLineByPlane={referenceLineByPlane}
+            onReferenceLineClick={handleReferenceLineClick}
           />
         ) : (
           <div className="h-full flex items-center justify-center">

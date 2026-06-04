@@ -14,6 +14,21 @@ export interface ProtocolStep {
   tool: WorkflowTool;
   /** Geometric primitive the user must draw to complete this step. */
   primitive: Primitive;
+  /**
+   * When set, this step must be completed on a specific plane that may differ
+   * from the protocol's `requiredPlane`.  The workflow will request this plane
+   * when the step becomes active, enabling cross-plane measurement protocols
+   * (e.g. sagittal joint-line localisation → axial sulcus angle).
+   */
+  plane?: Plane;
+  /**
+   * When set, the viewport draws a horizontal reference line at the given
+   * mm offset above the step's captured point.  Used for protocols that
+   * require navigating to a specific superior offset (e.g. 3 cm above the
+   * femorotibial joint line).  The value is the offset in mm (positive =
+   * superior).
+   */
+  referenceLineMm?: number;
 }
 
 export interface MeasurementResult {
@@ -349,11 +364,76 @@ const SULCUS_ANGLE: MeasurementProtocol = {
   },
 };
 
+/**
+ * Sulcus Angle measured 3 cm superior to the femorotibial joint line.
+ *
+ * Cross-plane workflow:
+ *   1. Sagittal – place a point at the joint line.
+ *   2. A 3 cm reference line appears above the point on the sagittal view.
+ *   3. Clicking the reference line navigates the axial viewer to that level.
+ *   4. Axial – draw the two sulcus-angle lines (medial→groove, lateral→groove).
+ */
+const SULCUS_ANGLE_3CM: MeasurementProtocol = {
+  id: 'sulcus-angle-3cm',
+  label: 'Sulcus Angle (3 cm)',
+  description:
+    'Sulcus angle measured 3 cm superior to the femorotibial joint line. Place the joint-line point on a sagittal slice, then click the reference line to jump to the correct axial level.',
+  requiredPlane: 'sagittal',
+  steps: [
+    {
+      id: 'joint-line',
+      label: 'Femorotibial joint line',
+      instruction:
+        'Use Point. On a sagittal slice, place a point at the femorotibial joint line. A 3 cm reference line will appear above it.',
+      tool: 'point',
+      primitive: 'point',
+      plane: 'sagittal',
+      referenceLineMm: 30,
+    },
+    {
+      id: 'medial-line',
+      label: 'Medial condyle → sulcus',
+      instruction:
+        'Use Distance. On the axial slice at 3 cm above the joint line, draw a line from the medial condyle peak to the deepest trochlear groove.',
+      tool: 'distance',
+      primitive: 'line',
+      plane: 'axial',
+    },
+    {
+      id: 'lateral-line',
+      label: 'Lateral condyle → sulcus',
+      instruction:
+        'Use Distance. Draw a line from the lateral condyle peak to the same groove point.',
+      tool: 'distance',
+      primitive: 'line',
+      plane: 'axial',
+    },
+  ],
+  compute: (results, ps, paramImageScale) => {
+    const m = results['medial-line'];
+    const l = results['lateral-line'];
+    if (!m || m.points.length < 2 || !l || l.points.length < 2) return null;
+    const imageScale = m.imageScale ?? l.imageScale ?? paramImageScale;
+    const raw = angleBetweenLines(m.points[1], m.points[0], l.points[1], l.points[0], ps, imageScale);
+    const angle = raw < 90 ? 180 - raw : raw;
+    return {
+      value: angle,
+      unit: '°',
+      summary: `Sulcus angle (3 cm) = ${angle.toFixed(1)}°`,
+      interpretation:
+        angle > 145
+          ? 'Trochlear dysplasia likely (>145°).'
+          : 'Within normal range (<145°).',
+    };
+  },
+};
+
 export const MEASUREMENT_PROTOCOLS: MeasurementProtocol[] = [
   TT_TG,
   INSALL_SALVATI,
   PATELLAR_TILT,
   SULCUS_ANGLE,
+  SULCUS_ANGLE_3CM,
 ];
 
 export function getProtocol(id: string | undefined | null): MeasurementProtocol | null {

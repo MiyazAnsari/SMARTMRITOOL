@@ -40,6 +40,18 @@ interface ViewportGridProps {
   onResetViewport?: (plane: Plane) => void;
   /** Per-plane display size callback for px↔mm conversion. */
   onDisplaySizeChange?: (plane: Plane, size: { width: number; height: number }) => void;
+  /** Cross-plane reference line data, keyed by plane.  Only the plane that
+   *  hosts the reference line receives the data; other planes get null. */
+  referenceLineByPlane?: Record<string, {
+    fromPoint: { x: number; y: number };
+    offsetMm: number;
+    label: string;
+    imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
+  } | null>;
+  /** Called when the user clicks a reference line.  Receives the Z-position
+   *  in image-pixels and the Z extent so the parent can map to the axial
+   *  volume's actual slice count. */
+  onReferenceLineClick?: (refImgY: number, imgH: number) => void;
 }
 
 type Rect = { top: number; left: number; width: number; height: number; z?: number };
@@ -66,6 +78,8 @@ export function ViewportGrid({
   onHideWindow,
   onResetViewport,
   onDisplaySizeChange,
+  referenceLineByPlane,
+  onReferenceLineClick,
 }: ViewportGridProps) {
   // pixelSpacing is optional and provided by parent when available
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -194,6 +208,8 @@ export function ViewportGrid({
               showCrosshair={showCrosshair}
               onViewportReset={() => onResetViewport?.(viewPlane)}
               onDisplaySizeChange={(size) => onDisplaySizeChange?.(viewPlane, size)}
+              referenceLine={referenceLineByPlane?.[viewPlane] ?? null}
+              onReferenceLineClick={onReferenceLineClick}
             />
           </div>
         </div>
@@ -277,6 +293,8 @@ export function ViewportGrid({
                 onViewportReset={() => onResetViewport?.(w.id)}
                 onClose={() => onHideWindow?.(w.id)}
                 onDisplaySizeChange={(size) => onDisplaySizeChange?.(w.id, size)}
+                referenceLine={referenceLineByPlane?.[w.id] ?? null}
+                onReferenceLineClick={onReferenceLineClick}
               />
               <div
                 onMouseDown={(e) => startResize(w.id, e)}
