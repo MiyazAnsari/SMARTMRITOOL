@@ -527,7 +527,11 @@ export function Viewport({
   // image height, so sagittal + coronal lines always align anatomically.
   const computedReferenceLines = useMemo(() => {
     const lines: { cssY: number; refFraction: number; label: string; isSagittal: boolean }[] = [];
-    if (measurementPlane === 'axial') return lines;
+    // Only show reference lines on sagittal (coronal cross-plane sync is
+    // limited by different anatomical axes — sagittal Y = L/R+Z vs coronal
+    // Y = A/P.  The 3D affine mapping (WIP in dicomAffine.ts) will re-enable
+    // coronal lines once the matrix inversion for oblique geometries is fixed.)
+    if (measurementPlane !== 'sagittal') return lines;
     if (!referenceLineFraction) return lines;
 
     const {
