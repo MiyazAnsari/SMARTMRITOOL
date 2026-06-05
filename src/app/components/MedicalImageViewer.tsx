@@ -21,7 +21,8 @@ function ToolTip({ label, children }: { label: string; children: React.ReactNode
 }
 import type { DicomStudyView } from './dicom/patientStudy';
 import type { DicomVolume, Plane } from './dicom/DicomLoader';
-import { getDicomAffine, mapPoint3D } from './dicom/dicomAffine';
+// 3D affine WIP — see guidelines/IMPLEMENTATION_PLAN.md P0
+// import { getDicomAffine, mapPoint3D, validateAffine, roundTripTest, voxelToPatient, patientToVoxel } from './dicom/dicomAffine';
 import {
   initialWorkflowState,
   recordStepResult,
@@ -267,6 +268,11 @@ export function MedicalImageViewer({
   const rightResizing = useRef(false);
   // Measurement workflow (TT-TG, Insall–Salvati, etc.)
   const [workflow, setWorkflow] = useState<WorkflowState>(initialWorkflowState);
+  /** Frame registration: user marks the same anatomical point (medial joint line)
+   *  on sagittal + coronal.  Points stored as CSS coords; affine lookup from studyData. */
+  const [calibrationPoints, setCalibrationPoints] = useState<Partial<Record<Plane, { x: number; y: number; imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number } }>>>({});
+  /** Which plane is awaiting a point placement for calibration. */
+  const [calibrationPending, setCalibrationPending] = useState<Plane | null>(null);
   /** DICOM: open floating viewers + focused series (single source of truth with `open`). */
   const [studyViewport, setStudyViewport] = useState<StudyViewportState>({ open: [], active: 'axial' });
   const prevStudyDataRef = useRef<DicomStudyView | null>(null);
@@ -394,30 +400,21 @@ export function MedicalImageViewer({
         planeImgH[p] = nSlices;
       }
 
-      // CSS fraction for sagittal (viewport-dependent but tracks drag).
+      // CSS fraction for sagittal.  Prefer creation-time display height
+      // so the fraction is invariant to viewport resize.
+      const creationDH = (sr as any).creationDisplayH as number | undefined;
       const sagDisp = viewportDisplaySizes['sagittal'];
-      const sagDisplayH = sagDisp?.height ?? 0;
+      const sagDisplayH = creationDH ?? sagDisp?.height ?? 0;
       const sagDrawH = Math.max(1, sagDisplayH - 2 * sagOffsetY);
       const sagFraction = sagDrawH > 0
         ? Math.max(0, Math.min(1, (sagCssY - sagOffsetY) / sagDrawH))
         : 0;
 
-      // ── 3D affine mapping sagittal → coronal (WIP) ────────────────
-      // Disabled for now — produces negative coronal slice indices.
-      // The CSS fraction fallback below works correctly.
+      // ── 3D affine + calibration (DISABLED) ───────────────────────
+      // Translation-only calibration can't correct for different axis
+      // orientations between series.  CSS fraction fallback below.
       let coronalImageY: number | undefined;
-      /* TODO: debug affine matrix inversion for oblique slice geometries
-      const sagAffine = getDicomAffine(studyData?.volumes?.sagittal?.header ?? {});
-      const corAffine = getDicomAffine(studyData?.volumes?.coronal?.header ?? {});
-      if (sagAffine && corAffine) {
-        const sagAuthImgH = planeImgH['sagittal'] || 61;
-        const sagImgY = sagFraction * sagAuthImgH;
-        const sagImgX = (sr.points[0].x - (is.offsetX ?? 0)) * (is.x || 1);
-        const sagColIdx = sr.slice ?? 0;
-        const result = mapPoint3D(sagColIdx, sagImgX, sagImgY, sagAffine, corAffine);
-        if (result) coronalImageY = result.slice;
-      }
-      */
+      /* 3D affine + calibration WIP — see guidelines/IMPLEMENTATION_PLAN.md P0 */
 
       return {
         sagFraction,
@@ -432,7 +429,7 @@ export function MedicalImageViewer({
       };
     }
     return null;
-  }, [protocol, workflow.stepResults, viewportDisplaySizes, studyData, computePlaneImageScale]);
+  }, [protocol, workflow.stepResults, viewportDisplaySizes, studyData, computePlaneImageScale, calibrationPoints]);
 
   // Per-step reference lines are now handled by referenceLineFraction (synced
   // across sagittal + coronal via Z-position fraction).
@@ -863,6 +860,60 @@ export function MedicalImageViewer({
     [studyData],
   );
 
+  // Frame registration: capture the currently selected measurement point
+  // as the calibration landmark for the given plane.
+  const handleCalibrationCapture = useCallback(
+    (plane: Plane) => {
+      if (plane === 'sagittal' && protocol) {
+        const jointStep = protocol.steps.find(s => s.referenceLineMm);
+        if (jointStep) {
+          const sr = workflow.stepResults[jointStep.id];
+          if (sr && sr.points.length > 0) {
+            setCalibrationPoints((prev) => ({
+              ...prev,
+              sagittal: { x: sr.points[0].x, y: sr.points[0].y, imageScale: sr.imageScale },
+            }));
+            return;
+          }
+        }
+        // Joint-line point not placed yet — do nothing (button shows tooltip).
+        return;
+      }
+      // Coronal / axial: toggle pending mode.
+      if (calibrationPending === plane) {
+        setCalibrationPending(null);
+      } else {
+        setCalibrationPending(plane);
+      }
+    },
+    [protocol, workflow.stepResults, calibrationPending],
+  );
+
+  // When a new measurement is added and calibration is pending for its plane,
+  // auto-capture it as the calibration point.
+  const prevMeasurementCountRef = useRef(measurements.length);
+  useEffect(() => {
+    if (!calibrationPending || measurements.length <= prevMeasurementCountRef.current) {
+      prevMeasurementCountRef.current = measurements.length;
+      return;
+    }
+    prevMeasurementCountRef.current = measurements.length;
+    // New measurement added — capture if it's on the pending plane.
+    const newest = measurements[measurements.length - 1];
+    if (newest && (newest.plane ?? '') === calibrationPending && newest.points.length > 0) {
+      setCalibrationPoints((prev) => ({
+        ...prev,
+        [calibrationPending]: { x: newest.points[0].x, y: newest.points[0].y, imageScale: newest.imageScale },
+      }));
+      setCalibrationPending(null);
+    }
+  }, [measurements.length, calibrationPending, measurements]);
+
+  const clearCalibration = useCallback(() => {
+    setCalibrationPoints({});
+    setCalibrationPending(null);
+  }, []);
+
   const toggleStudyPlaneViewport = useCallback(
     (plane: Plane) => {
       const studyVolumes = studyData?.volumes;
@@ -1057,6 +1108,7 @@ export function MedicalImageViewer({
             points: recordedPoints,
             slice: groupedMeasurement.slice,
             imageScale: groupedMeasurement.imageScale,
+            creationDisplayH: activeStep.plane ? viewportDisplaySizes[activeStep.plane]?.height : undefined,
           }),
         );
       }
@@ -1471,6 +1523,7 @@ export function MedicalImageViewer({
           <ViewportGrid
             imageData={imageData!}
             header={header!}
+            planeVolumes={studyData?.volumes as any}
             currentSlice={currentSlice}
             viewPlane={currentViewPlane}
             onSliceChange={handleSliceChange}
@@ -1495,7 +1548,7 @@ export function MedicalImageViewer({
             referenceLineByPlane={referenceLineByPlane}
             referenceLineFraction={referenceLineFraction}
             onReferenceLineClick={handleReferenceLineClick}
-            allowedDrawPlane={activeStep?.plane ?? protocol?.requiredPlane}
+            allowedDrawPlane={calibrationPending ?? activeStep?.plane ?? protocol?.requiredPlane}
             alwaysAllowPointDrag={!!(protocol && protocol.steps.some(s => s.referenceLineMm && workflow.stepResults[s.id]))}
           />
         ) : (
@@ -1527,6 +1580,56 @@ export function MedicalImageViewer({
               Sequence: <span className="text-gray-100 capitalize">{studyViewport.active}</span>
               {activeVolumeMeta?.seriesDescription ? ` (${activeVolumeMeta.seriesDescription})` : ''}
             </div>
+          </div>
+        )}
+
+        {/* Frame-registration calibration bar — disabled until 3D affine is fixed */}
+        {false && studyData && (
+          <div className="absolute bottom-2 left-1/2 -translate-x-1/2 z-50 bg-gray-900/95 border border-gray-600 rounded-lg px-3 py-1.5 text-[11px] flex items-center gap-2 shadow-lg backdrop-blur-sm pointer-events-auto"
+               onClick={(e) => e.stopPropagation()}>
+            <span className="text-gray-400 mr-1 font-medium">Calibrate</span>
+            {(['sagittal', 'coronal', 'axial'] as Plane[]).map((p) => {
+              const isSet = !!calibrationPoints[p];
+              const isPending = calibrationPending === p;
+              const hasJointPoint = p === 'sagittal'
+                && !!(protocol && protocol.steps.some(s => s.referenceLineMm && workflow.stepResults[s.id]?.points?.length));
+              const sagNeedsPoint = p === 'sagittal' && !hasJointPoint && !isSet;
+              return (
+                <button
+                  key={p}
+                  onClick={() => handleCalibrationCapture(p)}
+                  disabled={sagNeedsPoint}
+                  className={`px-2 py-0.5 rounded text-[11px] border transition-colors ${
+                    isSet
+                      ? 'bg-emerald-900/60 border-emerald-600 text-emerald-300'
+                      : isPending
+                        ? 'bg-amber-900/60 border-amber-600 text-amber-300 animate-pulse'
+                        : sagNeedsPoint
+                          ? 'bg-gray-800/40 border-gray-700/40 text-gray-600 cursor-not-allowed'
+                          : 'bg-gray-800 border-gray-700 text-gray-300 hover:bg-gray-700 hover:border-gray-500'
+                  }`}
+                  title={
+                    isSet ? `${p} calibrated ✓`
+                    : isPending ? `Place a point on ${p} — click again to cancel`
+                    : sagNeedsPoint ? 'Complete the joint-line protocol step on sagittal first'
+                    : `Click, then place a point on ${p} at the joint line`
+                  }
+                >
+                  {p.charAt(0).toUpperCase() + p.slice(1)}
+                  {isSet ? ' ✓' : isPending ? ' …' : ''}
+                </button>
+              );
+            })}
+            {calibrationPoints['sagittal'] && calibrationPoints['coronal'] ? (
+              <span className="text-emerald-400 text-[10px] font-medium">✓ Aligned</span>
+            ) : calibrationPending ? (
+              <span className="text-amber-400 text-[10px]">place point on {calibrationPending}</span>
+            ) : (
+              <span className="text-gray-500 text-[10px] hidden sm:inline">same joint line on all views</span>
+            )}
+            {(calibrationPoints['sagittal'] || calibrationPoints['coronal'] || calibrationPending) && (
+              <button onClick={clearCalibration} className="text-gray-500 hover:text-gray-300 text-[10px] ml-1">✕</button>
+            )}
           </div>
         )}
 

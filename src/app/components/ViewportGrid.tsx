@@ -16,6 +16,9 @@ interface SequenceWindow {
 interface ViewportGridProps {
   imageData: Uint8Array;
   header: any;
+  /** Optional per-plane authoritative volumes (e.g. from studyData.volumes).
+   *  When provided, each grid viewport uses its plane's own imageData/header. */
+  planeVolumes?: Partial<Record<Plane, { imageData: Uint8Array; header: any }>>;
   currentSlice: { axial: number; sagittal: number; coronal: number };
   /** Single-view mode */
   viewPlane: ViewPlane;
@@ -77,6 +80,7 @@ type Rect = { top: number; left: number; width: number; height: number; z?: numb
 export function ViewportGrid({
   imageData,
   header,
+  planeVolumes,
   currentSlice,
   viewPlane,
   onSliceChange,
@@ -210,8 +214,8 @@ export function ViewportGrid({
         <div className="flex-1 min-h-0 p-2 flex flex-col">
           <div className="flex-1 min-h-0 relative rounded-lg border border-gray-800 bg-gray-900 overflow-hidden shadow-lg">
             <Viewport
-              imageData={imageData}
-              header={header}
+              imageData={planeVolumes?.[viewPlane]?.imageData ?? imageData}
+              header={planeVolumes?.[viewPlane]?.header ?? header}
               plane={viewPlane}
               measurementPlane={viewPlane}
               currentSlice={planeSlice}

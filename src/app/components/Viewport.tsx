@@ -527,11 +527,8 @@ export function Viewport({
   // image height, so sagittal + coronal lines always align anatomically.
   const computedReferenceLines = useMemo(() => {
     const lines: { cssY: number; refFraction: number; label: string; isSagittal: boolean }[] = [];
-    // Only show reference lines on sagittal (coronal cross-plane sync is
-    // limited by different anatomical axes — sagittal Y = L/R+Z vs coronal
-    // Y = A/P.  The 3D affine mapping (WIP in dicomAffine.ts) will re-enable
-    // coronal lines once the matrix inversion for oblique geometries is fixed.)
-    if (measurementPlane !== 'sagittal') return lines;
+    // Only show on sagittal and coronal (not axial).
+    if (measurementPlane === 'axial') return lines;
     if (!referenceLineFraction) return lines;
 
     const {
@@ -2390,6 +2387,56 @@ export function Viewport({
   }, [activeTool]);
 
   const dims = header.dims;
+  // ── Orientation labels from DICOM IOP ───────────────────────────────
+  const orientationLabels = useMemo(() => {
+    // DICOM patient coordinate system: +X=left, +Y=posterior, +Z=superior
+    const DIRS: Record<string, [number,number,number]> = {
+      S: [0,0,1], I: [0,0,-1], A: [0,-1,0], P: [0,1,0], L: [1,0,0], R: [-1,0,0],
+    };
+    const closestDir = (v: [number,number,number]): string => {
+      let best = '?'; let bestDot = -Infinity;
+      for (const [label, d] of Object.entries(DIRS)) {
+        const dp = v[0]*d[0] + v[1]*d[1] + v[2]*d[2];
+        if (dp > bestDot) { bestDot = dp; best = label; }
+      }
+      return best;
+    };
+
+    const iop = (header as any)?.imageOrientationPatient as number[] | undefined;
+    const rowDir: [number,number,number] = iop?.length === 6 ? [iop[0],iop[1],iop[2]] : [0,0,0];
+    const colDir: [number,number,number] = iop?.length === 6 ? [iop[3],iop[4],iop[5]] : [0,0,0];
+    // Slice stacking direction = cross(row, col)
+    const sX = rowDir[1]*colDir[2] - rowDir[2]*colDir[1];
+    const sY = rowDir[2]*colDir[0] - rowDir[0]*colDir[2];
+    const sZ = rowDir[0]*colDir[1] - rowDir[1]*colDir[0];
+    const sliceDir: [number,number,number] = [sX, sY, sZ];
+
+    // What each screen axis represents per plane:
+    // rowDir (iop[0-2]) = direction along a row  → screen left→right (xDir)
+    // colDir (iop[3-5]) = direction along a column → screen top→bottom (yDir)
+    let xDir: [number,number,number]; // screen left→right
+    let yDir: [number,number,number]; // screen top→bottom
+    let throughDir: [number,number,number]; // slider (slice-stacking) direction
+
+    if (measurementPlane === 'axial') {
+      xDir = rowDir; yDir = colDir; throughDir = sliceDir;
+    } else if (measurementPlane === 'sagittal') {
+      xDir = rowDir; yDir = colDir; throughDir = sliceDir;
+    } else { // coronal
+      xDir = rowDir; yDir = colDir; throughDir = sliceDir;
+    }
+
+    const hasIOP = iop?.length === 6;
+    return {
+      top: hasIOP ? closestDir([-yDir[0], -yDir[1], -yDir[2]]) : (measurementPlane === 'axial' ? 'A' : 'S'),
+      bottom: hasIOP ? closestDir(yDir) : (measurementPlane === 'axial' ? 'P' : 'I'),
+      left: hasIOP ? closestDir([-xDir[0], -xDir[1], -xDir[2]]) : (measurementPlane === 'axial' ? 'R' : measurementPlane === 'sagittal' ? 'A' : 'R'),
+      right: hasIOP ? closestDir(xDir) : (measurementPlane === 'axial' ? 'L' : measurementPlane === 'sagittal' ? 'P' : 'L'),
+      sliderTop: hasIOP ? closestDir(throughDir) : (measurementPlane === 'axial' ? 'I' : measurementPlane === 'sagittal' ? 'R' : 'P'),
+      sliderBottom: hasIOP ? closestDir([-throughDir[0], -throughDir[1], -throughDir[2]]) : (measurementPlane === 'axial' ? 'S' : measurementPlane === 'sagittal' ? 'L' : 'A'),
+    };
+  }, [header, measurementPlane]);
+
   const maxSlice = plane === 'axial' ? dims[3] : plane === 'sagittal' ? dims[1] : dims[2];
 
   const { width: imgW, height: imgH } = getSliceData();
@@ -2686,35 +2733,16 @@ export function Viewport({
                 onContextMenu={(ev) => ev.preventDefault()}
               />
               {/* Orientation labels — after canvases so they render on top */}
-              {measurementPlane === 'axial' && (
-                <>
-                  <span className="absolute top-1 left-1/2 -translate-x-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">A</span>
-                  <span className="absolute bottom-1 left-1/2 -translate-x-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">P</span>
-                  <span className="absolute left-1 top-1/2 -translate-y-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">R</span>
-                  <span className="absolute right-1 top-1/2 -translate-y-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">L</span>
-                </>
-              )}
-              {measurementPlane === 'sagittal' && (
-                <>
-                  <span className="absolute top-1 left-1/2 -translate-x-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">S</span>
-                  <span className="absolute bottom-1 left-1/2 -translate-x-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">I</span>
-                  <span className="absolute left-1 top-1/2 -translate-y-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">A</span>
-                  <span className="absolute right-1 top-1/2 -translate-y-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">P</span>
-                </>
-              )}
-              {measurementPlane === 'coronal' && (
-                <>
-                  <span className="absolute top-1 left-1/2 -translate-x-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">S</span>
-                  <span className="absolute bottom-1 left-1/2 -translate-x-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">I</span>
-                  <span className="absolute left-1 top-1/2 -translate-y-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">R</span>
-                  <span className="absolute right-1 top-1/2 -translate-y-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">L</span>
-                </>
-              )}
+              <span className="absolute top-1 left-1/2 -translate-x-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">{orientationLabels.top}</span>
+              <span className="absolute bottom-1 left-1/2 -translate-x-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">{orientationLabels.bottom}</span>
+              <span className="absolute left-1 top-1/2 -translate-y-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">{orientationLabels.left}</span>
+              <span className="absolute right-1 top-1/2 -translate-y-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">{orientationLabels.right}</span>
             </div>
 
             {/* Vertical slice slider in the non-image area to the right */}
             <div ref={sliderRef} className="ml-4 flex flex-col items-center" style={{ height: `${displayH}px`, minHeight: '56px' }}>
-              <div className="text-xs text-gray-200 mb-2">{currentSlice + 1}</div>
+              <div className="text-[11px] text-gray-400 mb-1 select-none">{orientationLabels.sliderTop}</div>
+              <div className="text-xs text-gray-200 mb-1">{currentSlice + 1}</div>
               <div className="h-full flex items-center">
                 <Slider
                   orientation="vertical"
@@ -2726,7 +2754,8 @@ export function Viewport({
                   className="h-full"
                 />
               </div>
-              <div className="text-xs text-gray-200 mt-2">{maxSlice}</div>
+              <div className="text-xs text-gray-200 mt-1">{maxSlice}</div>
+              <div className="text-[11px] text-gray-400 mt-1 select-none">{orientationLabels.sliderBottom}</div>
             </div>
           </div>
         </div>

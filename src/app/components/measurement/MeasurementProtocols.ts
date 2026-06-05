@@ -70,6 +70,9 @@ export interface StepResult {
    *  Stored atomically with points so protocol `compute` always has the correct
    *  conversion regardless of display-size change timing. */
   imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
+  /** Viewport display height (px) when this result was captured.  Used with
+   *  imageScale.offsetY to compute the size-invariant CSS fraction. */
+  creationDisplayH?: number;
 }
 
 const toPhysical = (

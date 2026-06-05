@@ -352,36 +352,39 @@ export async function loadDicomSeries(
   const dz = consistent[0].sliceThickness;
 
   // DICOM spatial registration: preserve orientation + position for 3D mapping.
-  // (iop is already declared above for slice sorting.)
   const ipp0 = consistent[0].imagePositionPatient;
   let sliceDir: [number, number, number] | undefined;
   let sliceSpacing: number | undefined;
 
-  // Compute TRUE slice direction + spacing from IPP deltas (cross product
-  // of IOP row/col vectors is the plane normal, but the actual stacking
-  // direction can be oblique — e.g. coronal slices progress in Y while
-  // the plane normal points in X).
+  // Primary: use SliceThickness from DICOM header (reliable, typically 0.5-5mm).
+  // Secondary: try IPP deltas but validate they're within 2× of SliceThickness
+  // (sorted slices may not be physically adjacent, producing absurd spacings).
+  const nominalDS = dz; // SliceThickness from DICOM
+  let ippDeltaOk = false;
   if (consistent.length >= 2 && consistent[0].imagePositionPatient && consistent[1].imagePositionPatient) {
     const a = consistent[0].imagePositionPatient;
     const b = consistent[1].imagePositionPatient;
-    const dx = a[0] - b[0];
-    const dy = a[1] - b[1];
-    const dz = a[2] - b[2];
-    const d = Math.sqrt(dx*dx + dy*dy + dz*dz);
-    if (d > 0) {
+    const ddx = a[0] - b[0], ddy = a[1] - b[1], ddz = a[2] - b[2];
+    const d = Math.sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
+    // Only trust IPP delta if it's within 2× of nominal slice thickness.
+    if (d > 0 && nominalDS > 0 && d <= nominalDS * 2.5) {
       sliceSpacing = d;
-      sliceDir = [dx/d, dy/d, dz/d];
+      sliceDir = [ddx/d, ddy/d, ddz/d];
+      ippDeltaOk = true;
     }
-  } else if (iop && iop.length === 6) {
-    // Fallback: cross product of row/col directions.
-    const rowDir = [iop[0], iop[1], iop[2]] as [number, number, number];
-    const colDir = [iop[3], iop[4], iop[5]] as [number, number, number];
-    const sx = rowDir[1] * colDir[2] - rowDir[2] * colDir[1];
-    const sy = rowDir[2] * colDir[0] - rowDir[0] * colDir[2];
-    const sz = rowDir[0] * colDir[1] - rowDir[1] * colDir[0];
-    const norm = Math.sqrt(sx * sx + sy * sy + sz * sz) || 1;
-    sliceDir = [sx / norm, sy / norm, sz / norm];
-    sliceSpacing = dz;
+  }
+  if (!ippDeltaOk) {
+    // Fallback: use nominal SliceThickness for spacing, cross product for direction.
+    sliceSpacing = nominalDS > 0 ? nominalDS : 1;
+    if (iop && iop.length === 6) {
+      const rowDir = [iop[0], iop[1], iop[2]] as [number, number, number];
+      const colDir = [iop[3], iop[4], iop[5]] as [number, number, number];
+      const sx = rowDir[1]*colDir[2] - rowDir[2]*colDir[1];
+      const sy = rowDir[2]*colDir[0] - rowDir[0]*colDir[2];
+      const sz = rowDir[0]*colDir[1] - rowDir[1]*colDir[0];
+      const n = Math.sqrt(sx*sx + sy*sy + sz*sz) || 1;
+      sliceDir = [sx/n, sy/n, sz/n];
+    }
   }
 
   return {
