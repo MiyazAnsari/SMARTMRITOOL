@@ -6,7 +6,7 @@ import { Button } from './ui/button';
 import { RadioGroup, RadioGroupItem } from './ui/radio-group';
 import { Slider } from './ui/slider';
 import { Label } from './ui/label';
-import { MousePointer, Circle as CircleIcon, Pencil, Move, Ruler, Triangle, Dot, CornerDownLeft } from 'lucide-react';
+import { MousePointer, Circle as CircleIcon, Ruler, Triangle, Dot, CornerDownLeft } from 'lucide-react';
 
 /** Lightweight tooltip — no external dependency required. */
 function ToolTip({ label, children }: { label: string; children: React.ReactNode }) {
@@ -21,6 +21,7 @@ function ToolTip({ label, children }: { label: string; children: React.ReactNode
 }
 import type { DicomStudyView } from './dicom/patientStudy';
 import type { DicomVolume, Plane } from './dicom/DicomLoader';
+import { getDicomAffine, mapPoint3D } from './dicom/dicomAffine';
 import {
   initialWorkflowState,
   recordStepResult,
@@ -320,53 +321,136 @@ export function MedicalImageViewer({
     const fitScale = Math.min(dSize.width / physicalW, dSize.height / physicalH);
     const drawW = Math.max(1, Math.round(physicalW * fitScale));
     const drawH = Math.max(1, Math.round(physicalH * fitScale));
-    return { x: imgW / drawW, y: imgH / drawH };
+    const offsetX = (dSize.width - drawW) / 2;
+    const offsetY = (dSize.height - drawH) / 2;
+    return { x: imgW / drawW, y: imgH / drawH, offsetX, offsetY };
   }, [protocol, studyData, viewportDisplaySizes]);
+
+  // Compute imageScale for any plane (not just the protocol's required plane).
+  // Used by referenceLineFraction to map sagittal CSS→image pixels.
+  const computePlaneImageScale = useCallback(
+    (plane: Plane) => {
+      const vol = studyData?.volumes[plane];
+      if (!vol || !vol.header) return undefined;
+      const dims = vol.header.dims;
+      const pixDims: number[] = vol.header.pixDims || vol.header.pixdim || [];
+      const imgW: number = plane === 'sagittal' ? dims[2] : dims[1];
+      const imgH: number = plane === 'axial' ? dims[2] : dims[3];
+      const p1: number = Number.isFinite(pixDims[1]) && pixDims[1] > 0 ? pixDims[1] : 1;
+      const p2: number = Number.isFinite(pixDims[2]) && pixDims[2] > 0 ? pixDims[2] : 1;
+      const dInPlane: number = Math.min(p1, p2);
+      let spcX: number;
+      let spcY: number;
+      if (plane === 'axial') { spcX = p1; spcY = p2; }
+      else if (plane === 'coronal') { spcX = p1; spcY = dInPlane; }
+      else { spcX = p2; spcY = dInPlane; }
+      const dSize = viewportDisplaySizes[plane];
+      if (!dSize || dSize.width === 0) return undefined;
+      const physicalW = Math.max(1, imgW * spcX);
+      const physicalH = Math.max(1, imgH * spcY);
+      const fitScale = Math.min(dSize.width / physicalW, dSize.height / physicalH);
+      const drawW = Math.max(1, Math.round(physicalW * fitScale));
+      const drawH = Math.max(1, Math.round(physicalH * fitScale));
+      const offsetX = (dSize.width - drawW) / 2;
+      const offsetY = (dSize.height - drawH) / 2;
+      return { x: imgW / drawW, y: imgH / drawH, offsetX, offsetY, imgH };
+    },
+    [studyData, viewportDisplaySizes],
+  );
 
   // ── Cross-plane reference line computation ─────────────────────────
   // When any completed protocol step defines a `referenceLineMm` offset and
   // its result exists, compute reference line data for the viewport that
   // hosts the step's plane.  The line persists across steps so the user can
   // click it to navigate even after advancing to later steps.
-  const referenceLineByPlane = useMemo(() => {
-    if (!protocol) return undefined;
-    const result: Record<string, {
-      fromPoint: { x: number; y: number };
-      offsetMm: number;
-      label: string;
-      imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
-    } | null> = {};
-
+  // ── Synced reference lines ────────────────────────────────────────
+  // Uses DICOM 3D affine transforms (when available) to map the sagittal
+  // point to the correct anatomical position on the coronal.  Falls back
+  // to CSS-fraction matching when affine data is missing.
+  const referenceLineFraction = useMemo(() => {
+    if (!protocol) return null;
     for (const step of protocol.steps) {
       if (!step.referenceLineMm) continue;
-      const stepResult = workflow.stepResults[step.id];
-      if (!stepResult || stepResult.points.length < 1) continue;
+      const sr = workflow.stepResults[step.id];
+      if (!sr || sr.points.length < 1) continue;
 
-      const refPlane = step.plane ?? protocol.requiredPlane;
-      const point = stepResult.points[stepResult.points.length - 1];
-      const is = stepResult.imageScale;
+      const is = sr.imageScale ?? computePlaneImageScale('sagittal');
+      if (!is) continue;
+      const sagOffsetY = is.offsetY ?? 0;
+      const sagCssY = sr.points[0].y;
 
-      result[refPlane] = {
-        fromPoint: point,
+      // Per-plane authoritative data from studyData.volumes.
+      const planeImgH: Record<string, number> = {};
+      const planeZSpacing: Record<string, number> = {};
+
+      for (const p of ['sagittal', 'coronal', 'axial'] as const) {
+        const pVol = studyData?.volumes[p];
+        if (!pVol?.header) continue;
+        const h = pVol.header as any;
+        const pd: number[] = h.pixDims || h.pixdim || [];
+        const zSp = Number.isFinite(pd[3]) && pd[3] > 0 ? pd[3] : 1;
+        planeZSpacing[p] = zSp;
+        const nSlices: number = (h.dims?.[3] ?? h.dim?.[3] ?? pVol.sliceCount ?? 0);
+        planeImgH[p] = nSlices;
+      }
+
+      // CSS fraction for sagittal (viewport-dependent but tracks drag).
+      const sagDisp = viewportDisplaySizes['sagittal'];
+      const sagDisplayH = sagDisp?.height ?? 0;
+      const sagDrawH = Math.max(1, sagDisplayH - 2 * sagOffsetY);
+      const sagFraction = sagDrawH > 0
+        ? Math.max(0, Math.min(1, (sagCssY - sagOffsetY) / sagDrawH))
+        : 0;
+
+      // ── 3D affine mapping sagittal → coronal (WIP) ────────────────
+      // Disabled for now — produces negative coronal slice indices.
+      // The CSS fraction fallback below works correctly.
+      let coronalImageY: number | undefined;
+      /* TODO: debug affine matrix inversion for oblique slice geometries
+      const sagAffine = getDicomAffine(studyData?.volumes?.sagittal?.header ?? {});
+      const corAffine = getDicomAffine(studyData?.volumes?.coronal?.header ?? {});
+      if (sagAffine && corAffine) {
+        const sagAuthImgH = planeImgH['sagittal'] || 61;
+        const sagImgY = sagFraction * sagAuthImgH;
+        const sagImgX = (sr.points[0].x - (is.offsetX ?? 0)) * (is.x || 1);
+        const sagColIdx = sr.slice ?? 0;
+        const result = mapPoint3D(sagColIdx, sagImgX, sagImgY, sagAffine, corAffine);
+        if (result) coronalImageY = result.slice;
+      }
+      */
+
+      return {
+        sagFraction,
+        sagCssY,
+        sagOffsetY,
         offsetMm: step.referenceLineMm,
-        label: `${(step.referenceLineMm / 10).toFixed(1)} cm above joint line`,
-        imageScale: is,
+        label: 'Joint line',
+        planeZSpacing,
+        planeZSliceCount: planeImgH,
+        coronalImageY,        // 3D-mapped Y on coronal (authoritative pixels)
+        coronalImgH: planeImgH['coronal'],  // coronal authoritative slice count
       };
     }
-    return Object.keys(result).length > 0 ? result : undefined;
-  }, [protocol, workflow.stepResults]);
+    return null;
+  }, [protocol, workflow.stepResults, viewportDisplaySizes, studyData, computePlaneImageScale]);
+
+  // Per-step reference lines are now handled by referenceLineFraction (synced
+  // across sagittal + coronal via Z-position fraction).
+  const referenceLineByPlane = useMemo(() => undefined, []);
 
   // ── Reference line click → navigate axial viewer ──────────────────
-  // The Viewport passes the Z-position in sagittal image-pixels and the
-  // Z extent.  We map the fraction to the axial volume's actual slice count.
+  // The Viewport passes the Z-position fraction (0–1) of the clicked line.
+  // 0 = superior, 1 = inferior.  Axial slice 0 = inferior → invert.
   const navigateToAxialFraction = useCallback(
-    (refImgY: number, imgH: number) => {
-      if (refImgY < 0 || imgH <= 0) return;
+    (refFraction: number) => {
+      if (refFraction < 0 || refFraction > 1) return;
       const axialVol = studyData?.volumes?.axial;
       const axialSliceCount = axialVol?.sliceCount ?? (axialVol?.header?.dims?.[3] ?? 0);
       if (axialSliceCount <= 0) return;
-      const fraction = Math.max(0, Math.min(1, refImgY / imgH));
-      const axialSlice = Math.round(fraction * (axialSliceCount - 1));
+      // refFraction: 0 = superior, 1 = inferior.
+      // Axial slice 0 = inferior, max = superior → invert.
+      const axialFraction = 1 - refFraction;
+      const axialSlice = Math.round(axialFraction * (axialSliceCount - 1));
       setCurrentSlice((prev) => ({ ...prev, axial: axialSlice }));
       if (studyData) {
         setStudyViewport((s) => ({
@@ -379,8 +463,8 @@ export function MedicalImageViewer({
   );
 
   const handleReferenceLineClick = useCallback(
-    (refImgY: number, imgH: number) => {
-      navigateToAxialFraction(refImgY, imgH);
+    (refFraction: number) => {
+      navigateToAxialFraction(refFraction);
     },
     [navigateToAxialFraction],
   );
@@ -388,30 +472,26 @@ export function MedicalImageViewer({
   // ── Auto-navigate on first reference line appearance ──────────────
   // When the user places the joint-line point and the reference line data
   // first becomes available, automatically jump the axial viewer to the
-  // computed 3‑cm‑above slice so the user can immediately start drawing
-  // the sulcus angle lines without an extra click.
+  // computed offset slice so the user can immediately start drawing
+  // the measurement lines without an extra click.
   const prevHadReferenceLine = useRef(false);
   useEffect(() => {
-    const hasNow = referenceLineByPlane != null;
-    if (hasNow && !prevHadReferenceLine.current) {
-      // First time the reference line appears — auto-navigate.
-      const sagData = referenceLineByPlane!['sagittal'];
-      if (sagData && protocol) {
-        // Recompute the Z fraction using the sagittal volume's geometry.
-        const sagVol = studyData?.volumes?.sagittal;
-        const pixDims: number[] = sagVol?.header?.pixDims || sagVol?.header?.pixdim || [];
-        const rowSpacing = Number.isFinite(pixDims[2]) && pixDims[2] > 0 ? pixDims[2] : 1;
-        const imgH = sagVol?.header?.dims?.[2] ?? 0; // sagittal image height = Z extent
-        const is = sagData.imageScale;
-        if (imgH > 0 && is) {
-          const imgY = (sagData.fromPoint.y - (is.offsetY ?? 0)) * (is.y || 1);
-          const refImgY = imgY - sagData.offsetMm / rowSpacing;
-          navigateToAxialFraction(refImgY, imgH);
-        }
-      }
+    const hasNow = referenceLineFraction != null;
+    if (hasNow && !prevHadReferenceLine.current && referenceLineFraction) {
+      const { sagFraction, offsetMm, planeZSpacing, planeZSliceCount } = referenceLineFraction;
+
+      // Offset as a fraction of the sagittal image height.
+      const sagZS = planeZSpacing?.['sagittal'] ?? 1;
+      const sagSlices = planeZSliceCount?.['sagittal'] ?? 1;
+      const offsetFraction = sagSlices > 0 && sagZS > 0
+        ? (offsetMm / sagZS) / sagSlices
+        : 0;
+
+      const refFraction = Math.max(0, Math.min(1, sagFraction - offsetFraction));
+      navigateToAxialFraction(refFraction);
     }
     prevHadReferenceLine.current = hasNow;
-  }, [referenceLineByPlane, protocol, studyData, navigateToAxialFraction]);
+  }, [referenceLineFraction, navigateToAxialFraction]);
 
   useEffect(() => {
     if (workflow.protocolId) {
@@ -922,8 +1002,13 @@ export function MedicalImageViewer({
                 : stamped.type === 'angle'
                   ? 'Angle'
                   : stamped.type.charAt(0).toUpperCase() + stamped.type.slice(1);
+          // Count existing measurements of the same type.  When a protocol
+          // group is active only count within that group; otherwise count
+          // globally so free-drawn measurements get sequential numbers.
           const sameTypeCount = measurements.filter(
-            (m) => m.type === stamped.type && m.groupId === currentGroupIdRef.current,
+            (m) =>
+              m.type === stamped.type &&
+              (currentGroupIdRef.current ? m.groupId === currentGroupIdRef.current : true),
           ).length;
           label = `${baseLabel} ${sameTypeCount + 1}`;
         }
@@ -1408,8 +1493,10 @@ export function MedicalImageViewer({
             pixelSpacing={pixelSpacing}
             onDisplaySizeChange={handleViewportDisplaySizeChange}
             referenceLineByPlane={referenceLineByPlane}
+            referenceLineFraction={referenceLineFraction}
             onReferenceLineClick={handleReferenceLineClick}
             allowedDrawPlane={activeStep?.plane ?? protocol?.requiredPlane}
+            alwaysAllowPointDrag={!!(protocol && protocol.steps.some(s => s.referenceLineMm && workflow.stepResults[s.id]))}
           />
         ) : (
           <div className="h-full flex items-center justify-center">
@@ -1514,30 +1601,6 @@ export function MedicalImageViewer({
               aria-label="Ellipse tool"
             >
               <CircleIcon className="h-4 w-4" />
-            </Button>
-          </ToolTip>
-
-          <ToolTip label="Freehand">
-            <Button
-              size="sm"
-              variant={effectiveTool === 'freehand' ? 'default' : 'ghost'}
-              className={effectiveTool === 'freehand' ? 'bg-blue-600 text-white' : 'text-gray-300'}
-              onClick={() => selectTool('freehand')}
-              aria-label="Freehand tool"
-            >
-              <Pencil className="h-4 w-4" />
-            </Button>
-          </ToolTip>
-
-          <ToolTip label="Pan">
-            <Button
-              size="sm"
-              variant={effectiveTool === 'pan' ? 'default' : 'ghost'}
-              className={effectiveTool === 'pan' ? 'bg-blue-600 text-white' : 'text-gray-300'}
-              onClick={() => selectTool(effectiveTool === 'pan' ? 'none' : 'pan')}
-              aria-label="Pan tool"
-            >
-              <Move className="h-4 w-4" />
             </Button>
           </ToolTip>
 

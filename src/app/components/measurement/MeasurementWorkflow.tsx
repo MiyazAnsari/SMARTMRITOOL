@@ -392,6 +392,15 @@ export function MeasurementWorkflow({
             >
               <RotateCcw className="w-3 h-3 mr-1" /> Reset measurement
             </Button>
+
+            <Button
+              size="sm"
+              variant="ghost"
+              className="mt-1 w-full border border-gray-700 text-gray-400 hover:text-gray-200 hover:bg-gray-800"
+              onClick={() => onStateChange({ ...state, protocolId: null, activeStepIndex: 0 })}
+            >
+              Deselect protocol (free draw)
+            </Button>
           </>
         )}
 
@@ -401,7 +410,7 @@ export function MeasurementWorkflow({
             <h4 className="text-[10px] font-semibold uppercase tracking-wide text-gray-500 mb-2">
               All measurements
             </h4>
-            <div className="space-y-1">
+            <div className="space-y-1 max-h-60 overflow-y-auto pr-1">
               {rawMeasurementValues.map((row) => (
                 <div
                   key={row.id}

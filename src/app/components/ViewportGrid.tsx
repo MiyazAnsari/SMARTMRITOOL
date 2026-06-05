@@ -51,11 +51,25 @@ interface ViewportGridProps {
   /** Called when the user clicks a reference line.  Receives the Z-position
    *  in image-pixels and the Z extent so the parent can map to the axial
    *  volume's actual slice count. */
-  onReferenceLineClick?: (refImgY: number, imgH: number) => void;
+  onReferenceLineClick?: (refFraction: number) => void;
   /** When set, only viewports whose measurementPlane matches this value may
    *  create new measurements.  Existing measurements can still be selected
    *  and dragged on any viewport. */
   allowedDrawPlane?: Plane;
+  /** Z-position in mm of the joint line, for synced reference lines on
+   *  sagittal + coronal viewers. */
+  referenceLineFraction?: {
+    sagFraction: number;
+    sagCssY: number;
+    sagOffsetY: number;
+    offsetMm: number;
+    label: string;
+    planeZSpacing?: Record<string, number>;
+    planeZSliceCount?: Record<string, number>;
+    coronalImageY?: number;
+    coronalImgH?: number;
+  } | null;
+  alwaysAllowPointDrag?: boolean;
 }
 
 type Rect = { top: number; left: number; width: number; height: number; z?: number };
@@ -85,6 +99,8 @@ export function ViewportGrid({
   referenceLineByPlane,
   onReferenceLineClick,
   allowedDrawPlane,
+  referenceLineFraction,
+  alwaysAllowPointDrag,
 }: ViewportGridProps) {
   // pixelSpacing is optional and provided by parent when available
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -214,8 +230,10 @@ export function ViewportGrid({
               onViewportReset={() => onResetViewport?.(viewPlane)}
               onDisplaySizeChange={(size) => onDisplaySizeChange?.(viewPlane, size)}
               referenceLine={referenceLineByPlane?.[viewPlane] ?? null}
+              referenceLineFraction={referenceLineFraction}
               onReferenceLineClick={onReferenceLineClick}
               allowNewMeasurements={!allowedDrawPlane || viewPlane === allowedDrawPlane}
+              alwaysAllowPointDrag={alwaysAllowPointDrag}
             />
           </div>
         </div>
@@ -300,8 +318,10 @@ export function ViewportGrid({
                 onClose={() => onHideWindow?.(w.id)}
                 onDisplaySizeChange={(size) => onDisplaySizeChange?.(w.id, size)}
                 referenceLine={referenceLineByPlane?.[w.id] ?? null}
+                referenceLineFraction={referenceLineFraction}
                 onReferenceLineClick={onReferenceLineClick}
                 allowNewMeasurements={!allowedDrawPlane || w.id === allowedDrawPlane}
+                alwaysAllowPointDrag={alwaysAllowPointDrag}
               />
               <div
                 onMouseDown={(e) => startResize(w.id, e)}

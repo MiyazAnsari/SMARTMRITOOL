@@ -61,15 +61,37 @@ interface ViewportProps {
     label: string;
     imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
   } | null;
-  /** Called when the user clicks the reference line.  For sagittal viewports
-   *  the callback receives the Z-position fraction (0–1) and the Z extent in
-   *  image pixels so the parent can map to the axial volume's actual slice
-   *  count.  For non-sagittal planes both values are -1. */
-  onReferenceLineClick?: (refImgY: number, imgH: number) => void;
+  /** Z-position fraction of the joint line (from sagittal), used to draw
+   *  synced reference lines on sagittal + coronal viewers.  The fraction
+   *  (0=superior, 1=inferior) is mapped to each viewport's own image height
+   *  so lines align regardless of different Z coverage between series.
+   *  Two horizontal dashed lines are drawn: one at the joint line, another
+   *  at `offsetMm` superior. */
+  referenceLineFraction?: {
+    sagFraction: number;
+    sagCssY: number;
+    sagOffsetY: number;
+    offsetMm: number;
+    label: string;
+    planeZSpacing?: Record<string, number>;
+    planeZSliceCount?: Record<string, number>;
+    /** 3D-affine-mapped Y position on coronal (authoritative image pixels). */
+    coronalImageY?: number;
+    /** Coronal authoritative slice count. */
+    coronalImgH?: number;
+  } | null;
+  /** Called when the user clicks a reference line on a sagittal viewport.
+   *  Passes the Z-position fraction (0=superior, 1=inferior) so the parent
+   *  can map to the axial volume's slice. */
+  onReferenceLineClick?: (refFraction: number) => void;
   /** When false, creating new measurements (lines, points, angles) is
    *  blocked on this viewport.  Existing measurements can still be selected
    *  and dragged.  Defaults to true. */
   allowNewMeasurements?: boolean;
+  /** When true, point dragging is allowed regardless of the active tool
+   *  (not just in Select mode).  Used so reference-line landmarks remain
+   *  adjustable even after the workflow advances to the next step. */
+  alwaysAllowPointDrag?: boolean;
 }
 
 export function Viewport({
@@ -96,8 +118,10 @@ export function Viewport({
   pixelSpacing,
   onDisplaySizeChange,
   referenceLine,
+  referenceLineFraction,
   onReferenceLineClick,
   allowNewMeasurements = true,
+  alwaysAllowPointDrag = false,
 }: ViewportProps) {
   const [wl, setWl] = useState<WindowLevel>(() =>
     sanitizeWindowLevel(defaultWindowLevel.window, defaultWindowLevel.level, defaultWindowLevel),
@@ -145,6 +169,13 @@ export function Viewport({
   const sliderRef = useRef<HTMLDivElement | null>(null);
   const [isDrawing, setIsDrawing] = useState(false);
   const [drawingPoints, setDrawingPoints] = useState<{ x: number; y: number }[]>([]);
+  // Ref mirror for freehand — state updates are async, but handleMouseUp needs
+  // the latest points synchronously to finalize the measurement.
+  const drawingPointsRef = useRef<{ x: number; y: number }[]>([]);
+  useLayoutEffect(() => { drawingPointsRef.current = drawingPoints; }, [drawingPoints]);
+  // Tracks committed clicks for angle tool: 0 = idle, 1 = vertex placed,
+  // 2 = arm1 placed (or borrowed) → next click finalizes.
+  const angleClickCountRef = useRef(0);
   const [overlayTick, setOverlayTick] = useState(0);
   const [draggingPoint, setDraggingPoint] = useState<{ measurementId: string; pointIndex: number } | null>(null);
   const [selectedLineId, setSelectedLineId] = useState<string | null>(null);
@@ -259,6 +290,13 @@ export function Viewport({
   const [panSrc, setPanSrc] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const panStartRef = useRef<{ clientX: number; clientY: number; startX: number; startY: number } | null>(null);
   const [isPanning, setIsPanning] = useState(false);
+
+  // Reset angle click counter when tool changes away from angle.
+  useEffect(() => {
+    if (activeTool !== 'angle') {
+      angleClickCountRef.current = 0;
+    }
+  }, [activeTool]);
   const [zoomScale, setZoomScale] = useState(1);
   const [axialTransform, setAxialTransform] = useState<{ rotation: number }>({
     rotation: 0,
@@ -483,40 +521,75 @@ export function Viewport({
   }, [onMeasurementAdd, computeImageScale]);
 
   // ── Reference line computation (cross-plane protocol support) ──────────
-  // When the active protocol step defines a referenceLineMm offset, compute
-  // the CSS-pixel Y position of the reference line.  For sagittal viewports
-  // the Y-axis is the Z-direction (superior-inferior); the spacing is the
-  // row spacing of the sagittal acquisition (pixDims[2]), which is typically
-  // the in-plane resolution (~0.35 mm), NOT the slice thickness.
-  const computedReferenceLine = useMemo(() => {
-    if (!referenceLine) return null;
-    const { fromPoint, offsetMm, imageScale: rlImageScale } = referenceLine;
-    const is = rlImageScale ?? computeImageScale();
+  // Computes one or two horizontal reference lines from either a per-step
+  // CSS point (referenceLine) or a Z-position fraction (referenceLineFraction).
+  // The fraction (0=superior, 1=inferior) is mapped to each viewport's own
+  // image height, so sagittal + coronal lines always align anatomically.
+  const computedReferenceLines = useMemo(() => {
+    const lines: { cssY: number; refFraction: number; label: string; isSagittal: boolean }[] = [];
+    if (measurementPlane === 'axial') return lines;
+    if (!referenceLineFraction) return lines;
 
-    // Row spacing of this volume (Z-direction for sagittal, Y for axial).
-    const pixDims: number[] = header.pixDims || header?.pixdim || [];
-    const rowSpacing = Number.isFinite(pixDims[2]) && pixDims[2] > 0 ? pixDims[2] : 1;
-    const { height: imgH } = getPlaneGeometry();
+    const {
+      sagFraction, sagCssY, offsetMm, label, planeZSpacing, planeZSliceCount,
+      coronalImageY, coronalImgH,
+    } = referenceLineFraction;
 
     const isSagittal = measurementPlane === 'sagittal';
+    const is = computeImageScale();
 
-    // Convert the source point from CSS to image-pixel coordinates.
-    const imgY = (fromPoint.y - (is.offsetY ?? 0)) * (is.y || 1);
+    // ── Viewport CSS geometry ──────────────────────────────────────────
+    const myOffsetY = is.offsetY ?? 0;
+    const myDisplayH = displaySize.height;
+    const myDrawH = Math.max(1, myDisplayH - 2 * myOffsetY);
 
-    // Compute the offset in image pixels (superior = smaller Y in image space).
-    const offsetImgPx = offsetMm / rowSpacing;
-    const refImgY = imgY - offsetImgPx;
+    // ── Offset fraction (viewport-independent) ─────────────────────────
+    const sagZS = planeZSpacing?.['sagittal']
+      ?? (header.pixDims?.[3] || (header as any).pixdim?.[3] || 1);
+    const sagSlices = planeZSliceCount?.['sagittal']
+      ?? getPlaneGeometry().height;
+    const offsetFraction = sagSlices > 0 && sagZS > 0
+      ? (offsetMm / sagZS) / sagSlices
+      : 0;
 
-    // Convert back to CSS coordinates.
-    const refCssY = refImgY / (is.y || 1) + (is.offsetY ?? 0);
+    // ── Joint line CSS Y ──────────────────────────────────────────────
+    let jointCssY: number;
+    if (isSagittal) {
+      jointCssY = sagCssY;
+    } else if (coronalImageY != null && coronalImgH && coronalImgH > 0) {
+      // 3D affine mapping: coronalImageY is the authoritative image-pixel Y.
+      // Convert to CSS fraction, then to this viewport's CSS Y.
+      const corFraction = Math.max(0, Math.min(1, coronalImageY / coronalImgH));
+      jointCssY = corFraction * myDrawH + myOffsetY;
+    } else {
+      // Fallback: same CSS fraction as sagittal.
+      jointCssY = sagFraction * myDrawH + myOffsetY;
+    }
 
-    return {
-      cssY: refCssY,
-      refImgY: isSagittal ? refImgY : -1,
-      imgH: isSagittal ? imgH : -1,
+    // ── Offset line CSS Y ─────────────────────────────────────────────
+    const offsetCss = offsetFraction * myDrawH;
+    const refCssY = jointCssY - offsetCss;
+
+    // Fraction for click-to-navigate (only meaningful on sagittal).
+    const refFraction = myDrawH > 0
+      ? Math.max(0, Math.min(1, (refCssY - myOffsetY) / myDrawH))
+      : 0;
+
+    lines.push({
+      cssY: jointCssY,
+      refFraction: isSagittal ? refFraction : -1,
+      label: `${label} (joint)`,
       isSagittal,
-    };
-  }, [referenceLine, computeImageScale, getPlaneGeometry, measurementPlane, header]);
+    });
+    lines.push({
+      cssY: refCssY,
+      refFraction: isSagittal ? refFraction : -1,
+      label: `${label} (${(offsetMm / 10).toFixed(1)} cm sup)`,
+      isSagittal,
+    });
+
+    return lines;
+  }, [referenceLineFraction, computeImageScale, measurementPlane, plane, displaySize, header]);
 
   const prevDisplaySizeRef = useRef<{ width: number; height: number } | null>(null);
   useEffect(() => {
@@ -1385,7 +1458,7 @@ export function Viewport({
       ctx.fillStyle = '#60a5fa';
       ctx.lineWidth = 2;
 
-      if (activeTool === 'distance' || activeTool === 'line' || activeTool === 'perpendicular' || activeTool === 'angle') {
+      if (activeTool === 'distance' || activeTool === 'line' || activeTool === 'perpendicular') {
         ctx.beginPath();
         ctx.moveTo(drawingPoints[0].x, drawingPoints[0].y);
         drawingPoints.forEach(p => ctx.lineTo(p.x, p.y));
@@ -1396,15 +1469,61 @@ export function Viewport({
           ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
           ctx.fill();
         });
-      } else if (activeTool === 'ellipse' && drawingPoints.length >= 2) {
-        const cx = (drawingPoints[0].x + drawingPoints[1].x) / 2;
-        const cy = (drawingPoints[0].y + drawingPoints[1].y) / 2;
-        const rx = Math.abs(drawingPoints[1].x - drawingPoints[0].x) / 2;
-        const ry = Math.abs(drawingPoints[1].y - drawingPoints[0].y) / 2;
-        
+      } else if (activeTool === 'angle') {
         ctx.beginPath();
-        ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+        ctx.moveTo(drawingPoints[0].x, drawingPoints[0].y);
+        for (let i = 1; i < drawingPoints.length; i++) {
+          ctx.lineTo(drawingPoints[i].x, drawingPoints[i].y);
+        }
+        // Preview line from last stored point to cursor.
+        if (drawingPoints.length < 3 && lastPointerClientRef.current) {
+          const overlayRect = overlayCanvasRef.current?.getBoundingClientRect();
+          if (overlayRect) {
+            ctx.lineTo(
+              lastPointerClientRef.current.x - overlayRect.left,
+              lastPointerClientRef.current.y - overlayRect.top,
+            );
+          }
+        }
         ctx.stroke();
+        drawingPoints.forEach(p => {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      } else if (activeTool === 'ellipse') {
+        // 1 point stored → preview line from point to cursor.
+        // 2 points stored → preview ellipse.
+        if (drawingPoints.length === 1 && lastPointerClientRef.current) {
+          const overlayRect = overlayCanvasRef.current?.getBoundingClientRect();
+          if (overlayRect) {
+            const cx = lastPointerClientRef.current.x - overlayRect.left;
+            const cy = lastPointerClientRef.current.y - overlayRect.top;
+            const ex = (drawingPoints[0].x + cx) / 2;
+            const ey = (drawingPoints[0].y + cy) / 2;
+            const erx = Math.abs(cx - drawingPoints[0].x) / 2;
+            const ery = Math.abs(cy - drawingPoints[0].y) / 2;
+            ctx.beginPath();
+            ctx.ellipse(ex, ey, Math.max(1, erx), Math.max(1, ery), 0, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.arc(drawingPoints[0].x, drawingPoints[0].y, 4, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        } else if (drawingPoints.length >= 2) {
+          const cx = (drawingPoints[0].x + drawingPoints[1].x) / 2;
+          const cy = (drawingPoints[0].y + drawingPoints[1].y) / 2;
+          const rx = Math.abs(drawingPoints[1].x - drawingPoints[0].x) / 2;
+          const ry = Math.abs(drawingPoints[1].y - drawingPoints[0].y) / 2;
+          ctx.beginPath();
+          ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+          ctx.stroke();
+          drawingPoints.forEach(p => {
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+            ctx.fill();
+          });
+        }
       } else if (activeTool === 'closedCurve') {
         ctx.beginPath();
         ctx.moveTo(drawingPoints[0].x, drawingPoints[0].y);
@@ -1424,60 +1543,35 @@ export function Viewport({
       }
     }
 
-    // ── Reference line (cross-plane protocol guide) ──────────────────────
-    if (computedReferenceLine) {
-      const rl = computedReferenceLine;
+    // ── Reference lines (cross-plane protocol guide) ───────────────────
+    for (const rl of computedReferenceLines) {
       const y = rl.cssY;
+      if (y < 0 || y > clearH) continue;
 
-      // Only draw if within the visible canvas bounds.
-      if (y >= 0 && y <= clearH) {
-        ctx.save();
-        // Dashed yellow line spanning the full draw width.
-        ctx.setLineDash([8, 5]);
-        ctx.strokeStyle = 'rgba(250, 204, 21, 0.85)';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(clearW, y);
-        ctx.stroke();
-        ctx.setLineDash([]);
+      ctx.save();
+      ctx.setLineDash([8, 5]);
+      ctx.strokeStyle = 'rgba(250, 204, 21, 0.85)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(clearW, y);
+      ctx.stroke();
+      ctx.setLineDash([]);
 
-        // Label on the left side.
-        const labelText = referenceLine?.label ?? 'Reference';
-        const rlLabel = computedReferenceLine.isSagittal
-          ? `${labelText} (click to navigate axial)`
-          : labelText;
-
-        ctx.font = 'bold 10px sans-serif';
-        ctx.textAlign = 'left';
-        ctx.textBaseline = 'bottom';
-        const labelW = ctx.measureText(rlLabel).width + 10;
-
-        // Background pill.
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
-        ctx.beginPath();
-        ctx.roundRect(6, y - 6, labelW, 18, 6);
-        ctx.fill();
-
-        // Label text.
-        ctx.fillStyle = '#facc15';
-        ctx.fillText(rlLabel, 12, y + 6);
-
-        // Click target indicator (small arrow or circle on the right).
-        ctx.fillStyle = 'rgba(250, 204, 21, 0.6)';
-        ctx.beginPath();
-        ctx.arc(clearW - 16, y, 6, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillStyle = '#000';
-        ctx.font = 'bold 10px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText('↕', clearW - 16, y);
-
-        ctx.restore();
-      }
+      const rlLabel = rl.label;
+      ctx.font = 'bold 10px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      const labelW = ctx.measureText(rlLabel).width + 10;
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+      ctx.beginPath();
+      ctx.roundRect(clearW - labelW - 8, y - 22, labelW, 18, 6);
+      ctx.fill();
+      ctx.fillStyle = '#facc15';
+      ctx.fillText(rlLabel, clearW - labelW / 2 - 8, y - 16);
+      ctx.restore();
     }
-  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool, selectedLineId, overlayTick, computedReferenceLine, referenceLine, plane]);
+  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool, selectedLineId, overlayTick, computedReferenceLines, referenceLine, plane]);
 
   // Calculate measurement value (prefer physical units mm when possible)
   const calculateMeasurementValue = (type: MeasurementTool, points: { x: number; y: number }[]): string => {
@@ -1553,26 +1647,9 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    // ── Reference line click (cross-plane navigation) ───────────────────
-    // Check BEFORE any tool-specific logic so the reference line is always
-    // clickable regardless of the active tool (point, distance, select, etc.).
-    if (computedReferenceLine && onReferenceLineClick) {
-      const rl = computedReferenceLine;
-      const distToLine = Math.abs(y - rl.cssY);
-      const nearLabel = x <= 120 && Math.abs(y - rl.cssY) < 18;
-      if (distToLine < 14 || nearLabel) {
-        onReferenceLineClick(rl.refImgY, rl.imgH);
-        // Consume the event so it doesn't also trigger a tool action.
-        e.preventDefault();
-        e.stopPropagation();
-        return;
-      }
-    }
-
-    if (activeTool === 'none') {
-      // Point dragging — only in Select mode to avoid stealing clicks from
-      // creation tools (distance/line/point/angle) that need to snap to
-      // existing endpoints.
+    if (activeTool === 'none' || alwaysAllowPointDrag) {
+      // Point dragging — in Select mode always, or for any tool when
+      // alwaysAllowPointDrag is set (reference-line landmarks).
       for (const m of measurementsRef.current) {
         if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
         if (m.points.length === 0) continue;
@@ -1647,6 +1724,14 @@ export function Viewport({
       panStartRef.current = { clientX: e.clientX, clientY: e.clientY, startX: panSrc.x, startY: panSrc.y };
     } else if (activeTool === 'perpendicular') {
       // handled in handleClick
+    } else if (activeTool === 'freehand') {
+      // Start freehand drawing on mousedown (only if not already drawing).
+      if (!isDrawing) {
+        setIsDrawing(true);
+        setDrawingPoints([{ x, y }]);
+      }
+    } else if (activeTool === 'ellipse' || activeTool === 'closedCurve') {
+      // These are handled in handleClick — first click starts drawing.
     }
   };
 
@@ -1834,7 +1919,7 @@ export function Viewport({
           const dpIndex = draggingPointRef.current!.pointIndex;
           const moved = updated.points[dpIndex];
           lastDraggedPointRef.current = { id: updated.id, pointIndex: dpIndex, x: moved.x, y: moved.y, ts: now };
-          emitMeasurementUpdate(updated.id, updated.points, val);
+          emitMeasurementUpdate(updated.id, updated.points, val, computeImageScale());
           dragMovedRef.current = true;
           lastDragTimestampRef.current = now;
         }
@@ -1877,11 +1962,12 @@ export function Viewport({
           setDrawingPoints([drawingPoints[0], snapped]);
         }
       } else if (activeTool === 'angle') {
-        const pts = [...drawingPoints];
-        if (pts.length > 0) {
-          pts[pts.length - 1] = snapped;
-          setDrawingPoints(pts);
-        }
+        // Force overlay re-render on mouse move so the cursor-preview line
+        // updates.  drawingPoints stays clean (committed clicks only).
+        setOverlayTick(t => t + 1);
+      } else if (activeTool === 'freehand') {
+        // Accumulate points while the mouse moves during freehand drawing.
+        setDrawingPoints(prev => [...prev, snapped]);
       }
     }
   };
@@ -1892,6 +1978,20 @@ export function Viewport({
 
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
+
+    // Freehand: finalize on mouse up using the ref for latest points.
+    if (isDrawing && activeTool === 'freehand' && drawingPointsRef.current.length > 1) {
+      emitMeasurementAdd({
+        id: Date.now().toString(),
+        type: 'freehand',
+        points: drawingPointsRef.current,
+        slice: currentSlice,
+        plane: measurementPlane,
+      });
+      setIsDrawing(false);
+      setDrawingPoints([]);
+      return;
+    }
 
     if (draggingPointRef.current) {
       const suppressed = dragMovedRef.current;
@@ -2010,13 +2110,13 @@ export function Viewport({
     }
 
     // ── Reference line click (cross-plane navigation) ───────────────────
-    if (computedReferenceLine && onReferenceLineClick) {
-      const rl = computedReferenceLine;
-      const distToLine = Math.abs(y - rl.cssY);
-      const nearLabel = x <= 120 && Math.abs(y - rl.cssY) < 18;
-      if (distToLine < 14 || nearLabel) {
-        onReferenceLineClick(rl.refImgY, rl.imgH);
-        return;
+    if (computedReferenceLines.length > 0 && onReferenceLineClick) {
+      for (const rl of computedReferenceLines) {
+        const distToLine = Math.abs(y - rl.cssY);
+        if (distToLine < 14 && rl.isSagittal && rl.refFraction >= 0) {
+          onReferenceLineClick(rl.refFraction);
+          return;
+        }
       }
     }
 
@@ -2159,24 +2259,63 @@ export function Viewport({
         plane: measurementPlane,
       });
     } else if (activeTool === 'angle') {
+      // ── Smart continuity: if the snapped position matches an existing
+      //     line endpoint, borrow that segment as one angle arm. ──
+      const tryBorrow = (sx: number, sy: number): { x: number; y: number }[] | null => {
+        for (const m of measurementsRef.current) {
+          if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
+          const propagate = m.propagateAcrossSlices ?? true;
+          if (!propagate && m.slice !== currentSlice) continue;
+          if (m.points.length < 2) continue;
+          const p0 = m.points[0];
+          const p1 = m.points[1];
+          if (p0.x === sx && p0.y === sy) return [p0, p1];
+          if (p1.x === sx && p1.y === sy) return [p1, p0];
+        }
+        return null;
+      };
+
       if (!isDrawing) {
         setIsDrawing(true);
-        setDrawingPoints([snappedPoint]);
-      } else if (drawingPoints.length === 1) {
-        setDrawingPoints(prev => [...prev, snappedPoint]);
-      } else if (drawingPoints.length === 2) {
-        const points = [...drawingPoints, snappedPoint];
-        const value = calculateMeasurementValue('angle', points);
+        const borrowed = tryBorrow(snappedPoint.x, snappedPoint.y);
+        if (borrowed) {
+          setDrawingPoints(borrowed);
+          angleClickCountRef.current = 2;
+        } else {
+          setDrawingPoints([snappedPoint]);
+          angleClickCountRef.current = 1;
+        }
+      } else if (angleClickCountRef.current === 1) {
+        const borrowed = tryBorrow(snappedPoint.x, snappedPoint.y);
+        if (borrowed) {
+          const pts = [drawingPoints[0], borrowed[0], borrowed[1]];
+          const value = calculateMeasurementValue('angle', pts);
+          emitMeasurementAdd({
+            id: Date.now().toString(), type: 'angle', points: pts,
+            slice: currentSlice, plane: measurementPlane, value,
+          });
+          setIsDrawing(false);
+          setDrawingPoints([]);
+          angleClickCountRef.current = 0;
+        } else {
+          setDrawingPoints(prev => [...prev, snappedPoint]);
+          angleClickCountRef.current = 2;
+        }
+      } else {
+        // Third (or second with borrow) click: finalize.
+        const pts = [...drawingPoints, snappedPoint];
+        const value = calculateMeasurementValue('angle', pts);
         emitMeasurementAdd({
           id: Date.now().toString(),
           type: 'angle',
-          points,
+          points: pts,
           slice: currentSlice,
           plane: measurementPlane,
           value,
         });
         setIsDrawing(false);
         setDrawingPoints([]);
+        angleClickCountRef.current = 0;
       }
     } else if (activeTool === 'closedCurve' && isDrawing) {
       const firstPoint = drawingPoints[0];
@@ -2195,6 +2334,28 @@ export function Viewport({
         setDrawingPoints([]);
       } else {
         setDrawingPoints(prev => [...prev, { x, y }]);
+      }
+    } else if (activeTool === 'closedCurve' && !isDrawing) {
+      // First click starts the closed-curve drawing.
+      setIsDrawing(true);
+      setDrawingPoints([snappedPoint]);
+    } else if (activeTool === 'ellipse') {
+      if (!isDrawing) {
+        setIsDrawing(true);
+        setDrawingPoints([snappedPoint]);
+      } else {
+        const points = [...drawingPoints, snappedPoint];
+        const value = calculateMeasurementValue('ellipse', points);
+        emitMeasurementAdd({
+          id: Date.now().toString(),
+          type: 'ellipse',
+          points,
+          value,
+          slice: currentSlice,
+          plane: measurementPlane,
+        });
+        setIsDrawing(false);
+        setDrawingPoints([]);
       }
     }
   };
@@ -2520,6 +2681,31 @@ export function Viewport({
                 onWheel={handleWheel}
                 onContextMenu={(ev) => ev.preventDefault()}
               />
+              {/* Orientation labels — after canvases so they render on top */}
+              {measurementPlane === 'axial' && (
+                <>
+                  <span className="absolute top-1 left-1/2 -translate-x-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">A</span>
+                  <span className="absolute bottom-1 left-1/2 -translate-x-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">P</span>
+                  <span className="absolute left-1 top-1/2 -translate-y-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">R</span>
+                  <span className="absolute right-1 top-1/2 -translate-y-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">L</span>
+                </>
+              )}
+              {measurementPlane === 'sagittal' && (
+                <>
+                  <span className="absolute top-1 left-1/2 -translate-x-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">S</span>
+                  <span className="absolute bottom-1 left-1/2 -translate-x-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">I</span>
+                  <span className="absolute left-1 top-1/2 -translate-y-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">A</span>
+                  <span className="absolute right-1 top-1/2 -translate-y-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">P</span>
+                </>
+              )}
+              {measurementPlane === 'coronal' && (
+                <>
+                  <span className="absolute top-1 left-1/2 -translate-x-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">S</span>
+                  <span className="absolute bottom-1 left-1/2 -translate-x-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">I</span>
+                  <span className="absolute left-1 top-1/2 -translate-y-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">R</span>
+                  <span className="absolute right-1 top-1/2 -translate-y-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">L</span>
+                </>
+              )}
             </div>
 
             {/* Vertical slice slider in the non-image area to the right */}

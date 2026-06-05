@@ -882,17 +882,16 @@ function App() {
                             <div className="text-gray-400">
                               {r.laterality} knee · {r.sequenceName} · {r.plane} · slice {r.sliceIndex}
                             </div>
-                            {(r.value || r.units) && (
+                            {computeMmValue(r.points, r.imageScale, activePixelSpacing) ? (
+                              <div className="text-blue-300 mt-0.5 font-medium">
+                                {computeMmValue(r.points, r.imageScale, activePixelSpacing)}
+                              </div>
+                            ) : (r.value || r.units) ? (
                               <div className="text-blue-300 mt-0.5">
                                 {r.value}
                                 {r.units ? ` ${r.units}` : ''}
                               </div>
-                            )}
-                            {computeMmValue(r.points, r.imageScale, activePixelSpacing) && (
-                              <div className="text-blue-300 mt-0.5 font-medium">
-                                {computeMmValue(r.points, r.imageScale, activePixelSpacing)}
-                              </div>
-                            )}
+                            ) : null}
                             {computePxDistance(r.points, r.imageScale) && (
                               <div className="text-emerald-300 text-[10px] font-mono mt-0.5">
                                 {computePxDistance(r.points, r.imageScale)}
@@ -1052,10 +1051,12 @@ function App() {
                                             {m.plane} · slice index {m.slice}
                                           </div>
                                           {m.value ? <div className="text-blue-300 mt-1 font-medium">{m.value}</div> : null}
-                                          {computeMmValue(m.points, m.imageScale, activePixelSpacing) && (
+                                          {computeMmValue(m.points, m.imageScale, activePixelSpacing) ? (
                                             <div className="text-blue-300 mt-1 font-medium">
                                               {computeMmValue(m.points, m.imageScale, activePixelSpacing)}
                                             </div>
+                                          ) : (
+                                            m.value ? <div className="text-blue-300 mt-1 font-medium">{m.value}</div> : null
                                           )}
                                           {computePxDistance(m.points, m.imageScale) && (
                                             <div className="text-emerald-300 text-[10px] font-mono mt-0.5">

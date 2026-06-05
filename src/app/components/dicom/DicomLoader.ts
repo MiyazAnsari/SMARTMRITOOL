@@ -14,6 +14,14 @@ export interface DicomVolume {
     datatypeCode: 2; // uint8 after normalization
     scl_slope: 1;
     scl_inter: 0;
+    /** DICOM spatial registration (optional, for 3D cross-plane mapping). */
+    imageOrientationPatient?: [number, number, number, number, number, number];
+    /** IPP of the first slice (top-left voxel, patient mm). */
+    imagePositionPatient?: [number, number, number];
+    /** Normal vector to the slice plane = cross(rowDir, colDir). */
+    sliceDirection?: [number, number, number];
+    /** Through-plane spacing between consecutive slices (mm). */
+    sliceSpacing?: number;
   };
   dataRange: { min: number; max: number };
   defaultWindowLevel: { window: number; level: number };
@@ -343,6 +351,39 @@ export async function loadDicomSeries(
   const dy = consistent[0].pixelSpacing[0];
   const dz = consistent[0].sliceThickness;
 
+  // DICOM spatial registration: preserve orientation + position for 3D mapping.
+  // (iop is already declared above for slice sorting.)
+  const ipp0 = consistent[0].imagePositionPatient;
+  let sliceDir: [number, number, number] | undefined;
+  let sliceSpacing: number | undefined;
+
+  // Compute TRUE slice direction + spacing from IPP deltas (cross product
+  // of IOP row/col vectors is the plane normal, but the actual stacking
+  // direction can be oblique — e.g. coronal slices progress in Y while
+  // the plane normal points in X).
+  if (consistent.length >= 2 && consistent[0].imagePositionPatient && consistent[1].imagePositionPatient) {
+    const a = consistent[0].imagePositionPatient;
+    const b = consistent[1].imagePositionPatient;
+    const dx = a[0] - b[0];
+    const dy = a[1] - b[1];
+    const dz = a[2] - b[2];
+    const d = Math.sqrt(dx*dx + dy*dy + dz*dz);
+    if (d > 0) {
+      sliceSpacing = d;
+      sliceDir = [dx/d, dy/d, dz/d];
+    }
+  } else if (iop && iop.length === 6) {
+    // Fallback: cross product of row/col directions.
+    const rowDir = [iop[0], iop[1], iop[2]] as [number, number, number];
+    const colDir = [iop[3], iop[4], iop[5]] as [number, number, number];
+    const sx = rowDir[1] * colDir[2] - rowDir[2] * colDir[1];
+    const sy = rowDir[2] * colDir[0] - rowDir[0] * colDir[2];
+    const sz = rowDir[0] * colDir[1] - rowDir[1] * colDir[0];
+    const norm = Math.sqrt(sx * sx + sy * sy + sz * sz) || 1;
+    sliceDir = [sx / norm, sy / norm, sz / norm];
+    sliceSpacing = dz;
+  }
+
   return {
     imageData,
     header: {
@@ -351,6 +392,10 @@ export async function loadDicomSeries(
       datatypeCode: 2,
       scl_slope: 1,
       scl_inter: 0,
+      imageOrientationPatient: iop?.length === 6 ? (iop as [number,number,number,number,number,number]) : undefined,
+      imagePositionPatient: ipp0?.length === 3 ? (ipp0 as [number,number,number]) : undefined,
+      sliceDirection: sliceDir,
+      sliceSpacing,
     },
     dataRange: { min, max },
     defaultWindowLevel: { window: defaultWindow, level: defaultLevel },
