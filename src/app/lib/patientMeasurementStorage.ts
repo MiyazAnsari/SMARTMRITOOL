@@ -46,6 +46,7 @@ function normalizeMeasurement(raw: Partial<Measurement> & { id: string }): Measu
     label: raw.label,
     workflowStepId: raw.workflowStepId,
     propagateAcrossSlices: raw.propagateAcrossSlices,
+    imageScale: raw.imageScale,
     timestamp:
       typeof raw.timestamp === 'string' && raw.timestamp.length > 0 ? raw.timestamp : undefined,
   };

@@ -514,7 +514,7 @@ export function MedicalImageViewer({
       currentGroupIdRef.current = null;
       groupCountsRef.current = { distanceCount: 0, perpCount: 0 };
     }
-  }, [workflow.protocolId]);
+  }, [workflow.protocolId, studyData]);
 
   // Synchronously-tracked measurement counts per group so the limiting
   // check in handleMeasurementAdd never sees stale React state.
@@ -826,6 +826,14 @@ export function MedicalImageViewer({
         setImageData(vol0.imageData);
         setDataRange(vol0.dataRange);
       }
+      // Clear step results for the new study while keeping the protocol
+      // selected.  The groupId effect (depends on studyData) will generate
+      // a fresh groupId so each patient's annotations stay independent.
+      setWorkflow((prev) =>
+        prev.protocolId
+          ? { ...prev, activeStepIndex: 0, stepResults: {} }
+          : prev,
+      );
       return;
     }
 

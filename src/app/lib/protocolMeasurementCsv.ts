@@ -67,18 +67,24 @@ const CSV_COLUMNS = [
   'measurementPropagateAcrossSlices',
   'p0_x',
   'p0_y',
+  'p0_z',
   'p1_x',
   'p1_y',
+  'p1_z',
   'p2_x',
   'p2_y',
+  'p2_z',
   'p3_x',
   'p3_y',
+  'p3_z',
   'stepPointsMmJson',
   'baselineId',
   'baseline_p0_x',
   'baseline_p0_y',
+  'baseline_p0_z',
   'baseline_p1_x',
   'baseline_p1_y',
+  'baseline_p1_z',
   'baselinePointsMmJson',
   'pointsJson',
   'baselinePointsJson',
@@ -113,6 +119,9 @@ function findBorrowCandidate(
   allMeasurements: ProtocolExportMeasurement[],
 ): ProtocolExportMeasurement | undefined {
   const preferredSlice = groupMeasurements.find((measurement) => measurement.plane === protocolPlane)?.slice;
+  // Only borrow from the same patient so cross-patient annotations
+  // don't contaminate each other's protocol results.
+  const groupPatientId = groupMeasurements[0]?.patientId;
 
   const matches = (measurement: ProtocolExportMeasurement) => {
     if (measurement.workflowStepId === step.id) return true;
@@ -125,6 +134,8 @@ function findBorrowCandidate(
     .find((measurement) => {
       if (groupMeasurements.some((existing) => existing.id === measurement.id)) return false;
       if (measurement.plane !== protocolPlane) return false;
+      // Restrict borrowing to the same patient.
+      if (groupPatientId && measurement.patientId && measurement.patientId !== groupPatientId) return false;
       if (matches(measurement)) return true;
       if (!measurementMatchesPrimitive(measurement, step.primitive)) return false;
       if (preferredSlice == null) return true;
@@ -137,13 +148,16 @@ function findBorrowCandidate(
 function formatPoints(
   points: { x: number; y: number }[],
   maxPoints = 4,
-  spacing: { x: number; y: number } = { x: 1, y: 1 },
+  spacing: { x: number; y: number; z?: number } = { x: 1, y: 1 },
   imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
+  sliceIndex?: number,
 ): (string | number)[] {
   const sx = (imageScale?.x ?? 1) * spacing.x;
   const sy = (imageScale?.y ?? 1) * spacing.y;
   const ox = imageScale?.offsetX ?? 0;
   const oy = imageScale?.offsetY ?? 0;
+  const sz = (spacing.z ?? 1);
+  const zMm = sliceIndex != null && Number.isFinite(sliceIndex) ? (sliceIndex * sz).toFixed(4) : '';
   const flattened: (string | number)[] = [];
   for (let index = 0; index < maxPoints; index += 1) {
     const point = points[index];
@@ -152,7 +166,9 @@ function formatPoints(
       const ymm = (point.y - oy) * sy;
       flattened.push(Number.isFinite(xmm) ? xmm.toFixed(4) : '');
       flattened.push(Number.isFinite(ymm) ? ymm.toFixed(4) : '');
+      flattened.push(zMm);
     } else {
+      flattened.push('');
       flattened.push('');
       flattened.push('');
     }
@@ -162,14 +178,21 @@ function formatPoints(
 
 function convertPointsToMm(
   points: { x: number; y: number }[],
-  spacing: { x: number; y: number },
+  spacing: { x: number; y: number; z?: number },
   imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
+  sliceIndex?: number,
 ) {
   const sx = (imageScale?.x ?? 1) * spacing.x;
   const sy = (imageScale?.y ?? 1) * spacing.y;
   const ox = imageScale?.offsetX ?? 0;
   const oy = imageScale?.offsetY ?? 0;
-  return points.map((p) => ({ x: Number(((p.x - ox) * sx).toFixed(4)), y: Number(((p.y - oy) * sy).toFixed(4)) }));
+  const sz = (spacing.z ?? 1);
+  const zMm = sliceIndex != null && Number.isFinite(sliceIndex) ? Number((sliceIndex * sz).toFixed(4)) : null;
+  return points.map((p) => ({
+    x: Number(((p.x - ox) * sx).toFixed(4)),
+    y: Number(((p.y - oy) * sy).toFixed(4)),
+    ...(zMm != null ? { z: zMm } : {}),
+  }));
 }
 
 function computeMeasurementValue(
@@ -208,13 +231,14 @@ function computeMeasurementValue(
   return { value: null, unit: null };
 }
 
-export function getPlaneSpacing(study: DicomStudyView | null | undefined, plane: Plane): { x: number; y: number } {
+export function getPlaneSpacing(study: DicomStudyView | null | undefined, plane: Plane): { x: number; y: number; z: number } {
   const volume = study?.volumes?.[plane];
   const header = volume?.header as any;
   const pixDims = header?.pixDims || header?.pixdim || [];
   const spacingX = Number.isFinite(pixDims?.[1]) && pixDims[1] > 0 ? Number(pixDims[1]) : 1;
   const spacingY = Number.isFinite(pixDims?.[2]) && pixDims[2] > 0 ? Number(pixDims[2]) : 1;
-  return { x: spacingX, y: spacingY };
+  const spacingZ = Number.isFinite(pixDims?.[3]) && pixDims[3] > 0 ? Number(pixDims[3]) : 1;
+  return { x: spacingX, y: spacingY, z: spacingZ };
 }
 
 function getSequenceName(study: DicomStudyView | null | undefined, plane: Plane): string {
@@ -311,10 +335,13 @@ export function exportProtocolMeasurementsToCsv(
   const byGroup = new Map<string, ProtocolExportMeasurement[]>();
 
   for (const measurement of measurements) {
-    const groupId = measurement.groupId || measurement.id;
-    const current = byGroup.get(groupId) ?? [];
+    // Use a composite key of patientId + groupId so measurements from
+    // different patients never land in the same export group, even if
+    // they accidentally share a groupId.
+    const compositeKey = `${measurement.patientId ?? 'unknown'}::${measurement.groupId || measurement.id}`;
+    const current = byGroup.get(compositeKey) ?? [];
     current.push(measurement);
-    byGroup.set(groupId, current);
+    byGroup.set(compositeKey, current);
   }
 
   // Cross-group supplement: if a protocol group is missing a step that is
@@ -324,8 +351,10 @@ export function exportProtocolMeasurementsToCsv(
   // so inferProtocolStepResults can resolve the step and protocol.compute
   // returns a result.  The original measurement stays in its own group; only a
   // copy is added here, tagged with the borrowing groupId.
-  for (const [groupId, groupMeasurements] of byGroup) {
-    const protocolId = findProtocolIdFromGroupId(groupId);
+  for (const [compositeKey, groupMeasurements] of byGroup) {
+    // Extract the raw groupId from the composite key (format: patientId::groupId)
+    const rawGroupId = compositeKey.includes('::') ? compositeKey.split('::')[1]! : compositeKey;
+    const protocolId = findProtocolIdFromGroupId(rawGroupId);
     const protocol = getProtocol(protocolId);
     if (!protocol) continue;
 
@@ -341,7 +370,7 @@ export function exportProtocolMeasurementsToCsv(
       const candidate = findBorrowCandidate(protocol.requiredPlane, step, groupMeasurements, measurements);
       if (candidate) {
         // Shallow-clone so the original's groupId is unchanged.
-        groupMeasurements.push({ ...candidate, groupId });
+        groupMeasurements.push({ ...candidate, groupId: rawGroupId });
       }
     }
   }
@@ -349,8 +378,9 @@ export function exportProtocolMeasurementsToCsv(
   const rows: CsvValue[][] = [];
 
   const sortedGroups = [...byGroup.entries()].sort(([a], [b]) => a.localeCompare(b));
-  for (const [groupId, groupMeasurements] of sortedGroups) {
-    const protocolId = findProtocolIdFromGroupId(groupId);
+  for (const [compositeKey, groupMeasurements] of sortedGroups) {
+    const rawGroupId = compositeKey.includes('::') ? compositeKey.split('::')[1]! : compositeKey;
+    const protocolId = findProtocolIdFromGroupId(rawGroupId);
     const protocol = getProtocol(protocolId);
     const groupSorted = [...groupMeasurements].sort((a, b) => {
       const ta = a.workflowStepId ? 0 : 1;
@@ -381,39 +411,22 @@ export function exportProtocolMeasurementsToCsv(
           protocol.requiredPlane,
           protocol.id,
           protocol.label,
-          groupId,
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
+          rawGroupId,
+          '', '', '', '', '', '', '',
           finalResult.value.toFixed(4),
           finalResult.unit,
           finalResult.summary,
           finalResult.interpretation ?? '',
+          '', '', '', '',
+          '', '', '',
+          '', '', '',
+          '', '', '',
+          '', '', '',
           '',
           '',
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
-          '',
+          '', '', '',
+          '', '', '',
+          '', '', '',
           JSON.stringify(stepMeasurementIds),
         ]);
       }
@@ -430,8 +443,8 @@ export function exportProtocolMeasurementsToCsv(
         const finalResultUnit = finalResult?.unit ?? '';
         const finalResultSummary = finalResult?.summary ?? '';
         const finalResultInterpretation = finalResult?.interpretation ?? '';
-        const measurementPointsJson = JSON.stringify(convertPointsToMm(measurement.points, spacing, msImageScale));
-        const baselinePointsJson = JSON.stringify(convertPointsToMm(baseline?.points ?? [], spacing, blImageScale));
+        const measurementPointsJson = JSON.stringify(convertPointsToMm(measurement.points, spacing, msImageScale, measurement.slice));
+        const baselinePointsJson = JSON.stringify(convertPointsToMm(baseline?.points ?? [], spacing, blImageScale, baseline?.slice));
         const rowContext = resolveExportContext(measurement, context);
         rows.push([
           'step_measurement',
@@ -443,7 +456,7 @@ export function exportProtocolMeasurementsToCsv(
           measurement.plane,
           protocol.id,
           protocol.label,
-          groupId,
+          rawGroupId,
           measurement.id,
           measurement.workflowStepId ?? '',
           protocol.steps.find((step) => step.id === measurement.workflowStepId)?.label ?? measurement.label ?? '',
@@ -459,10 +472,10 @@ export function exportProtocolMeasurementsToCsv(
           measurementValueCell,
           computed.unit ?? '',
           String(measurement.propagateAcrossSlices ?? true),
-          ...formatPoints(measurement.points, 4, spacing, msImageScale),
+          ...formatPoints(measurement.points, 4, spacing, msImageScale, measurement.slice),
           measurementPointsJson,
           measurement.baseLineId ?? '',
-          ...(baseline ? formatPoints(baseline.points, 2, spacing, blImageScale) : ['', '', '', '']),
+          ...(baseline ? formatPoints(baseline.points, 2, spacing, blImageScale, baseline.slice) : ['', '', '', '', '', '']),
           baselinePointsJson,
           measurementPointsJson,
           baselinePointsJson,
@@ -475,7 +488,7 @@ export function exportProtocolMeasurementsToCsv(
     // Non-protocol groups still export their raw geometry.
     for (const measurement of groupSorted) {
       const msImageScale = measurement.imageScale ?? context.imageScale;
-      const measurementPointsJson = JSON.stringify(convertPointsToMm(measurement.points, spacing, msImageScale));
+      const measurementPointsJson = JSON.stringify(convertPointsToMm(measurement.points, spacing, msImageScale, measurement.slice));
       const baselinePointsJson = '[]';
       const computed = computeMeasurementValue(measurement, spacing, msImageScale);
       const measurementValueCell = computed.value != null ? computed.value.toFixed(4) : '';
@@ -490,7 +503,7 @@ export function exportProtocolMeasurementsToCsv(
         measurement.plane,
         '',
         '',
-        groupId,
+        rawGroupId,
         measurement.id,
         measurement.workflowStepId ?? '',
         measurement.label ?? '',
@@ -506,13 +519,10 @@ export function exportProtocolMeasurementsToCsv(
         measurementValueCell,
         computed.unit ?? '',
         String(measurement.propagateAcrossSlices ?? true),
-        ...formatPoints(measurement.points, 4, spacing, msImageScale),
+        ...formatPoints(measurement.points, 4, spacing, msImageScale, measurement.slice),
         measurementPointsJson,
         measurement.baseLineId ?? '',
-        '',
-        '',
-        '',
-        '',
+        '', '', '', '', '', '',
         baselinePointsJson,
         measurementPointsJson,
         baselinePointsJson,
