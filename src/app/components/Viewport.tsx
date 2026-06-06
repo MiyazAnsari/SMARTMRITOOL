@@ -607,20 +607,43 @@ export function Viewport({
   }, [referenceLineFraction, computeImageScale, measurementPlane, plane, displaySize, header]);
 
   const prevDisplaySizeRef = useRef<{ width: number; height: number } | null>(null);
+  const prevImageDataForRepositionRef = useRef<Uint8Array | null>(null);
   useEffect(() => {
+    // When the underlying image volume changes (e.g. patient switch), the
+    // shared previous-display-size is no longer a valid reference for
+    // coordinate remapping.  However, each measurement stores its own
+    // imageScale (the draw-area geometry at capture time), so we can
+    // safely remap using per-measurement creation geometry even across
+    // volume switches.  Without this, switching back to a previously-
+    // viewed patient after resizing the viewport leaves measurements
+    // in the wrong coordinate system.
+    const volumeChanged = prevImageDataForRepositionRef.current !== imageData;
+    if (volumeChanged) {
+      prevImageDataForRepositionRef.current = imageData;
+      prevDisplaySizeRef.current = null;
+      // Fall through — still check whether measurements need remapping
+      // using per-measurement imageScale (the measurementOldArea helper
+      // below reconstructs the draw area from the stored imageScale,
+      // which is volume-specific and safe across patient switches).
+    }
+
     const prev = prevDisplaySizeRef.current;
     const cur = displaySize;
 
     if (!prev || prev.width === 0 || prev.height === 0) {
       prevDisplaySizeRef.current = cur;
-      return;
+      // If the volume just changed, the current display size may differ
+      // from when the measurements were originally captured.  Continue
+      // to the remapping logic instead of returning early.
+      if (!volumeChanged) return;
     }
-    
+
     if (cur.width === 0 || cur.height === 0) {
         return;
     }
 
-    if (prev.width === cur.width && prev.height === cur.height) return;
+    // When the volume hasn't changed and display size is unchanged, skip.
+    if (!volumeChanged && prev && prev.width === cur.width && prev.height === cur.height) return;
 
     if (
       draggingPointRef.current ||
@@ -659,9 +682,33 @@ export function Viewport({
       return { drawW, drawH, offsetX: (dW - drawW) / 2, offsetY: (dH - drawH) / 2 };
     };
 
-    const oldArea = drawArea(prev.width, prev.height);
+    // When the volume changed, prev is null so the shared oldArea is
+    // meaningless.  measurementOldArea will fall back to per-measurement
+    // imageScale (which is volume-specific and safe).  We still compute
+    // newArea from the current display size for the remapping target.
+    const oldArea = prev ? drawArea(prev.width, prev.height) : null;
     const newArea = drawArea(cur.width, cur.height);
     const currentImageScale = computeImageScale();
+
+    /** Reconstruct the display area at which a single measurement was captured
+     *  from its stored imageScale, falling back to the global oldArea.  Using
+     *  per-measurement creation geometry means each measurement is remapped
+     *  from its own original viewport size, not a shared "previous" size that
+     *  may belong to a different patient or a different resize event. */
+    const measurementOldArea = (m: { imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number } | null }) => {
+      const is = m.imageScale;
+      if (is && is.x > 0 && is.y > 0) {
+        return {
+          drawW: imgW / is.x,
+          drawH: imgH / is.y,
+          offsetX: is.offsetX ?? 0,
+          offsetY: is.offsetY ?? 0,
+        };
+      }
+      // Fall back to the shared oldArea.  When the volume changed, oldArea
+      // is null — skip measurements without stored imageScale in that case.
+      return oldArea;
+    };
 
     // Only remap baselines (distance / line / angle).  Perpendicular anchors
     // are automatically recalculated by handleMeasurementUpdate when their
@@ -670,10 +717,21 @@ export function Viewport({
     // batched state processing and leave the baseline at its old coordinates.
     for (const m of measurements) {
       if (m.type === 'perpendicular') continue;
+      const oa = measurementOldArea(m);
+      if (!oa) continue; // no usable old area (volume changed, no stored imageScale)
+      // Skip measurements whose stored imageScale already matches the current
+      // draw area (within rounding tolerance).  This avoids unnecessary state
+      // updates during patient switches when the display size is unchanged.
+      if (
+        Math.abs(oa.drawW - newArea.drawW) <= 1 &&
+        Math.abs(oa.drawH - newArea.drawH) <= 1 &&
+        Math.abs((oa.offsetX ?? 0) - (newArea.offsetX ?? 0)) <= 1 &&
+        Math.abs((oa.offsetY ?? 0) - (newArea.offsetY ?? 0)) <= 1
+      ) continue;
       emitMeasurementUpdate(m.id, (oldPoints) =>
         oldPoints.map((p) => ({
-          x: ((p.x - oldArea.offsetX) / oldArea.drawW) * newArea.drawW + newArea.offsetX,
-          y: ((p.y - oldArea.offsetY) / oldArea.drawH) * newArea.drawH + newArea.offsetY,
+          x: ((p.x - oa.offsetX) / oa.drawW) * newArea.drawW + newArea.offsetX,
+          y: ((p.y - oa.offsetY) / oa.drawH) * newArea.drawH + newArea.offsetY,
         })),
         undefined,
         currentImageScale,
@@ -686,10 +744,18 @@ export function Viewport({
     for (const m of measurements) {
       if (m.type !== 'perpendicular') continue;
       if (m.baseLineId && remappedIds.has(m.baseLineId)) continue;
+      const oa = measurementOldArea(m);
+      if (!oa) continue;
+      if (
+        Math.abs(oa.drawW - newArea.drawW) <= 1 &&
+        Math.abs(oa.drawH - newArea.drawH) <= 1 &&
+        Math.abs((oa.offsetX ?? 0) - (newArea.offsetX ?? 0)) <= 1 &&
+        Math.abs((oa.offsetY ?? 0) - (newArea.offsetY ?? 0)) <= 1
+      ) continue;
       emitMeasurementUpdate(m.id, (oldPoints) =>
         oldPoints.map((p) => ({
-          x: ((p.x - oldArea.offsetX) / oldArea.drawW) * newArea.drawW + newArea.offsetX,
-          y: ((p.y - oldArea.offsetY) / oldArea.drawH) * newArea.drawH + newArea.offsetY,
+          x: ((p.x - oa.offsetX) / oa.drawW) * newArea.drawW + newArea.offsetX,
+          y: ((p.y - oa.offsetY) / oa.drawH) * newArea.drawH + newArea.offsetY,
         })),
         undefined,
         currentImageScale,
@@ -697,7 +763,7 @@ export function Viewport({
     }
 
     prevDisplaySizeRef.current = cur;
-  }, [displaySize, measurements, onMeasurementUpdate, isPanning, isDrawing, emitMeasurementUpdate, getPlaneGeometry, pixelSpacing]);
+  }, [displaySize, measurements, onMeasurementUpdate, isPanning, isDrawing, emitMeasurementUpdate, getPlaneGeometry, pixelSpacing, imageData]);
 
   // New volume buffer → reset this viewer’s W/L and brightness only (no cross-viewport state).
   const prevImageDataRef = useRef<Uint8Array | null>(null);
@@ -715,6 +781,11 @@ export function Viewport({
     setIsBrightnessMode(false);
     setIsWlMode(false);
     setIsWwMode(false);
+    // Reset display-size tracking so the repositioning effect does not
+    // remap the new volume's measurements using the previous volume's
+    // display area as a coordinate-system reference (cross-patient
+    // measurement corruption).
+    prevDisplaySizeRef.current = null;
   }, [imageData, defaultWindowLevel]);
 
   // Apply weighting, per-viewport brightness, then window/level
