@@ -1662,9 +1662,15 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    if (activeTool === 'none' || alwaysAllowPointDrag) {
-      // Point dragging — in Select mode always, or for any tool when
-      // alwaysAllowPointDrag is set (reference-line landmarks).
+    // Point dragging: allowed in Select mode always, and also when
+    // alwaysAllowPointDrag is set (reference-line landmarks) UNLESS the
+    // active tool is a drawing/measurement tool that needs the click.
+    const isDrawingTool =
+      activeTool === 'distance' || activeTool === 'line' ||
+      activeTool === 'point' || activeTool === 'angle' ||
+      activeTool === 'perpendicular' || activeTool === 'freehand' ||
+      activeTool === 'ellipse' || activeTool === 'closedCurve';
+    if (activeTool === 'none' || (alwaysAllowPointDrag && !isDrawingTool)) {
       for (const m of measurementsRef.current) {
         if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
         if (m.points.length === 0) continue;
