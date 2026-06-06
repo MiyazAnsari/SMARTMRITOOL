@@ -527,12 +527,12 @@ export function Viewport({
   // image height, so sagittal + coronal lines always align anatomically.
   const computedReferenceLines = useMemo(() => {
     const lines: { cssY: number; refFraction: number; label: string; isSagittal: boolean }[] = [];
-    // Only show on sagittal and coronal (not axial).
-    if (measurementPlane === 'axial') return lines;
+    // Only show on sagittal.
+    if (measurementPlane !== 'sagittal') return lines;
     if (!referenceLineFraction) return lines;
 
     const {
-      sagFraction, sagCssY, offsetMm, label, planeZSpacing, planeZSliceCount,
+      sagFraction, sagCssY, offsetMm, label,
       coronalImageY, coronalImgH,
     } = referenceLineFraction;
 
@@ -544,14 +544,26 @@ export function Viewport({
     const myDisplayH = displaySize.height;
     const myDrawH = Math.max(1, myDisplayH - 2 * myOffsetY);
 
-    // ── Offset fraction (viewport-independent) ─────────────────────────
-    const sagZS = planeZSpacing?.['sagittal']
-      ?? (header.pixDims?.[3] || (header as any).pixdim?.[3] || 1);
-    const sagSlices = planeZSliceCount?.['sagittal']
-      ?? getPlaneGeometry().height;
-    const offsetFraction = sagSlices > 0 && sagZS > 0
-      ? (offsetMm / sagZS) / sagSlices
-      : 0;
+    // ── Offset in CSS pixels for this viewport ────────────────────────
+    // The offset (e.g. 30 mm superior) is along the anatomical superior-
+    // inferior axis, which maps to the image *column* direction (screen Y).
+    //
+    // The in-plane column pixel spacing (dy = pixDims[2]) gives the
+    // physical distance between adjacent rows.  Multiply by the SI
+    // component of the column direction vector (|col_z| from IOP) to get
+    // the SI distance per row, then compute the SI fraction of the image.
+    //
+    //   siPerRow        = dy × |col_z|
+    //   imageSiExtent   = imageRows × siPerRow
+    //   offsetFraction  = offsetMm / imageSiExtent
+    //   offsetCss       = offsetFraction × myDrawH
+    const iopCol = (header as any)?.imageOrientationPatient as number[] | undefined;
+    const colZ = iopCol?.length === 6 ? Math.abs(iopCol[5]) : 1; // |col_z|, SI component
+    const dy = header.pixDims?.[2] ?? (header as any).pixdim?.[2] ?? 1;
+    const imageRows = getPlaneGeometry().height;
+    const siPerRow = dy * colZ;
+    const imageSiH = Math.max(1, imageRows * siPerRow);
+    const offsetCss = (offsetMm / imageSiH) * myDrawH;
 
     // ── Joint line CSS Y ──────────────────────────────────────────────
     let jointCssY: number;
@@ -568,17 +580,19 @@ export function Viewport({
     }
 
     // ── Offset line CSS Y ─────────────────────────────────────────────
-    const offsetCss = offsetFraction * myDrawH;
     const refCssY = jointCssY - offsetCss;
 
     // Fraction for click-to-navigate (only meaningful on sagittal).
     const refFraction = myDrawH > 0
       ? Math.max(0, Math.min(1, (refCssY - myOffsetY) / myDrawH))
       : 0;
+    const jointFraction = myDrawH > 0
+      ? Math.max(0, Math.min(1, (jointCssY - myOffsetY) / myDrawH))
+      : 0;
 
     lines.push({
       cssY: jointCssY,
-      refFraction: isSagittal ? refFraction : -1,
+      refFraction: isSagittal ? jointFraction : -1,
       label: `${label} (joint)`,
       isSagittal,
     });
@@ -2405,35 +2419,32 @@ export function Viewport({
     const iop = (header as any)?.imageOrientationPatient as number[] | undefined;
     const rowDir: [number,number,number] = iop?.length === 6 ? [iop[0],iop[1],iop[2]] : [0,0,0];
     const colDir: [number,number,number] = iop?.length === 6 ? [iop[3],iop[4],iop[5]] : [0,0,0];
-    // Slice stacking direction = cross(row, col)
+
+    // Slice-stacking direction = cross(row, col).
+    // Always compute from IOP — do NOT rely on stored sliceDirection (that
+    // value reflects IPP delta sign, which may be stale from a pre-fix load).
     const sX = rowDir[1]*colDir[2] - rowDir[2]*colDir[1];
     const sY = rowDir[2]*colDir[0] - rowDir[0]*colDir[2];
     const sZ = rowDir[0]*colDir[1] - rowDir[1]*colDir[0];
-    const sliceDir: [number,number,number] = [sX, sY, sZ];
+    const throughDir: [number,number,number] = [sX, sY, sZ];
 
-    // What each screen axis represents per plane:
-    // rowDir (iop[0-2]) = direction along a row  → screen left→right (xDir)
-    // colDir (iop[3-5]) = direction along a column → screen top→bottom (yDir)
-    let xDir: [number,number,number]; // screen left→right
-    let yDir: [number,number,number]; // screen top→bottom
-    let throughDir: [number,number,number]; // slider (slice-stacking) direction
-
-    if (measurementPlane === 'axial') {
-      xDir = rowDir; yDir = colDir; throughDir = sliceDir;
-    } else if (measurementPlane === 'sagittal') {
-      xDir = rowDir; yDir = colDir; throughDir = sliceDir;
-    } else { // coronal
-      xDir = rowDir; yDir = colDir; throughDir = sliceDir;
-    }
+    // Screen axes (row direction = left→right, col direction = top→bottom)
+    const xDir = rowDir;
+    const yDir = colDir;
 
     const hasIOP = iop?.length === 6;
     return {
-      top: hasIOP ? closestDir([-yDir[0], -yDir[1], -yDir[2]]) : (measurementPlane === 'axial' ? 'A' : 'S'),
-      bottom: hasIOP ? closestDir(yDir) : (measurementPlane === 'axial' ? 'P' : 'I'),
-      left: hasIOP ? closestDir([-xDir[0], -xDir[1], -xDir[2]]) : (measurementPlane === 'axial' ? 'R' : measurementPlane === 'sagittal' ? 'A' : 'R'),
-      right: hasIOP ? closestDir(xDir) : (measurementPlane === 'axial' ? 'L' : measurementPlane === 'sagittal' ? 'P' : 'L'),
-      sliderTop: hasIOP ? closestDir(throughDir) : (measurementPlane === 'axial' ? 'I' : measurementPlane === 'sagittal' ? 'R' : 'P'),
-      sliderBottom: hasIOP ? closestDir([-throughDir[0], -throughDir[1], -throughDir[2]]) : (measurementPlane === 'axial' ? 'S' : measurementPlane === 'sagittal' ? 'L' : 'A'),
+      // Edge labels: screen top = -colDir, bottom = +colDir, etc.
+      top:    hasIOP ? closestDir([-yDir[0], -yDir[1], -yDir[2]]) : (measurementPlane === 'axial' ? 'A' : 'S'),
+      bottom: hasIOP ? closestDir(yDir)                            : (measurementPlane === 'axial' ? 'P' : 'I'),
+      left:   hasIOP ? closestDir([-xDir[0], -xDir[1], -xDir[2]]) : (measurementPlane === 'axial' ? 'R' : measurementPlane === 'sagittal' ? 'A' : 'R'),
+      right:  hasIOP ? closestDir(xDir)                            : (measurementPlane === 'axial' ? 'L' : measurementPlane === 'sagittal' ? 'P' : 'L'),
+      // Slider labels: throughDir points from slice 0 → slice max.
+      // IMPORTANT: Radix Slider in vertical mode inverts the axis —
+      // min (0 = slice 0) is at the BOTTOM, max (last slice) at the TOP.
+      // So the label ABOVE the slider is slice max, BELOW is slice 0.
+      sliderTop:    hasIOP ? closestDir(throughDir)                                              : (measurementPlane === 'axial' ? 'S' : measurementPlane === 'sagittal' ? 'R' : 'P'),
+      sliderBottom: hasIOP ? closestDir([-throughDir[0], -throughDir[1], -throughDir[2]]) : (measurementPlane === 'axial' ? 'I' : measurementPlane === 'sagittal' ? 'L' : 'A'),
     };
   }, [header, measurementPlane]);
 

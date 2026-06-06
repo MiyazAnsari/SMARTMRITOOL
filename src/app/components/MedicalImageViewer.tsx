@@ -437,16 +437,24 @@ export function MedicalImageViewer({
 
   // ── Reference line click → navigate axial viewer ──────────────────
   // The Viewport passes the Z-position fraction (0–1) of the clicked line.
-  // 0 = superior, 1 = inferior.  Axial slice 0 = inferior → invert.
+  // 0 = superior, 1 = inferior.  Whether axial slice 0 is inferior or
+  // superior depends on the acquisition.  The loader stores the slice-
+  // stacking direction in sliceDirection (points from slice 0 → max).
+  // If that direction points superiorly (Z > 0), ascending slice index =
+  // ascending Z → slice 0 = inferior → must invert.  Otherwise not.
   const navigateToAxialFraction = useCallback(
     (refFraction: number) => {
       if (refFraction < 0 || refFraction > 1) return;
       const axialVol = studyData?.volumes?.axial;
       const axialSliceCount = axialVol?.sliceCount ?? (axialVol?.header?.dims?.[3] ?? 0);
       if (axialSliceCount <= 0) return;
-      // refFraction: 0 = superior, 1 = inferior.
-      // Axial slice 0 = inferior, max = superior → invert.
-      const axialFraction = 1 - refFraction;
+      const axialHeader = axialVol?.header as any;
+      const sliceDir = axialHeader?.sliceDirection as [number, number, number] | undefined;
+      // If sliceDir Z > 0: slice 0 is inferior → refFraction (0=sup) needs inversion.
+      // If sliceDir Z < 0: slice 0 is superior → no inversion.
+      // Safe default (no IOP data): assume standard foot-to-head (invert).
+      const needsInvert = sliceDir ? sliceDir[2] > 0 : true;
+      const axialFraction = needsInvert ? 1 - refFraction : refFraction;
       const axialSlice = Math.round(axialFraction * (axialSliceCount - 1));
       setCurrentSlice((prev) => ({ ...prev, axial: axialSlice }));
       if (studyData) {
@@ -477,12 +485,16 @@ export function MedicalImageViewer({
     if (hasNow && !prevHadReferenceLine.current && referenceLineFraction) {
       const { sagFraction, offsetMm, planeZSpacing, planeZSliceCount } = referenceLineFraction;
 
-      // Offset as a fraction of the sagittal image height.
+      // Convert offsetMm to a 0–1 fraction of the sagittal image height.
+      // sagFraction is (cssY − offsetY) / sagDrawH, which maps linearly to
+      // image-row fraction because the draw area spans exactly sagSlices rows.
+      // So offsetFraction = offsetRows / sagSlices = (offsetMm / sagZS) / sagSlices,
+      // which equals offsetMm / (sagZS * sagSlices) — the mm offset divided by
+      // the total physical height of the sagittal volume in mm.
       const sagZS = planeZSpacing?.['sagittal'] ?? 1;
       const sagSlices = planeZSliceCount?.['sagittal'] ?? 1;
-      const offsetFraction = sagSlices > 0 && sagZS > 0
-        ? (offsetMm / sagZS) / sagSlices
-        : 0;
+      const sagPhysicalH = Math.max(1, sagSlices * sagZS);
+      const offsetFraction = offsetMm / sagPhysicalH;
 
       const refFraction = Math.max(0, Math.min(1, sagFraction - offsetFraction));
       navigateToAxialFraction(refFraction);

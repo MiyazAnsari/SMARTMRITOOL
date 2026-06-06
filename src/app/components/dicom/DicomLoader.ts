@@ -364,7 +364,8 @@ export async function loadDicomSeries(
   if (consistent.length >= 2 && consistent[0].imagePositionPatient && consistent[1].imagePositionPatient) {
     const a = consistent[0].imagePositionPatient;
     const b = consistent[1].imagePositionPatient;
-    const ddx = a[0] - b[0], ddy = a[1] - b[1], ddz = a[2] - b[2];
+    // Direction from slice 0 toward slice max (forward in sort order)
+    const ddx = b[0] - a[0], ddy = b[1] - a[1], ddz = b[2] - a[2];
     const d = Math.sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
     // Only trust IPP delta if it's within 2× of nominal slice thickness.
     if (d > 0 && nominalDS > 0 && d <= nominalDS * 2.5) {
