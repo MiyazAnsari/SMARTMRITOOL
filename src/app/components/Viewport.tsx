@@ -599,12 +599,32 @@ export function Viewport({
     lines.push({
       cssY: refCssY,
       refFraction: isSagittal ? refFraction : -1,
-      label: `${label} (${(offsetMm / 10).toFixed(1)} cm sup)`,
+      label: `${(offsetMm / 10).toFixed(1)} cm superior to joint line`,
       isSagittal,
     });
 
     return lines;
   }, [referenceLineFraction, computeImageScale, measurementPlane, plane, displaySize, header]);
+
+  // ── Auto-navigate when the offset reference line first appears ──────
+  // The Viewport already computes the exact refFraction for the offset
+  // line using IOP-aware geometry.  Trigger the same navigation as if the
+  // user clicked the "3 cm superior" line, so the auto-jump and manual
+  // click always go to the identical axial slice.
+  const prevHadRefLineForAutoNav = useRef(false);
+  useEffect(() => {
+    const hasNow = computedReferenceLines.length > 0 && onReferenceLineClick != null;
+    if (hasNow && !prevHadRefLineForAutoNav.current) {
+      // Find the offset line (the one with "superior" in its label)
+      const offsetLine = computedReferenceLines.find(
+        (rl) => rl.isSagittal && rl.refFraction >= 0 && rl.label.includes('superior'),
+      );
+      if (offsetLine) {
+        onReferenceLineClick(offsetLine.refFraction);
+      }
+    }
+    prevHadRefLineForAutoNav.current = hasNow;
+  }, [computedReferenceLines, onReferenceLineClick]);
 
   const prevDisplaySizeRef = useRef<{ width: number; height: number } | null>(null);
   const prevImageDataForRepositionRef = useRef<Uint8Array | null>(null);
@@ -710,13 +730,18 @@ export function Viewport({
       return oldArea;
     };
 
-    // Only remap baselines (distance / line / angle).  Perpendicular anchors
-    // are automatically recalculated by handleMeasurementUpdate when their
-    // parent baseline is moved, so emitting a second update for the same
-    // perpendicular would conflict with the baseline’s update inside React’s
-    // batched state processing and leave the baseline at its old coordinates.
+    // Remap ALL measurements using per-measurement imageScale so every
+    // point, line, perpendicular and angle stays invariant to viewport resize.
+    // Baselines (distance/line/angle) are processed first so dependent
+    // perpendiculars are recalculated with full geometric precision.  All
+    // remaining types (point, perpendicular without a remapped baseline,
+    // ellipse, curve, freehand) get the direct draw-area remap as a safety net.
+    const baselineTypes = new Set(['distance', 'line', 'angle']);
+    const isBaseline = (m) => baselineTypes.has(m.type);
+
+    // Pass 1 – baselines first (triggers perpendicular recalculation)
     for (const m of measurements) {
-      if (m.type === 'perpendicular') continue;
+      if (!isBaseline(m)) continue;
       const oa = measurementOldArea(m);
       if (!oa) continue; // no usable old area (volume changed, no stored imageScale)
       // Skip measurements whose stored imageScale already matches the current
@@ -738,12 +763,15 @@ export function Viewport({
       );
     }
 
-    // Remap any perpendiculars whose baseline was NOT processed above
-    // (e.g. the baseline belongs to a different plane / is hidden).
-    const remappedIds = new Set(measurements.filter(m => m.type !== 'perpendicular').map(m => m.id));
+    // Pass 2 – all remaining measurements (points, perpendiculars whose
+    // baseline was not remapped, ellipses, curves, freehand).
+    const remappedIds = new Set(measurements.filter((m) => isBaseline(m)).map((m) => m.id));
     for (const m of measurements) {
-      if (m.type !== 'perpendicular') continue;
-      if (m.baseLineId && remappedIds.has(m.baseLineId)) continue;
+      if (isBaseline(m)) continue;
+      // Perpendicular whose baseline was remapped → recalculation handles it.
+      // All other types (point, ellipse, curve, freehand, perpendicular
+      // without a remapped baseline) get the direct remap.
+      if (m.type === 'perpendicular' && m.baseLineId && remappedIds.has(m.baseLineId)) continue;
       const oa = measurementOldArea(m);
       if (!oa) continue;
       if (

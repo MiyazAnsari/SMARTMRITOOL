@@ -474,33 +474,8 @@ export function MedicalImageViewer({
     [navigateToAxialFraction],
   );
 
-  // ── Auto-navigate on first reference line appearance ──────────────
-  // When the user places the joint-line point and the reference line data
-  // first becomes available, automatically jump the axial viewer to the
-  // computed offset slice so the user can immediately start drawing
-  // the measurement lines without an extra click.
-  const prevHadReferenceLine = useRef(false);
-  useEffect(() => {
-    const hasNow = referenceLineFraction != null;
-    if (hasNow && !prevHadReferenceLine.current && referenceLineFraction) {
-      const { sagFraction, offsetMm, planeZSpacing, planeZSliceCount } = referenceLineFraction;
-
-      // Convert offsetMm to a 0–1 fraction of the sagittal image height.
-      // sagFraction is (cssY − offsetY) / sagDrawH, which maps linearly to
-      // image-row fraction because the draw area spans exactly sagSlices rows.
-      // So offsetFraction = offsetRows / sagSlices = (offsetMm / sagZS) / sagSlices,
-      // which equals offsetMm / (sagZS * sagSlices) — the mm offset divided by
-      // the total physical height of the sagittal volume in mm.
-      const sagZS = planeZSpacing?.['sagittal'] ?? 1;
-      const sagSlices = planeZSliceCount?.['sagittal'] ?? 1;
-      const sagPhysicalH = Math.max(1, sagSlices * sagZS);
-      const offsetFraction = offsetMm / sagPhysicalH;
-
-      const refFraction = Math.max(0, Math.min(1, sagFraction - offsetFraction));
-      navigateToAxialFraction(refFraction);
-    }
-    prevHadReferenceLine.current = hasNow;
-  }, [referenceLineFraction, navigateToAxialFraction]);
+  // ── Auto-navigation is now handled by the Viewport (computedReferenceLines
+  // effect calls onReferenceLineClick with the exact offset-line fraction).
 
   useEffect(() => {
     if (workflow.protocolId) {
@@ -628,20 +603,33 @@ export function MedicalImageViewer({
 
     setWorkflow((prev) => {
       if (prev.protocolId !== protocol.id && prev.protocolId !== null) return prev;
-      const merged = { ...prev.stepResults };
+
+      // Rebuild stepResults from current measurements only — this
+      // automatically clears stale results when switching to a patient
+      // with no completed steps, and repopulates when switching back
+      // to a patient whose measurements match the protocol.
+      const nextResults: Record<string, { primitive: Primitive; points: { x: number; y: number }[]; slice: number; imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number } }> = {};
       let changed = false;
-      for (const [stepId, result] of Object.entries(existingResults)) {
-        if (!sameStepResult(merged[stepId], result)) {
-          merged[stepId] = result;
+
+      for (const step of protocol.steps) {
+        const newResult = existingResults[step.id];
+        const oldResult = prev.stepResults[step.id];
+        if (newResult) {
+          nextResults[step.id] = newResult;
+          if (!sameStepResult(oldResult, newResult)) changed = true;
+        } else if (oldResult) {
+          // Step was previously completed but no longer has a matching
+          // measurement (e.g. patient switch) — clear it.
           changed = true;
         }
       }
+
       if (!changed) return prev;
-      const nextActiveIndex = protocol.steps.findIndex((step) => !merged[step.id]);
+      const nextActiveIndex = protocol.steps.findIndex((step) => !nextResults[step.id]);
       return {
         ...prev,
         protocolId: protocol.id,
-        stepResults: merged,
+        stepResults: nextResults,
         activeStepIndex: nextActiveIndex >= 0 ? nextActiveIndex : Math.max(0, protocol.steps.length - 1),
       };
     });
@@ -826,14 +814,6 @@ export function MedicalImageViewer({
         setImageData(vol0.imageData);
         setDataRange(vol0.dataRange);
       }
-      // Clear step results for the new study while keeping the protocol
-      // selected.  The groupId effect (depends on studyData) will generate
-      // a fresh groupId so each patient's annotations stay independent.
-      setWorkflow((prev) =>
-        prev.protocolId
-          ? { ...prev, activeStepIndex: 0, stepResults: {} }
-          : prev,
-      );
       return;
     }
 
@@ -1203,6 +1183,8 @@ export function MedicalImageViewer({
             const perps = measurements.filter(
               (m) => m.type === 'perpendicular' && m.baseLineId === id && m.points.length >= 2,
             );
+            // Collect workflow step result updates for recalculated perpendiculars
+            const perpWorkflowUpdatesSession: { stepId: string; points: { x: number; y: number }[]; imageScale: { x: number; y: number; offsetX?: number; offsetY?: number } }[] = [];
             for (const perp of perps) {
               const oldAnchor = perp.points[0];
               const t = oldLen > 0
@@ -1225,15 +1207,52 @@ export function MedicalImageViewer({
               const sign = stubDx * perpX + stubDy * perpY >= 0 ? 1 : -1;
               const scaledStubLen = stubLen * scaleFactor;
 
+              const newPoints = [
+                { x: newAnchorX, y: newAnchorY },
+                { x: newAnchorX + perpX * scaledStubLen * sign, y: newAnchorY + perpY * scaledStubLen * sign },
+              ];
+              const newImageScale = imageScale ?? perp.imageScale;
+
               onUpdateSessionAnnotation(perp.id, (row: SessionAnnotationRow) => ({
                 ...row,
-                points: [
-                  { x: newAnchorX, y: newAnchorY },
-                  { x: newAnchorX + perpX * scaledStubLen * sign, y: newAnchorY + perpY * scaledStubLen * sign },
-                ],
+                points: newPoints,
                 timestamp: new Date().toISOString(),
-                imageScale: imageScale ?? row.imageScale,
+                imageScale: newImageScale,
               }));
+
+              // Record for workflow update below
+              const perpStep = protocol?.steps.find((step) =>
+                perp.workflowStepId === step.id ||
+                (perp.label === step.label && measurementMatchesPrimitive(perp, step.primitive)),
+              );
+              if (perpStep) {
+                const recordedPoints =
+                  perpStep.primitive === 'point' && perp.type === 'perpendicular' && newPoints.length >= 2
+                    ? [newPoints[1]]
+                    : newPoints;
+                perpWorkflowUpdatesSession.push({ stepId: perpStep.id, points: recordedPoints, imageScale: newImageScale });
+              }
+            }
+
+            // Update workflow step results for recalculated perpendiculars
+            if (perpWorkflowUpdatesSession.length > 0) {
+              setWorkflow((prev) => {
+                const next = { ...prev.stepResults };
+                let changed = false;
+                for (const update of perpWorkflowUpdatesSession) {
+                  const old = next[update.stepId];
+                  if (!old || old.points.some((p, i) => p.x !== update.points[i]?.x || p.y !== update.points[i]?.y) || old.imageScale?.x !== update.imageScale.x || old.imageScale?.y !== update.imageScale.y) {
+                    next[update.stepId] = {
+                      primitive: old?.primitive ?? 'point',
+                      points: update.points,
+                      slice: old?.slice ?? 0,
+                      imageScale: update.imageScale,
+                    };
+                    changed = true;
+                  }
+                }
+                return changed ? { ...prev, stepResults: next } : prev;
+              });
             }
           }
         }
@@ -1312,6 +1331,10 @@ export function MedicalImageViewer({
         const oldLen = Math.hypot(oldDx, oldDy) || 1;
         const scaleFactor = len / oldLen;
 
+        // Collect recalculated perpendicular step results so the workflow
+        // menu and protocol result stay in sync after resize.
+        const perpWorkflowUpdates: { stepId: string; points: { x: number; y: number }[]; imageScale: { x: number; y: number; offsetX?: number; offsetY?: number } }[] = [];
+
         return updated.map((m) => {
           if (m.type !== 'perpendicular' || m.baseLineId !== id || m.points.length < 2) {
             return m;
@@ -1344,15 +1367,31 @@ export function MedicalImageViewer({
           // Scale the stub length to match the display size change
           const scaledStubLen = stubLen * scaleFactor;
 
+          const newPoints = [
+            { x: newAnchorX, y: newAnchorY },
+            { x: newAnchorX + perpX * scaledStubLen * sign, y: newAnchorY + perpY * scaledStubLen * sign },
+          ];
+          const newImageScale = imageScale ?? m.imageScale;
+
+          // Record for workflow update below
+          const perpStep = protocol?.steps.find((step) =>
+            m.workflowStepId === step.id ||
+            (m.label === step.label && measurementMatchesPrimitive(m, step.primitive)),
+          );
+          if (perpStep) {
+            const recordedPoints =
+              perpStep.primitive === 'point' && m.type === 'perpendicular' && newPoints.length >= 2
+                ? [newPoints[1]]
+                : newPoints;
+            perpWorkflowUpdates.push({ stepId: perpStep.id, points: recordedPoints, imageScale: newImageScale });
+          }
+
           return {
             ...m,
-            points: [
-              { x: newAnchorX, y: newAnchorY },
-              { x: newAnchorX + perpX * scaledStubLen * sign, y: newAnchorY + perpY * scaledStubLen * sign },
-            ],
+            points: newPoints,
             // Recalculated at the same display size as the baseline update;
             // stamp the same imageScale so CSV export stays invariant.
-            imageScale: imageScale ?? m.imageScale,
+            imageScale: newImageScale,
           };
         });
       };
@@ -1361,6 +1400,29 @@ export function MedicalImageViewer({
         onPatientMeasurementsUpdate(updater);
       } else {
         setLocalMeasurements(updater);
+      }
+
+      // Update workflow step results for any perpendiculars that were
+      // recalculated so the left-hand protocol menu and protocol.compute
+      // stay in sync with the remapped measurement positions.
+      if (perpWorkflowUpdates.length > 0) {
+        setWorkflow((prev) => {
+          const next = { ...prev.stepResults };
+          let changed = false;
+          for (const update of perpWorkflowUpdates) {
+            const old = next[update.stepId];
+            if (!old || old.points.some((p, i) => p.x !== update.points[i]?.x || p.y !== update.points[i]?.y) || old.imageScale?.x !== update.imageScale.x || old.imageScale?.y !== update.imageScale.y) {
+              next[update.stepId] = {
+                primitive: old?.primitive ?? 'point',
+                points: update.points,
+                slice: old?.slice ?? 0,
+                imageScale: update.imageScale,
+              };
+              changed = true;
+            }
+          }
+          return changed ? { ...prev, stepResults: next } : prev;
+        });
       }
 
       // Update matched protocol step if active

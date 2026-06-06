@@ -76,47 +76,6 @@ export function MeasurementWorkflow({
     ? protocol.compute(state.stepResults, pixelSpacing, imageScale)
     : null;
 
-  // ── Per-step display values (px + mm for distance/line steps) ─────
-  const stepValues = useMemo(() => {
-    if (!protocol) return {} as Record<string, string>;
-    const values: Record<string, string> = {};
-    for (const step of protocol.steps) {
-      const sr = state.stepResults[step.id];
-      if (!sr || sr.points.length < 1) continue;
-      // Distance / line / perpendicular need at least 2 points; angle needs 3.
-      if (step.primitive !== 'point' && sr.points.length < 2) continue;
-      if (step.primitive === 'angle' && sr.points.length < 3) continue;
-      const is = sr.imageScale ?? imageScale;
-      const sx = (is?.x ?? 1) * pixelSpacing.x;
-      const sy = (is?.y ?? 1) * pixelSpacing.y;
-      const ixx = (is?.x ?? 1);
-      const ixy = (is?.y ?? 1);
-
-      if (step.primitive === 'distance' || step.primitive === 'line') {
-        const dx = sr.points[1].x - sr.points[0].x;
-        const dy = sr.points[1].y - sr.points[0].y;
-        const pxDist = Math.hypot(dx * ixx, dy * ixy);
-        const mmDist = Math.hypot(dx * sx, dy * sy);
-        values[step.id] = `${pxDist.toFixed(1)} px / ${mmDist.toFixed(1)} mm`;
-      } else if (step.primitive === 'angle' && sr.points.length >= 3) {
-        // Simple CSS-pixel angle (invariant to spacing)
-        const v1x = sr.points[0].x - sr.points[1].x;
-        const v1y = sr.points[0].y - sr.points[1].y;
-        const v2x = sr.points[2].x - sr.points[1].x;
-        const v2y = sr.points[2].y - sr.points[1].y;
-        const dot = v1x * v2x + v1y * v2y;
-        const m1 = Math.hypot(v1x, v1y);
-        const m2 = Math.hypot(v2x, v2y);
-        if (m1 > 0 && m2 > 0) {
-          const deg = (Math.acos(Math.max(-1, Math.min(1, dot / (m1 * m2)))) * 180) / Math.PI;
-          values[step.id] = `${deg.toFixed(1)}°`;
-        }
-      } else if (step.primitive === 'point') {
-        values[step.id] = `${sr.points[0].x.toFixed(1)}, ${sr.points[0].y.toFixed(1)} px`;
-      }
-    }
-    return values;
-  }, [protocol, state.stepResults, pixelSpacing, imageScale]);
 
   // ── Raw measurement values (shown for all measurements) ────────────
   const rawMeasurementValues = useMemo(() => {
@@ -148,7 +107,15 @@ export function MeasurementWorkflow({
           value = `${deg.toFixed(1)}°`;
         }
       } else if (m.type === 'point' && m.points.length >= 1) {
-        value = `${m.points[0].x.toFixed(1)}, ${m.points[0].y.toFixed(1)} px`;
+        // Show image-pixel coordinates (invariant to viewport size)
+        // rather than CSS-pixel coordinates which change on resize.
+        const px = m.points[0].x;
+        const py = m.points[0].y;
+        const ox = is?.offsetX ?? 0;
+        const oy = is?.offsetY ?? 0;
+        const ix = (px - ox) * ixx;
+        const iy = (py - oy) * ixy;
+        value = `${ix.toFixed(1)}, ${iy.toFixed(1)} px`;
       }
 
       // Fallback: show at minimum the point count so nothing is silently hidden.
@@ -352,11 +319,6 @@ export function MeasurementWorkflow({
                         )}
                         {isDone && (
                           <>
-                            {stepValues[step.id] && (
-                              <div className="text-[10px] text-emerald-300 mt-1 font-mono">
-                                {stepValues[step.id]}
-                              </div>
-                            )}
                             <button
                               className="text-[10px] text-blue-400 hover:text-blue-300 mt-1"
                               onClick={(e) => {
