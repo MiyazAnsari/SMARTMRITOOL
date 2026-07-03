@@ -1,0 +1,1066 @@
+// Hip X-ray Viewer — fully self-contained, no shared workflow dependencies
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Viewport } from '../Viewport';
+import type { MeasurementTool, Measurement, PointUpdater } from '../MedicalImageViewer';
+import type { HipXrayImage } from './HipXrayLoader';
+import type { Laterality } from '../dicom/laterality';
+import { LATERALITIES } from '../dicom/laterality';
+import { Button } from '../ui/button';
+import { loadHipXrayFolder } from './HipXrayLoader';
+import { FolderOpen, Loader2, MousePointer, Ruler, Triangle, Dot, CheckCircle2, Circle, RotateCcw } from 'lucide-react';
+import { HIP_MEASUREMENT_PROTOCOL } from './HipMeasurementProtocols';
+
+export { HIP_MEASUREMENT_PROTOCOL };
+
+/** Lightweight tooltip */
+function ToolTip({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="relative group/tip">
+      {children}
+      <div className="pointer-events-none absolute bottom-full left-1/2 mb-2 -translate-x-1/2 whitespace-nowrap rounded bg-gray-800 border border-gray-700 px-2 py-1 text-xs text-gray-100 opacity-0 shadow-lg transition-opacity duration-150 group-hover/tip:opacity-100 z-[10000]">
+        {label}
+      </div>
+    </div>
+  );
+}
+
+/** Per-step result stored in workflow state */
+interface StepResult {
+  points: { x: number; y: number }[];
+  slice: number;
+  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
+}
+
+interface HipWorkflowState {
+  protocolId: string | null;
+  activeStepIndex: number;
+  stepResults: Record<string, StepResult>;
+}
+
+const initialWorkflow: HipWorkflowState = {
+  protocolId: null,
+  activeStepIndex: 0,
+  stepResults: {},
+};
+
+interface HipXrayViewerProps {
+  onImagesLoad?: (images: HipXrayImage[]) => void;
+  sessionUser?: string;
+  sessionUserEmail?: string;
+}
+
+// ── LocalStorage persistence ─────────────────────────────────────────
+const HIP_STORAGE_KEY = 'hip-measurements';
+
+function loadHipArchive(): Record<string, Measurement[]> {
+  try {
+    const raw = localStorage.getItem(HIP_STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return {};
+}
+
+function saveHipArchive(archive: Record<string, Measurement[]>) {
+  try {
+    localStorage.setItem(HIP_STORAGE_KEY, JSON.stringify(archive));
+  } catch {}
+}
+
+function storageKey(patientKey: string, laterality: Laterality): string {
+  return `${patientKey}::${laterality}`;
+}
+
+export function HipXrayViewer({ onImagesLoad, sessionUser, sessionUserEmail }: HipXrayViewerProps) {
+  // ── State ──────────────────────────────────────────────────────────
+  const [images, setImages] = useState<HipXrayImage[]>([]);
+  const [activeImageKey, setActiveImageKey] = useState<string | null>(null);
+  const [activeLaterality, setActiveLaterality] = useState<Laterality>('left');
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<string | null>(null);
+  const [activeTool, setActiveTool] = useState<MeasurementTool>('pan');
+  const [userToolOverride, setUserToolOverride] = useState<MeasurementTool | null>(null);
+  // Per-patient per-side measurement archive
+  const [measurementArchive, setMeasurementArchive] = useState<Record<string, Measurement[]>>(() => loadHipArchive());
+  const [selectedMeasurementId, setSelectedMeasurementId] = useState<string | null>(null);
+  const [workflow, setWorkflow] = useState<HipWorkflowState>(initialWorkflow);
+
+  // Persist archive on every change
+  useEffect(() => { saveHipArchive(measurementArchive); }, [measurementArchive]);
+
+  // Active measurements for current patient + side
+  const activeStorageKey = activeImageKey ? storageKey(activeImageKey, activeLaterality) : null;
+  const measurements: Measurement[] = activeStorageKey ? measurementArchive[activeStorageKey] ?? [] : [];
+
+  const setMeasurements = useCallback(
+    (updater: Measurement[] | ((prev: Measurement[]) => Measurement[])) => {
+      if (!activeStorageKey) return;
+      setMeasurementArchive((prev) => {
+        const cur = prev[activeStorageKey] ?? [];
+        const next = typeof updater === 'function' ? updater(cur) : updater;
+        return { ...prev, [activeStorageKey]: next };
+      });
+    },
+    [activeStorageKey],
+  );
+  const [rightWidth, setRightWidth] = useState(288);
+  const rightResizing = useRef(false);
+  const dicomInputRef = useRef<HTMLInputElement | null>(null);
+  const measIdCounter = useRef(0);
+
+  const activeImage = useMemo(
+    () => images.find((img) => img.patientKey === activeImageKey) ?? null,
+    [images, activeImageKey],
+  );
+
+  const activePixelSpacing = useMemo(
+    () => activeImage?.pixelSpacing ?? { x: 1, y: 1 },
+    [activeImage],
+  );
+
+  const protocolActive = workflow.protocolId === HIP_MEASUREMENT_PROTOCOL.id;
+  const activeStep = protocolActive ? HIP_MEASUREMENT_PROTOCOL.steps[workflow.activeStepIndex] : null;
+
+  // Rebuild workflow from existing measurements when switching patient or side
+  const prevStorageKeyRef = useRef(activeStorageKey);
+  useEffect(() => {
+    if (!activeStorageKey || activeStorageKey === prevStorageKeyRef.current) {
+      prevStorageKeyRef.current = activeStorageKey;
+      return;
+    }
+    prevStorageKeyRef.current = activeStorageKey;
+    setSelectedMeasurementId(null);
+    // Rebuild step results from existing measurements for this patient/side
+    const curMeas = measurementArchive[activeStorageKey] ?? [];
+    const stepResults: Record<string, { points: { x: number; y: number }[]; slice: number; imageScale?: any }> = {};
+    for (const m of curMeas) {
+      if (m.workflowStepId && HIP_MEASUREMENT_PROTOCOL.steps.some((s) => s.id === m.workflowStepId)) {
+        stepResults[m.workflowStepId] = { points: m.points, slice: 0, imageScale: m.imageScale };
+      }
+    }
+    let nextIdx = 0;
+    while (nextIdx < HIP_MEASUREMENT_PROTOCOL.steps.length && stepResults[HIP_MEASUREMENT_PROTOCOL.steps[nextIdx].id]) {
+      nextIdx++;
+    }
+    setWorkflow({
+      protocolId: HIP_MEASUREMENT_PROTOCOL.id,
+      activeStepIndex: Math.min(nextIdx, HIP_MEASUREMENT_PROTOCOL.steps.length - 1),
+      stepResults,
+    });
+  }, [activeStorageKey, measurementArchive]);
+
+  // ── Resize ─────────────────────────────────────────────────────────
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (!rightResizing.current) return;
+      setRightWidth((w) => Math.max(220, Math.min(600, w - e.movementX)));
+    };
+    const onUp = () => { rightResizing.current = false; document.body.style.cursor = ''; };
+    const onTouchMove = (e: TouchEvent) => {
+      if (!rightResizing.current) return;
+      const t = e.touches[0];
+      if (t) setRightWidth((w) => Math.max(220, Math.min(600, window.innerWidth - t.clientX)));
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    window.addEventListener('touchmove', onTouchMove, { passive: true });
+    window.addEventListener('touchend', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('touchmove', onTouchMove);
+      window.removeEventListener('touchend', onUp);
+    };
+  }, []);
+
+  // ── Handlers ───────────────────────────────────────────────────────
+  const handleLoadFolder = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files || !files.length) return;
+    try {
+      setBusy(true);
+      const loaded = await loadHipXrayFolder(files, setProgress);
+      if (loaded.length === 0) { alert('No valid hip X-ray DICOMs found.'); return; }
+      setImages(loaded);
+      setActiveImageKey(loaded[0].patientKey);
+      onImagesLoad?.(loaded);
+    } catch (err) {
+      console.error(err);
+      alert('Failed to load hip X-ray DICOMs.');
+    } finally {
+      setBusy(false);
+      setProgress(null);
+      event.target.value = '';
+    }
+  };
+
+  const genId = () => `hip-${Date.now()}-${++measIdCounter.current}`;
+
+  const selectTool = (tool: MeasurementTool) => {
+    setActiveTool(tool);
+    setUserToolOverride(tool);
+  };
+
+  // When a protocol step is active, auto-select the matching tool UNLESS
+  // the user manually overrode it (e.g. clicked a done step to edit).
+  const effectiveTool: MeasurementTool = useMemo(() => {
+    if (userToolOverride !== null) return userToolOverride;
+    if (!activeStep) return activeTool;
+    if (activeStep.tool === 'point') return 'point';
+    return 'distance';
+  }, [activeStep, activeTool, userToolOverride]);
+
+  // Clear user tool override when step advances (new measurement added)
+  const prevStepIdRef = useRef(activeStep?.id);
+  useEffect(() => {
+    if (activeStep?.id !== prevStepIdRef.current) {
+      setUserToolOverride(null);
+      prevStepIdRef.current = activeStep?.id;
+    }
+  }, [activeStep?.id]);
+
+  // Compute constraint for the current step
+  const constraintProps = useMemo(() => {
+    if (!protocolActive || !activeStep || !activeStep.id) return { constraintLineId: null, constraintMode: 'none' as const };
+    
+    const stepId = activeStep.id;
+    const stepIdx = workflow.activeStepIndex;
+    
+    // Step 2 (lesser-trochanter-guideline): perpendicular to step 1
+    if (stepId === 'lesser-trochanter-guideline') {
+      const refMeas = measurements.find((m) => m.workflowStepId === 'femur-shaft-midline');
+      if (refMeas && refMeas.points.length >= 2) return { constraintLineId: refMeas.id, constraintMode: 'perpendicular' as const };
+    }
+    
+    // Step 7 (femur-head-diameter): parallel to step 6
+    if (stepId === 'femur-head-diameter') {
+      const refMeas = measurements.find((m) => m.workflowStepId === 'femur-neck-width');
+      if (refMeas && refMeas.points.length >= 2) return { constraintLineId: refMeas.id, constraintMode: 'parallel' as const };
+    }
+    
+    return { constraintLineId: null, constraintMode: 'none' as const };
+  }, [protocolActive, activeStep, measurements, workflow.activeStepIndex]);
+
+  // Point constraint: snap to specific guideline based on step
+  const pointConstraintLineId = useMemo(() => {
+    if (!protocolActive || !activeStep) return null;
+    const stepId = activeStep.id;
+    // Steps 3-4: snap to lesser trochanter guideline
+    if (stepId === 'medial-cortical-point' || stepId === 'lateral-cortical-point') {
+      const g = measurements.find((m) => m.workflowStepId === 'lesser-trochanter-guideline');
+      return g?.id ?? null;
+    }
+    // Steps 8-10: snap to midpoint guideline
+    if (stepId === 'hip-axis-lateral' || stepId === 'hip-axis-medial' || stepId === 'neck-axis-medial') {
+      const g = measurements.find((m) => m.workflowStepId === 'midpoint-guideline');
+      return g?.id ?? null;
+    }
+    return null;
+  }, [protocolActive, activeStep, measurements]);
+
+  // Snap-to-lines for point steps (3, 4)
+  const shouldSnapToLines = protocolActive && activeStep?.tool === 'point';
+
+  // Compute which measurements should render as extended dashed guidelines
+  const guidelineIds = useMemo(() => {
+    if (!protocolActive) return null;
+    const ids = new Set<string>();
+    // Non-auto guidelines only (midpoint-guideline is rendered as derived line)
+    for (const stepId of ['femur-shaft-midline', 'lesser-trochanter-guideline']) {
+      const m = measurements.find((mm) => mm.workflowStepId === stepId);
+      if (m) ids.add(m.id);
+    }
+    return ids.size > 0 ? ids : null;
+  }, [protocolActive, measurements]);
+
+  // Compute derived measurement lines for visual overlay
+  const derivedLines = useMemo(() => {
+    const lines: { points: { x: number; y: number }[]; label: string }[] = [];
+    if (!protocolActive) return lines;
+
+    const headDiam = measurements.find((m) => m.workflowStepId === 'femur-head-diameter');
+    const shaftMid = measurements.find((m) => m.workflowStepId === 'femur-shaft-midline');
+    const ltGuid = measurements.find((m) => m.workflowStepId === 'lesser-trochanter-guideline');
+    const midGuid = measurements.find((m) => m.workflowStepId === 'midpoint-guideline');
+    const hipLat = measurements.find((m) => m.workflowStepId === 'hip-axis-lateral');
+    const hipMed = measurements.find((m) => m.workflowStepId === 'hip-axis-medial');
+
+    // Midpoint guideline (auto-created, show as black dashed derived line)
+    if (midGuid && midGuid.points.length >= 2) {
+      // Extend to edges
+      const p0 = midGuid.points[0], p1 = midGuid.points[1];
+      const dx = p1.x - p0.x, dy = p1.y - p0.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const ux = dx / len, uy = dy / len;
+      const big = 5000;
+      lines.push({ points: [
+        { x: p0.x - ux * big, y: p0.y - uy * big },
+        { x: p1.x + ux * big, y: p1.y + uy * big }
+      ], label: 'Midpoint' });
+    }
+
+    if (headDiam && headDiam.points.length >= 2) {
+      const headMid = { x: (headDiam.points[0].x + headDiam.points[1].x) / 2, y: (headDiam.points[0].y + headDiam.points[1].y) / 2 };
+      // Horizontal offset
+      if (shaftMid && shaftMid.points.length >= 2) {
+        const sm0 = shaftMid.points[0], sm1 = shaftMid.points[1];
+        const dx = sm1.x - sm0.x, dy = sm1.y - sm0.y;
+        const len2 = dx * dx + dy * dy || 1;
+        const t = ((headMid.x - sm0.x) * dx + (headMid.y - sm0.y) * dy) / len2;
+        const foot = { x: sm0.x + dx * t, y: sm0.y + dy * t };
+        lines.push({ points: [headMid, foot], label: 'H-Offset' });
+      }
+      // Vertical offset
+      if (ltGuid && ltGuid.points.length >= 2) {
+        const lt0 = ltGuid.points[0], lt1 = ltGuid.points[1];
+        const dx = lt1.x - lt0.x, dy = lt1.y - lt0.y;
+        const len2 = dx * dx + dy * dy || 1;
+        const t = ((headMid.x - lt0.x) * dx + (headMid.y - lt0.y) * dy) / len2;
+        const foot = { x: lt0.x + dx * t, y: lt0.y + dy * t };
+        lines.push({ points: [headMid, foot], label: 'V-Offset' });
+      }
+    }
+
+    // Angle arc: arc between hip axis (projected onto guideline) and shaft midline
+    if (hipLat && hipMed && hipLat.points.length >= 1 && hipMed.points.length >= 1 && shaftMid && shaftMid.points.length >= 2 && midGuid && midGuid.points.length >= 2) {
+      const mg0 = midGuid.points[0], mg1 = midGuid.points[1];
+      const tLat = ((hipLat.points[0].x - mg0.x) * (mg1.x - mg0.x) + (hipLat.points[0].y - mg0.y) * (mg1.y - mg0.y)) / ((mg1.x - mg0.x) ** 2 + (mg1.y - mg0.y) ** 2 || 1);
+      const tMed = ((hipMed.points[0].x - mg0.x) * (mg1.x - mg0.x) + (hipMed.points[0].y - mg0.y) * (mg1.y - mg0.y)) / ((mg1.x - mg0.x) ** 2 + (mg1.y - mg0.y) ** 2 || 1);
+      const gdx = mg1.x - mg0.x, gdy = mg1.y - mg0.y;
+      const projLat = { x: mg0.x + gdx * tLat, y: mg0.y + gdy * tLat };
+      const projMed = { x: mg0.x + gdx * tMed, y: mg0.y + gdy * tMed };
+      // Hip axis direction
+      const haDx = projMed.x - projLat.x, haDy = projMed.y - projLat.y;
+      const haLen = Math.hypot(haDx, haDy) || 1;
+      // Shaft midline direction
+      const smDx = shaftMid.points[1].x - shaftMid.points[0].x, smDy = shaftMid.points[1].y - shaftMid.points[0].y;
+      const smLen = Math.hypot(smDx, smDy) || 1;
+      // Compute intersection of hip axis line and shaft midline
+      const haPx = projLat.x, haPy = projLat.y;
+      const smPx = shaftMid.points[0].x, smPy = shaftMid.points[0].y;
+      const det = haDx * (-smDy) - haDy * (-smDx);
+      if (Math.abs(det) > 1e-10) {
+        const tS = ((smPx - haPx) * (-smDy) + (smPy - haPy) * smDx) / det;
+        const ix = haPx + tS * haDx, iy = haPy + tS * haDy;
+        // Build arc points from hip axis direction to shaft midline direction
+        let angle1 = Math.atan2(-haDy, haDx);
+        let angle2 = Math.atan2(-smDy, smDx);
+        if (activeLaterality === 'right') {
+          [angle1, angle2] = [angle2, angle1];
+        }
+        // Always draw the shorter (acute) arc — if diff > π, go the other way
+        let diff = angle2 - angle1;
+        while (diff < -Math.PI) diff += 2 * Math.PI;
+        while (diff > Math.PI) diff -= 2 * Math.PI;
+        if (diff > Math.PI) diff -= 2 * Math.PI;
+        if (diff < -Math.PI) diff += 2 * Math.PI;
+        const arcR = 40;
+        const steps = 20;
+        const arcPts: { x: number; y: number }[] = [];
+        for (let i = 0; i <= steps; i++) {
+          const a = angle1 + diff * (i / steps);
+          arcPts.push({ x: ix + arcR * Math.cos(a), y: iy - arcR * Math.sin(a) });
+        }
+        lines.push({ points: arcPts, label: 'Angle' });
+      }
+    }
+    return lines;
+  }, [protocolActive, measurements, activeLaterality]);
+
+  const handleMeasurementAdd = useCallback(
+    (m: Measurement) => {
+      // If protocol active and step expects a specific primitive, check match
+      if (protocolActive && activeStep) {
+        const stepPrimitive = activeStep.primitive;
+        const mType = m.type;
+        const matches = 
+          (stepPrimitive === 'distance' || stepPrimitive === 'line') 
+            ? (mType === 'distance' || mType === 'line')
+            : stepPrimitive === 'point'
+              ? (mType === 'point')
+              : false;
+        if (!matches) return; // silently reject wrong-tool drawings
+        // Block if this step already has a completed result (no duplicates)
+        if (workflow.stepResults[activeStep.id]) return;
+      }
+
+      const id = m.id || genId();
+      const tagged: Measurement = {
+        ...m,
+        id,
+        patientId: m.patientId ?? activeImage?.patientId,
+        patientName: m.patientName ?? activeImage?.patientName,
+        laterality: activeLaterality,
+        label: activeStep?.label ?? m.label ?? m.type,
+        workflowStepId: activeStep?.id,
+        plane: 'coronal',
+        slice: 0,
+        timestamp: m.timestamp ?? new Date().toISOString(),
+      };
+
+      setMeasurements((prev) => [...prev, tagged]);
+
+      // Record step result and advance
+      if (protocolActive && activeStep) {
+        setWorkflow((prev) => {
+          const stepResults = { ...prev.stepResults, [activeStep.id]: { points: tagged.points, slice: 0, imageScale: tagged.imageScale } };
+          let nextIdx = 0;
+          while (nextIdx < HIP_MEASUREMENT_PROTOCOL.steps.length && stepResults[HIP_MEASUREMENT_PROTOCOL.steps[nextIdx].id]) {
+            nextIdx++;
+          }
+          return { ...prev, stepResults, activeStepIndex: Math.min(nextIdx, HIP_MEASUREMENT_PROTOCOL.steps.length - 1) };
+        });
+      }
+    },
+    [protocolActive, activeStep, activeLaterality, activeImage],
+  );
+
+  const handleMeasurementUpdate = useCallback(
+    (id: string, newPoints: PointUpdater, value?: string, imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number }) => {
+      const key = activeStorageKey;
+      if (!key) return;
+      setMeasurementArchive((prev) => {
+        const cur = prev[key] ?? [];
+        const target = cur.find((m) => m.id === id);
+        if (!target) return prev;
+        const pts = typeof newPoints === 'function' ? newPoints(target.points) : newPoints;
+        // Apply live constraint based on the measurement's workflow step
+        const constrained = constrainPoints(target.workflowStepId, pts, target.points, cur);
+        let next = cur.map((m) => {
+          if (m.id !== id) return m;
+          return { ...m, points: constrained, value: value ?? m.value, imageScale: imageScale ?? m.imageScale };
+        });
+        // Cascade: update all dependent measurements
+        next = cascadeDependents(target.workflowStepId, next);
+        return { ...prev, [key]: next };
+      });
+    },
+    [activeStorageKey],
+  );
+
+  // ── Cascade: when a reference measurement is edited, update all dependents ──
+  const cascadeDependents = (changedStepId: string | undefined, cur: Measurement[]): Measurement[] => {
+    if (!changedStepId) return cur;
+    let next = cur;
+    // Loop through dependency levels (handles transitive: step1→step2→steps3-4)
+    let iteration = 0;
+    while (iteration < 5) {
+      iteration++;
+      const trigger = iteration === 1 ? changedStepId : '';
+      let didChange = false;
+
+      // Re-project perpendicular (step 2) when step 1 or any cascade changes
+      if (trigger === 'femur-shaft-midline' || iteration > 1) {
+        next = next.map((m) => {
+          if (m.workflowStepId !== 'lesser-trochanter-guideline' || m.points.length < 2) return m;
+          const newPts = constrainPoints('lesser-trochanter-guideline', m.points, m.points, next);
+          if (newPts[0]?.x !== m.points[0]?.x || newPts[1]?.x !== m.points[1]?.x) didChange = true;
+          return { ...m, points: newPts };
+        });
+      }
+
+      // Re-project points on lesser trochanter guideline (steps 3-4)
+      if (trigger === 'lesser-trochanter-guideline' || iteration > 1) {
+        next = next.map((m) => {
+          if ((m.workflowStepId !== 'medial-cortical-point' && m.workflowStepId !== 'lateral-cortical-point') || m.points.length < 1) return m;
+          const newPts = constrainPoints(m.workflowStepId, m.points, m.points, next);
+          if (newPts[0]?.x !== m.points[0]?.x || newPts[0]?.y !== m.points[0]?.y) didChange = true;
+          return { ...m, points: newPts };
+        });
+      }
+
+      // Re-project parallel (step 7) when step 5 changes
+      if (trigger === 'femur-neck-width' || iteration > 1) {
+        next = next.map((m) => {
+          if (m.workflowStepId !== 'femur-head-diameter' || m.points.length < 2) return m;
+          const newPts = constrainPoints('femur-head-diameter', m.points, m.points, next);
+          if (newPts[0]?.x !== m.points[0]?.x || newPts[1]?.x !== m.points[1]?.x) didChange = true;
+          return { ...m, points: newPts };
+        });
+      }
+
+      // Recompute midpoint guideline (step 8)
+      if (trigger === 'femur-neck-width' || trigger === 'femur-head-diameter' || iteration > 1) {
+        const neck = next.find((m) => m.workflowStepId === 'femur-neck-width');
+        const head = next.find((m) => m.workflowStepId === 'femur-head-diameter');
+        if (neck && head && neck.points.length >= 2 && head.points.length >= 2) {
+          const neckMid = { x: (neck.points[0].x + neck.points[1].x) / 2, y: (neck.points[0].y + neck.points[1].y) / 2 };
+          const headMid = { x: (head.points[0].x + head.points[1].x) / 2, y: (head.points[0].y + head.points[1].y) / 2 };
+          const oldG = next.find((m) => m.workflowStepId === 'midpoint-guideline');
+          if (oldG && (oldG.points[0]?.x !== neckMid.x || oldG.points[1]?.x !== headMid.x)) {
+            didChange = true;
+            next = next.map((m) => m.workflowStepId === 'midpoint-guideline' ? { ...m, points: [neckMid, headMid] } : m);
+          }
+        }
+      }
+
+      // Re-project points on midpoint guideline (steps 8-10)
+      if (trigger === 'midpoint-guideline' || iteration > 1) {
+        next = next.map((m) => {
+          if ((m.workflowStepId !== 'hip-axis-lateral' && m.workflowStepId !== 'hip-axis-medial' && m.workflowStepId !== 'neck-axis-medial') || m.points.length < 1) return m;
+          const newPts = constrainPoints(m.workflowStepId, m.points, m.points, next);
+          if (newPts[0]?.x !== m.points[0]?.x || newPts[0]?.y !== m.points[0]?.y) didChange = true;
+          return { ...m, points: newPts };
+        });
+      }
+
+      if (!didChange) break;
+    }
+    return next;
+  };
+
+  // ── Helper: constrain points to maintain live perpendicular/parallel/point-on-line ──
+  const constrainPoints = (
+    stepId: string | undefined,
+    newPts: { x: number; y: number }[],
+    oldPts: { x: number; y: number }[],
+    allMeas: Measurement[],
+  ): { x: number; y: number }[] => {
+    if (!stepId || newPts.length === 0) return newPts;
+
+    // Point-on-line: steps 3-4 (on lesser trochanter guideline), steps 8-10 (on midpoint guideline)
+    if (newPts.length === 1) {
+      let guideId: string | undefined;
+      if (stepId === 'medial-cortical-point' || stepId === 'lateral-cortical-point') {
+        guideId = 'lesser-trochanter-guideline';
+      } else if (stepId === 'hip-axis-lateral' || stepId === 'hip-axis-medial' || stepId === 'neck-axis-medial') {
+        guideId = 'midpoint-guideline';
+      }
+      if (guideId) {
+        const guide = allMeas.find((m) => m.workflowStepId === guideId);
+        if (guide && guide.points.length >= 2) {
+          const g0 = guide.points[0], g1 = guide.points[1];
+          const dx = g1.x - g0.x, dy = g1.y - g0.y;
+          const len2 = dx * dx + dy * dy || 1;
+          const t = ((newPts[0].x - g0.x) * dx + (newPts[0].y - g0.y) * dy) / len2;
+          return [{ x: g0.x + dx * t, y: g0.y + dy * t }];
+        }
+      }
+      return newPts;
+    }
+
+    // Perpendicular constraint: step 2 → step 1
+    if (stepId === 'lesser-trochanter-guideline' && newPts.length >= 2) {
+      const ref = allMeas.find((m) => m.workflowStepId === 'femur-shaft-midline');
+      if (ref && ref.points.length >= 2) {
+        const r0 = ref.points[0], r1 = ref.points[1];
+        const rdx = r1.x - r0.x, rdy = r1.y - r0.y;
+        const rlen = Math.hypot(rdx, rdy) || 1;
+        const perpX = -rdy / rlen, perpY = rdx / rlen;
+        // Keep first point fixed, project second point onto perpendicular axis
+        const start = newPts[0];
+        const vx = newPts[1].x - start.x, vy = newPts[1].y - start.y;
+        const proj = vx * perpX + vy * perpY;
+        return [start, { x: start.x + perpX * proj, y: start.y + perpY * proj }];
+      }
+    }
+
+    // Parallel constraint: step 7 → step 6
+    if (stepId === 'femur-head-diameter' && newPts.length >= 2) {
+      const ref = allMeas.find((m) => m.workflowStepId === 'femur-neck-width');
+      if (ref && ref.points.length >= 2) {
+        const r0 = ref.points[0], r1 = ref.points[1];
+        const rdx = r1.x - r0.x, rdy = r1.y - r0.y;
+        const rlen = Math.hypot(rdx, rdy) || 1;
+        const dirX = rdx / rlen, dirY = rdy / rlen;
+        const start = newPts[0];
+        const vx = newPts[1].x - start.x, vy = newPts[1].y - start.y;
+        const proj = vx * dirX + vy * dirY;
+        return [start, { x: start.x + dirX * proj, y: start.y + dirY * proj }];
+      }
+    }
+
+    return newPts;
+  };
+
+  // ── Helper: recompute midpoint guideline from neck width and head diameter ──
+  const recomputeMidpointGuideline = (cur: Measurement[]): Measurement[] => {
+    const neck = cur.find((m) => m.workflowStepId === 'femur-neck-width');
+    const head = cur.find((m) => m.workflowStepId === 'femur-head-diameter');
+    if (!neck || !head || neck.points.length < 2 || head.points.length < 2) return cur;
+    const neckMid = { x: (neck.points[0].x + neck.points[1].x) / 2, y: (neck.points[0].y + neck.points[1].y) / 2 };
+    const headMid = { x: (head.points[0].x + head.points[1].x) / 2, y: (head.points[0].y + head.points[1].y) / 2 };
+    return cur.map((m) => {
+      if (m.workflowStepId === 'midpoint-guideline') {
+        return { ...m, points: [neckMid, headMid] };
+      }
+      return m;
+    });
+  };
+
+  const handleMeasurementDelete = useCallback((id: string) => {
+    // Find the measurement's workflow step before removing
+    const target = measurements.find((m) => m.id === id);
+    setMeasurements((prev) => prev.filter((m) => m.id !== id));
+    if (selectedMeasurementId === id) setSelectedMeasurementId(null);
+    // Also clear the workflow step result so the task list updates
+    if (target?.workflowStepId) {
+      clearSteps([target.workflowStepId]);
+    }
+  }, [measurements, selectedMeasurementId]);
+
+  const clearSteps = (stepIds: string[]) => {
+    // Also cascade: removing step 5 or 6 removes step 7 too
+    const toRemove = new Set(stepIds);
+    if (toRemove.has('femur-neck-width') || toRemove.has('femur-head-diameter')) {
+      toRemove.add('midpoint-guideline');
+    }
+    const removeArr = Array.from(toRemove);
+    setMeasurements((prev) => prev.filter((m) => !removeArr.includes(m.workflowStepId ?? '')));
+    setWorkflow((prev) => {
+      const stepResults = { ...prev.stepResults };
+      for (const sid of removeArr) delete stepResults[sid];
+      let minIdx = Infinity;
+      for (const sid of removeArr) {
+        const idx = HIP_MEASUREMENT_PROTOCOL.steps.findIndex((s) => s.id === sid);
+        if (idx >= 0 && idx < minIdx) minIdx = idx;
+      }
+      return { ...prev, stepResults, activeStepIndex: Math.max(0, minIdx < Infinity ? minIdx : 0) };
+    });
+  };
+
+  const redrawStep = (stepId: string) => {
+    clearSteps([stepId]);
+  };
+
+  const resetProtocol = () => {
+    setMeasurements((prev) => prev.filter((m) => !m.workflowStepId));
+    setWorkflow({ ...initialWorkflow, protocolId: HIP_MEASUREMENT_PROTOCOL.id });
+  };
+
+  // ── Export ─────────────────────────────────────────────────────────
+  const downloadTextFile = (filename: string, text: string) => {
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    a.click(); URL.revokeObjectURL(url);
+  };
+
+  const exportHipCsv = useCallback(() => {
+    const rows: string[] = ['sessionUser,sessionUserEmail,patient,laterality,step,label,type,mm_value,point1_x,point1_y,point2_x,point2_y'];
+    const userCols = [sessionUser ?? '', sessionUserEmail ?? ''].join(',');
+    for (const [key, measList] of Object.entries(measurementArchive)) {
+      const [patientKey, laterality] = key.split('::');
+      // Build step results for this patient+side to compute derived values
+      const stepResults: Record<string, { points: { x: number; y: number }[]; slice: number; imageScale?: any }> = {};
+      for (const m of measList) {
+        if (m.workflowStepId) stepResults[m.workflowStepId] = { points: m.points, slice: 0, imageScale: m.imageScale };
+      }
+      // Compute derived measurements (M1-M10)
+      const computed = HIP_MEASUREMENT_PROTOCOL.compute(stepResults, activePixelSpacing);
+      const derivedLines = computed ? computed.summary.split('\n').filter(Boolean) : [];
+      for (const dl of derivedLines) {
+        const eqIdx = dl.indexOf('=');
+        if (eqIdx > 0) {
+          const label = dl.substring(0, eqIdx).trim();
+          const val = dl.substring(eqIdx + 1).trim();
+          rows.push([userCols, patientKey, laterality, 'derived', label, 'computed', val, '', '', '', ''].join(','));
+        }
+      }
+      // Raw measurements
+      for (const m of measList) {
+        const is = m.imageScale;
+        const sx = (is?.x ?? 1) * activePixelSpacing.x;
+        const sy = (is?.y ?? 1) * activePixelSpacing.y;
+        let mmVal = '';
+        if ((m.type === 'distance' || m.type === 'line') && m.points.length >= 2) {
+          mmVal = Math.hypot((m.points[1].x - m.points[0].x) * sx, (m.points[1].y - m.points[0].y) * sy).toFixed(2);
+        }
+        const p1x = m.points[0]?.x.toFixed(1) ?? '';
+        const p1y = m.points[0]?.y.toFixed(1) ?? '';
+        const p2x = m.points[1]?.x.toFixed(1) ?? '';
+        const p2y = m.points[1]?.y.toFixed(1) ?? '';
+        rows.push([userCols, patientKey, laterality, m.workflowStepId || '', m.label || '', m.type, mmVal, p1x, p1y, p2x, p2y].join(','));
+      }
+    }
+    downloadTextFile(`hip-measurements-${Date.now()}.csv`, rows.join('\n'));
+  }, [measurementArchive, activePixelSpacing, sessionUser, sessionUserEmail]);
+
+  // ── Protocol result (computed from live measurements, not stale workflow state) ──
+  const result = useMemo(() => {
+    if (!protocolActive) return null;
+    // Build step results from current measurements so drags reflect immediately
+    const stepResults: Record<string, { points: { x: number; y: number }[]; slice: number; imageScale?: any }> = {};
+    for (const m of measurements) {
+      if (m.workflowStepId) {
+        stepResults[m.workflowStepId] = { points: m.points, slice: 0, imageScale: m.imageScale };
+      }
+    }
+    const raw = HIP_MEASUREMENT_PROTOCOL.compute(stepResults, activePixelSpacing);
+    if (!raw) return null;
+    // Post-process M10 angle for left/right laterality
+    let summary = raw.summary;
+    const m10Match = summary.match(/M10\. Femur Neck Angle = ([\d.]+)° \(signed: ([\d.-]+)°\)/);
+    if (m10Match) {
+      const unsigned = parseFloat(m10Match[1]);
+      const signed = parseFloat(m10Match[2]);
+      let angle: number;
+      if (activeLaterality === 'left') {
+        // Left: clockwise from hip axis to shaft midline = signed (acute)
+        angle = signed < 0 ? signed + 360 : signed;
+      } else {
+        // Right: counter-clockwise from shaft midline to hip axis
+        // The signed angle is hip axis → shaft midline. To get shaft→hip CCW:
+        angle = signed <= 0 ? -signed : 360 - signed;
+      }
+      summary = summary.replace(m10Match[0], `M10. Femur Neck Angle = ${angle.toFixed(1)}° (${activeLaterality} hip)`);
+    }
+    return { ...raw, summary };
+  }, [protocolActive, measurements, activePixelSpacing, activeLaterality]);
+
+  // ── Auto-create guideline for step 8 when steps 6 & 7 complete ────
+  const prevStepResultsRef = useRef<Record<string, any>>({});
+  useEffect(() => {
+    if (!protocolActive) return;
+    const neckDone = !!workflow.stepResults['femur-neck-width'];
+    const headDone = !!workflow.stepResults['femur-head-diameter'];
+    const wasNeckDone = !!prevStepResultsRef.current['femur-neck-width'];
+    const wasHeadDone = !!prevStepResultsRef.current['femur-head-diameter'];
+    prevStepResultsRef.current = { ...workflow.stepResults };
+    if (!(neckDone && headDone && (!wasNeckDone || !wasHeadDone))) return;
+
+    const neck = workflow.stepResults['femur-neck-width'];
+    const head = workflow.stepResults['femur-head-diameter'];
+    if (!neck || !head || neck.points.length < 2 || head.points.length < 2) return;
+
+    const neckMid = { x: (neck.points[0].x + neck.points[1].x) / 2, y: (neck.points[0].y + neck.points[1].y) / 2 };
+    const headMid = { x: (head.points[0].x + head.points[1].x) / 2, y: (head.points[0].y + head.points[1].y) / 2 };
+
+    if (measurements.some((m) => m.workflowStepId === 'midpoint-guideline')) return;
+
+    const gId = genId();
+    const guideline: Measurement = {
+      id: gId, type: 'distance', points: [neckMid, headMid],
+      slice: 0, plane: 'coronal',
+      laterality: activeLaterality,
+      label: 'Guideline Through Midpoints', workflowStepId: 'midpoint-guideline',
+      timestamp: new Date().toISOString(),
+    };
+    setMeasurements((prev) => [...prev, guideline]);
+    setWorkflow((prev) => {
+      const stepResults = { ...prev.stepResults, 'midpoint-guideline': { points: guideline.points, slice: 0 } };
+      let nextIdx = 0;
+      while (nextIdx < HIP_MEASUREMENT_PROTOCOL.steps.length && stepResults[HIP_MEASUREMENT_PROTOCOL.steps[nextIdx].id]) nextIdx++;
+      return { ...prev, stepResults, activeStepIndex: Math.min(nextIdx, HIP_MEASUREMENT_PROTOCOL.steps.length - 1) };
+    });
+  }, [workflow.stepResults, protocolActive, measurements, activeLaterality]);
+
+  const loaded = activeImage !== null;
+
+  // ── Independent canvas click handler for measurement selection ──
+  const handleCanvasClick = useCallback((x: number, y: number) => {
+    if (userToolOverride !== 'none') return; // only in Select mode
+    // Hit-test all measurements
+    for (const m of measurements) {
+      for (const p of m.points) {
+        if (Math.hypot(p.x - x, p.y - y) <= 15) {
+          setSelectedMeasurementId(m.id);
+          return;
+        }
+      }
+      if ((m.type === 'distance' || m.type === 'line') && m.points.length >= 2) {
+        const a = m.points[0], b = m.points[1];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const len2 = dx * dx + dy * dy || 1;
+        const t = Math.max(0, Math.min(1, ((x - a.x) * dx + (y - a.y) * dy) / len2));
+        const cp = { x: a.x + dx * t, y: a.y + dy * t };
+        if (Math.hypot(cp.x - x, cp.y - y) <= 15) {
+          setSelectedMeasurementId(m.id);
+          return;
+        }
+      }
+    }
+  }, [measurements, userToolOverride]);
+
+  // ── Render ─────────────────────────────────────────────────────────
+  return (
+    <div className="h-full flex">
+      <input ref={dicomInputRef} type="file" webkitdirectory="" directory="" multiple onChange={handleLoadFolder} className="hidden" />
+
+      {/* Center: viewport */}
+      <div className="flex-1 flex flex-col min-h-0 relative">
+        {loaded ? (
+          <Viewport
+            imageData={activeImage!.imageData}
+            header={activeImage!.header}
+            plane="axial"
+            planeLabel={`AP Pelvis — ${activeImage!.patientId}`}
+            measurementPlane="coronal"
+            currentSlice={0}
+            onSliceChange={() => {}}
+            defaultWindowLevel={activeImage!.defaultWindowLevel}
+            activeTool={effectiveTool}
+            measurements={measurements}
+            onMeasurementAdd={handleMeasurementAdd}
+            onMeasurementUpdate={handleMeasurementUpdate}
+            selectedMeasurementId={selectedMeasurementId}
+            onMeasurementSelect={setSelectedMeasurementId}
+            showCrosshair={false}
+            applyWeighting={(v: number) => v}
+            pixelSpacing={activePixelSpacing}
+            measurementUnits="mm"
+            allowNewMeasurements={true}
+            constraintLineId={constraintProps.constraintLineId}
+            constraintMode={constraintProps.constraintMode}
+            snapToLines={shouldSnapToLines}
+            pointConstraintLineId={pointConstraintLineId}
+            guidelineIds={guidelineIds}
+            derivedLines={derivedLines}
+            suppressPerpendicularCreation={protocolActive}
+            onCanvasClick={handleCanvasClick}
+          />
+        ) : (
+          <div className="h-full flex items-center justify-center">
+            <div className="text-center max-w-md">
+              <svg className="mx-auto h-16 w-16 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+              </svg>
+              <h3 className="mt-4 text-lg font-medium text-gray-300">No hip X-ray loaded</h3>
+              <p className="mt-2 text-sm text-gray-500">Select a folder of .dcm files (one per patient AP Pelvis).</p>
+              <div className="mt-4">
+                <Button type="button" onClick={() => dicomInputRef.current?.click()} disabled={busy} className="bg-blue-600 hover:bg-blue-500 text-white">
+                  {busy ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <FolderOpen className="w-4 h-4 mr-2" />}
+                  Load Hip X-ray Folder
+                </Button>
+              </div>
+              {progress && <div className="mt-2 text-[10px] text-gray-400">{progress}</div>}
+            </div>
+          </div>
+        )}
+
+        {/* Patient info overlay */}
+        {loaded && (
+          <div className="absolute top-10 left-2 z-20 bg-black/60 border border-gray-700 rounded px-2 py-1 text-[10px] text-gray-200">
+            <div>Patient: <span className="text-gray-100">{activeImage!.patientId}</span> · {activeImage!.patientName || 'Unknown'}</div>
+            <div>Study: AP Pelvis · Hip: <span className="capitalize">{activeLaterality}</span></div>
+            <div>{activeImage!.rows}×{activeImage!.cols} · {activeImage!.pixelSpacing.x.toFixed(3)} mm/px</div>
+          </div>
+        )}
+
+        {/* Floating bottom-right tool bar */}
+        <div className="absolute bottom-4 right-4 flex flex-col items-center space-y-2" style={{ zIndex: 9999 }}>
+          <ToolTip label="Select">
+            <Button size="sm" variant={effectiveTool === 'none' ? 'default' : 'ghost'} className={effectiveTool === 'none' ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => selectTool('none')} aria-label="Select tool">
+              <MousePointer className="h-4 w-4" />
+            </Button>
+          </ToolTip>
+          <ToolTip label="Distance">
+            <Button size="sm" variant={effectiveTool === 'distance' ? 'default' : 'ghost'} className={effectiveTool === 'distance' ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => selectTool('distance')} aria-label="Distance tool">
+              <Ruler className="h-4 w-4" />
+            </Button>
+          </ToolTip>
+          <ToolTip label="Angle">
+            <Button size="sm" variant={effectiveTool === 'angle' ? 'default' : 'ghost'} className={effectiveTool === 'angle' ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => selectTool('angle')} aria-label="Angle tool">
+              <Triangle className="h-4 w-4" />
+            </Button>
+          </ToolTip>
+          <ToolTip label="Point">
+            <Button size="sm" variant={effectiveTool === 'point' ? 'default' : 'ghost'} className={effectiveTool === 'point' ? 'bg-blue-600 text-white' : 'text-gray-300'} onClick={() => selectTool('point')} aria-label="Point tool">
+              <Dot className="h-4 w-4" />
+            </Button>
+          </ToolTip>
+        </div>
+      </div>
+
+      {/* Resizable divider */}
+      <div
+        role="separator" aria-orientation="vertical" aria-label="Resize right panel"
+        onMouseDown={() => { rightResizing.current = true; document.body.style.cursor = 'col-resize'; }}
+        onTouchStart={() => { rightResizing.current = true; document.body.style.cursor = 'col-resize'; }}
+        onDoubleClick={() => { setRightWidth(288); }}
+        className="w-8 -ml-4 -mr-4 cursor-col-resize relative" style={{ zIndex: 40 }}
+      >
+        <div className="absolute inset-y-0 left-1/2 w-px bg-transparent hover:bg-gray-700" />
+      </div>
+
+      {/* Right panel */}
+      <div style={{ width: rightWidth }} className="flex-shrink-0 bg-gray-900 border-l border-gray-800 p-4 overflow-y-auto h-full">
+        <h2 className="text-sm font-bold text-blue-300 mb-3">Hip X-ray Measurements</h2>
+
+        {/* Load button */}
+        <Button type="button" size="sm" onClick={() => dicomInputRef.current?.click()} disabled={busy} className="bg-blue-600 hover:bg-blue-500 text-white w-full mb-3">
+          {busy ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <FolderOpen className="w-4 h-4 mr-2" />}
+          Load Hip X-ray Folder
+        </Button>
+        {progress && <div className="mb-3 text-[10px] text-gray-400 truncate">{progress}</div>}
+
+        {/* Patient list */}
+        {images.length > 0 && (
+          <div className="mb-4">
+            <div className="text-[10px] font-semibold uppercase tracking-wide text-gray-500 mb-1.5">Patients ({images.length})</div>
+            <div className="space-y-1 max-h-40 overflow-y-auto pr-1">
+              {images.map((img) => (
+                <button key={img.patientKey} type="button" onClick={() => setActiveImageKey(img.patientKey)}
+                  className={`w-full rounded border px-2 py-1.5 text-left text-[10px] transition-colors ${
+                    activeImageKey === img.patientKey ? 'border-blue-500 bg-blue-900/30' : 'border-gray-700 bg-gray-800/80 hover:bg-gray-700'
+                  }`}
+                >
+                  <div className="font-semibold text-gray-100">{img.patientId}</div>
+                  <div className="text-gray-400">{img.patientName}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Left/Right Hip Toggle */}
+        {loaded && (
+          <div className="mb-4">
+            <div className="text-[10px] font-semibold uppercase tracking-wide text-gray-500 mb-1.5">Hip Side</div>
+            <div className="flex gap-1 rounded-md bg-gray-950/80 p-0.5 border border-gray-700">
+              {LATERALITIES.map((lat) => (
+                <button key={lat} type="button" onClick={() => setActiveLaterality(lat)}
+                  className={`flex-1 rounded px-2 py-1 text-[10px] font-medium transition-colors ${
+                    activeLaterality === lat ? 'bg-blue-600 text-white' : 'text-gray-200 hover:bg-gray-700/80'
+                  }`}
+                >{lat === 'left' ? 'Left Hip' : 'Right Hip'}</button>
+              ))}
+            </div>
+            <p className="text-[9px] text-gray-500 mt-1 leading-tight">Same image, toggle tags measurements with this side.</p>
+          </div>
+        )}
+
+        {/* ── Standalone Protocol Workflow ──────────────────────── */}
+        <div className="rounded border border-gray-800 bg-gray-950/50 p-2 mb-3">
+          <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-gray-400">Hip protocol</div>
+          {!protocolActive ? (
+            <button type="button" onClick={() => setWorkflow({ ...initialWorkflow, protocolId: HIP_MEASUREMENT_PROTOCOL.id })}
+              className="w-full rounded border border-emerald-700 bg-emerald-950/40 px-2 py-2 text-left text-xs text-emerald-200 hover:bg-emerald-900/40 transition-colors"
+            >
+              <div className="font-medium">Hip X-ray Measurements</div>
+              <div className="mt-1 text-[10px] text-emerald-400/80">10-measurement protocol for AP Pelvis</div>
+            </button>
+          ) : (
+            <>
+              <div className="rounded border border-emerald-900/50 bg-emerald-950/30 p-2 text-xs text-gray-200 mb-2">
+                <div className="font-medium text-emerald-200">Hip X-ray Measurements</div>
+                <div className="mt-1 text-emerald-400/70 text-[10px]">Active — draw the current step</div>
+              </div>
+
+              <ol className="space-y-1.5 mb-2">
+                {HIP_MEASUREMENT_PROTOCOL.steps.map((step, idx) => {
+                  const done = !!workflow.stepResults[step.id];
+                  const isActive = idx === workflow.activeStepIndex && !done;
+                  const isAuto = step.id === 'midpoint-guideline' || step.id === 'shaft-thickness' || step.id === 'horizontal-offset' || step.id === 'vertical-offset' || step.id === 'femoral-neck-angle';
+                  if (isAuto) {
+                    // Step 7 (midpoint-guideline): show as completed when done
+                    if (step.id === 'midpoint-guideline' && done) {
+                      return (
+                        <li key={step.id} className="rounded p-1.5 text-[10px] bg-gray-800/60 border border-emerald-700/60">
+                          <div className="flex items-start gap-1.5">
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 mt-0.5 flex-shrink-0" />
+                            <div className="flex-1">
+                              <div className="font-medium text-gray-400 line-through">{idx + 1}. {step.label}</div>
+                              <div className="text-emerald-500/70 text-[9px]">Auto-completed</div>
+                            </div>
+                          </div>
+                        </li>
+                      );
+                    }
+                    // Other auto-computed steps — show as info line (no checkmark)
+                    return (
+                      <li key={step.id} className="rounded p-1.5 text-[10px] bg-gray-900/40 border border-dashed border-gray-700/50">
+                        <div className="flex items-start gap-1.5">
+                          <div className="w-3.5 h-3.5 flex-shrink-0" />
+                          <div className="flex-1">
+                            <div className="font-medium text-gray-500 italic">{idx + 1}. {step.label}</div>
+                            <div className="text-gray-600 text-[9px]">Auto-computed</div>
+                          </div>
+                        </div>
+                      </li>
+                    );
+                  }
+                  return (
+                    <li key={step.id}
+                      className={`rounded p-1.5 text-[10px] cursor-pointer ${isActive ? 'bg-blue-900/40 border border-blue-700' : done ? 'bg-gray-800/60' : 'bg-gray-800/30'}`}
+                      onClick={() => {
+                        if (done) {
+                          // Select the measurement and switch to Select tool
+                          const m = measurements.find((mm) => mm.workflowStepId === step.id);
+                          if (m) { setSelectedMeasurementId(m.id); setUserToolOverride('none'); setActiveTool('none'); }
+                        } else {
+                          setWorkflow((prev) => ({ ...prev, activeStepIndex: idx }));
+                        }
+                      }}
+                    >
+                      <div className="flex items-start gap-1.5">
+                        {done ? (
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 mt-0.5 flex-shrink-0" />
+                        ) : (
+                          <Circle className={`w-3.5 h-3.5 mt-0.5 flex-shrink-0 ${isActive ? 'text-blue-400' : 'text-gray-500'}`} />
+                        )}
+                        <div className="flex-1">
+                          <div className={`font-medium ${done ? 'text-gray-400 line-through' : isActive ? 'text-blue-200' : 'text-gray-300'}`}>
+                            {idx + 1}. {step.label}
+                          </div>
+                          {isActive && <div className="text-gray-300 mt-0.5 leading-snug">{step.instruction}</div>}
+                          {done && (
+                            <button className="text-[9px] text-blue-400 hover:text-blue-300 mt-0.5" onClick={(e) => { e.stopPropagation(); redrawStep(step.id); }}>
+                              Redo
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ol>
+
+              {/* Result box */}
+              {result && (
+                <div className="rounded bg-emerald-900/30 border border-emerald-700 p-2 text-[10px] mb-2">
+                  <div className="font-semibold text-emerald-300 whitespace-pre-line">{result.summary}</div>
+                </div>
+              )}
+
+              <Button size="sm" variant="outline" className="w-full border-gray-700 bg-gray-800 text-gray-200 hover:bg-gray-700"
+                onClick={resetProtocol}
+              >
+                <RotateCcw className="w-3 h-3 mr-1" /> Reset measurements
+              </Button>
+              <Button size="sm" variant="ghost" className="mt-1 w-full border border-emerald-700 text-emerald-300 hover:bg-emerald-950/40 hover:text-emerald-200"
+                onClick={exportHipCsv}
+              >
+                Export CSV
+              </Button>
+            </>
+          )}
+        </div>
+
+        {/* ── All measurement values ────────────────────────────── */}
+        {measurements.length > 0 && (
+          <div>
+            <div className="text-[10px] font-semibold uppercase tracking-wide text-gray-500 mb-1.5">Drawn measurements</div>
+            <div className="space-y-1 max-h-60 overflow-y-auto pr-1">
+              {measurements.map((m) => {
+                const is = m.imageScale;
+                const sx = (is?.x ?? 1) * activePixelSpacing.x;
+                const sy = (is?.y ?? 1) * activePixelSpacing.y;
+                let val = '';
+                if ((m.type === 'distance' || m.type === 'line') && m.points.length >= 2) {
+                  const mm = Math.hypot((m.points[1].x - m.points[0].x) * sx, (m.points[1].y - m.points[0].y) * sy);
+                  val = `${mm.toFixed(1)} mm`;
+                } else if (m.type === 'point' && m.points.length >= 1) {
+                  val = `(${m.points[0].x.toFixed(0)}, ${m.points[0].y.toFixed(0)})`;
+                }
+                return (
+                  <div key={m.id} onClick={() => { setSelectedMeasurementId(m.id); }}
+                    className={`rounded p-1.5 text-[10px] cursor-pointer transition-colors ${
+                      selectedMeasurementId === m.id ? 'bg-blue-900/40 border border-blue-700' : 'bg-gray-800/30 hover:bg-gray-800/60'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-1">
+                      <span className="text-gray-300 truncate">{m.label || m.type}</span>
+                      <button className="text-red-400 hover:text-red-300 text-[9px]" onClick={(e) => { e.stopPropagation(); handleMeasurementDelete(m.id); }}>×</button>
+                    </div>
+                    {val && <div className="text-emerald-300 font-mono mt-0.5">{val}</div>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

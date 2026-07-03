@@ -92,6 +92,24 @@ interface ViewportProps {
    *  (not just in Select mode).  Used so reference-line landmarks remain
    *  adjustable even after the workflow advances to the next step. */
   alwaysAllowPointDrag?: boolean;
+  /** When set with constraintMode, the distance/line tool constrains the
+   *  second click to be perpendicular or parallel to this reference line. */
+  constraintLineId?: string | null;
+  /** Type of geometric constraint to apply to distance/line drawing. */
+  constraintMode?: 'none' | 'perpendicular' | 'parallel';
+  /** When true, point placements snap to the nearest guideline line. */
+  snapToLines?: boolean;
+  /** When set, point tool snaps to this specific line ID (takes priority over snapToLines). */
+  pointConstraintLineId?: string | null;
+  /** Set of measurement IDs to render as extended dashed guidelines. */
+  guidelineIds?: Set<string> | null;
+  /** Derived auto-computed lines to render (e.g. offsets, angles). Black dotted. */
+  derivedLines?: { points: { x: number; y: number }[]; label: string }[];
+  /** When true, the Select tool (none) does NOT create perpendiculars on click. */
+  suppressPerpendicularCreation?: boolean;
+  /** When set, fires for every click on the overlay canvas with raw CSS coords.
+   *  The parent can use this for custom hit-testing (e.g. hip protocol selection). */
+  onCanvasClick?: (x: number, y: number) => void;
 }
 
 export function Viewport({
@@ -122,6 +140,14 @@ export function Viewport({
   onReferenceLineClick,
   allowNewMeasurements = true,
   alwaysAllowPointDrag = false,
+  constraintLineId = null,
+  constraintMode = 'none',
+  snapToLines = false,
+  pointConstraintLineId = null,
+  guidelineIds = null,
+  derivedLines = [],
+  suppressPerpendicularCreation = false,
+  onCanvasClick,
 }: ViewportProps) {
   const [wl, setWl] = useState<WindowLevel>(() =>
     sanitizeWindowLevel(defaultWindowLevel.window, defaultWindowLevel.level, defaultWindowLevel),
@@ -261,6 +287,58 @@ export function Viewport({
     }
     return best?.measurement ?? null;
   }, [currentSlice, distanceToSegment]);
+
+  /** Snap (x,y) to the closest point on any nearby line. Returns {x,y} or null. */
+  const snapToNearestLine = useCallback((x: number, y: number): { x: number; y: number } | null => {
+    let best: { x: number; y: number; dist: number } | null = null;
+    for (const measurement of measurementsRef.current) {
+      if ((measurement.plane ?? measurementPlane) !== measurementPlane) continue;
+      if (measurement.type !== 'distance' && measurement.type !== 'line' && measurement.type !== 'perpendicular') continue;
+      if (measurement.points.length < 2) continue;
+      const p0 = measurement.points[0];
+      const p1 = measurement.points[1];
+      const dx = p1.x - p0.x;
+      const dy = p1.y - p0.y;
+      const len2 = dx * dx + dy * dy || 1;
+      const t = Math.max(0, Math.min(1, ((x - p0.x) * dx + (y - p0.y) * dy) / len2));
+      const proj = { x: p0.x + dx * t, y: p0.y + dy * t };
+      const dist = Math.hypot(proj.x - x, proj.y - y);
+      if (dist <= 15 && (!best || dist < best.dist)) {
+        best = { x: proj.x, y: proj.y, dist };
+      }
+    }
+    return best ? { x: best.x, y: best.y } : null;
+  }, [currentSlice]);
+
+  /** Apply a perpendicular/parallel constraint to a point relative to a start point and reference line. */
+  const applyConstraint = useCallback(
+    (startPt: { x: number; y: number }, rawPt: { x: number; y: number }): { x: number; y: number } => {
+      if (!constraintLineId || constraintMode === 'none') return rawPt;
+      const refMeas = measurements.find((m) => m.id === constraintLineId);
+      if (!refMeas || refMeas.points.length < 2) return rawPt;
+      const p0 = refMeas.points[0];
+      const p1 = refMeas.points[1];
+      const dx = p1.x - p0.x;
+      const dy = p1.y - p0.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const vx = rawPt.x - startPt.x;
+      const vy = rawPt.y - startPt.y;
+      if (constraintMode === 'perpendicular') {
+        const perpX = -dy / len;
+        const perpY = dx / len;
+        const proj = vx * perpX + vy * perpY;
+        return { x: startPt.x + perpX * proj, y: startPt.y + perpY * proj };
+      }
+      if (constraintMode === 'parallel') {
+        const dirX = dx / len;
+        const dirY = dy / len;
+        const proj = vx * dirX + vy * dirY;
+        return { x: startPt.x + dirX * proj, y: startPt.y + dirY * proj };
+      }
+      return rawPt;
+    },
+    [constraintLineId, constraintMode, measurements],
+  );
 
   const buildPerpendicularPoints = useCallback((baseLine: Measurement, cursor: { x: number; y: number }) => {
     if (baseLine.points.length < 2) return null;
@@ -1419,8 +1497,10 @@ export function Viewport({
       if ((measurement.type === 'distance' || measurement.type === 'line') && points.length >= 2) {
         ctx.save();
         ctx.globalAlpha = overlayAlpha;
-        // draw baseline (dashed for infinite 'line', solid for distance)
-        if (measurement.type === 'line') {
+
+        // Draw guideline as extended dashed line if its ID is in guidelineIds
+        const isGuideline = guidelineIds?.has(measurement.id);
+        if (isGuideline) {
           const dx = points[1].x - points[0].x;
           const dy = points[1].y - points[0].y;
           const len = Math.hypot(dx, dy) || 1;
@@ -1429,13 +1509,14 @@ export function Viewport({
           const big = (canvas.width + canvas.height) / dpr;
           const a = { x: points[0].x - ux * big, y: points[0].y - uy * big };
           const b = { x: points[1].x + ux * big, y: points[1].y + uy * big };
-          ctx.save();
           ctx.setLineDash([6, 4]);
           ctx.beginPath();
           ctx.moveTo(a.x, a.y);
           ctx.lineTo(b.x, b.y);
           ctx.stroke();
           ctx.restore();
+          ctx.save();
+          ctx.globalAlpha = overlayAlpha;
         }
 
         ctx.beginPath();
@@ -1685,7 +1766,36 @@ export function Viewport({
       ctx.fillText(rlLabel, clearW - labelW / 2 - 8, y - 16);
       ctx.restore();
     }
-  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool, selectedLineId, overlayTick, computedReferenceLines, referenceLine, plane]);
+
+    // ── Derived auto-computed lines (e.g. offsets, angles) ──────────
+    for (const dl of derivedLines) {
+      if (dl.points.length < 2) continue;
+      ctx.save();
+      ctx.setLineDash([4, 4]);
+      ctx.strokeStyle = 'rgba(0, 0, 0, 0.7)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(dl.points[0].x, dl.points[0].y);
+      for (let i = 1; i < dl.points.length; i++) ctx.lineTo(dl.points[i].x, dl.points[i].y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      if (dl.label) {
+        ctx.font = 'bold 9px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        const mx = (dl.points[0].x + dl.points[1].x) / 2;
+        const my = (dl.points[0].y + dl.points[1].y) / 2;
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        const tw = ctx.measureText(dl.label).width + 8;
+        ctx.beginPath();
+        ctx.roundRect(mx - tw / 2, my - 14, tw, 16, 4);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.fillText(dl.label, mx, my - 2);
+      }
+      ctx.restore();
+    }
+  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool, selectedLineId, overlayTick, computedReferenceLines, referenceLine, plane, derivedLines]);
 
   // Calculate measurement value (prefer physical units mm when possible)
   const calculateMeasurementValue = (type: MeasurementTool, points: { x: number; y: number }[]): string => {
@@ -2079,7 +2189,9 @@ export function Viewport({
     } else if (isDrawing) {
       if (activeTool === 'distance' || activeTool === 'line') {
         if (drawingPoints.length > 0) {
-          setDrawingPoints([drawingPoints[0], snapped]);
+          const startPt = drawingPoints[0];
+          const constrained = applyConstraint(startPt, snapped);
+          setDrawingPoints([startPt, constrained]);
         }
       } else if (activeTool === 'angle') {
         // Force overlay re-render on mouse move so the cursor-preview line
@@ -2121,7 +2233,12 @@ export function Viewport({
         suppressClickRef.current = true;
         console.debug('[mouseup] draggingPoint suppressed -> set suppressClick', { x, y, suppressed, dpBefore, lastDragTs: lastDragTimestampRef.current, now: Date.now() });
       } else {
-        console.debug('[mouseup] draggingPoint', { x, y, suppressed, dpBefore, lastDragTs: lastDragTimestampRef.current, now: Date.now() });
+        // Click without drag: select the measurement
+        const clickedMeas = measurementsRef.current.find((m) => m.id === dpBefore.measurementId);
+        if (clickedMeas) {
+          setSelectedLineId(clickedMeas.id);
+          onMeasurementSelect?.(clickedMeas.id);
+        }
       }
       draggingPointRef.current = null;
       setDraggingPoint(null);
@@ -2150,7 +2267,12 @@ export function Viewport({
         suppressClickRef.current = true;
         console.debug('[mouseup] pendingLineDrag suppressed -> set suppressClick', { x, y, suppressed, pendingId: pending?.measurementId ?? null, lastDragTs: lastDragTimestampRef.current, now: Date.now() });
       } else {
-        console.debug('[mouseup] pendingLineDrag', { x, y, suppressed, pendingId: pending?.measurementId ?? null, lastDragTs: lastDragTimestampRef.current, now: Date.now() });
+        // Click on line body without drag: select the measurement
+        const clickedMeas = measurementsRef.current.find((m) => m.id === pending.measurementId);
+        if (clickedMeas) {
+          setSelectedLineId(clickedMeas.id);
+          onMeasurementSelect?.(clickedMeas.id);
+        }
       }
       pendingLineDragRef.current = null;
       lineDragMovedRef.current = false;
@@ -2256,7 +2378,9 @@ export function Viewport({
     // tool and clicking anywhere near a line.  In select mode we also fall
     // back to spatial hit-testing so the user can click the midpoint of any
     // visible line without needing to hover or select it first.
-    if (activeTool === 'none' || activeTool === 'perpendicular') {
+    // When suppressPerpendicularCreation is true, select mode does NOT create
+    // perpendiculars — it only selects/drags.
+    if (!suppressPerpendicularCreation && (activeTool === 'none' || activeTool === 'perpendicular')) {
       let targetLineId: string | null = hoveredLineId ?? selectedLineId ?? null;
       if (!targetLineId) {
         const nearby = findNearbyLine(x, y);
@@ -2344,17 +2468,39 @@ export function Viewport({
       }
     }
 
+    // ── Select mode (none): clicking near a measurement selects it ──
+    if (activeTool === 'none') {
+      // Check all measurements: iterate points first, then line bodies
+      for (const m of measurements) {
+        if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
+        for (const p of m.points) {
+          if (Math.hypot(p.x - x, p.y - y) <= 12) {
+            setSelectedLineId(m.id);
+            onMeasurementSelect?.(m.id);
+            return;
+          }
+        }
+        // Check line body for distance/line types
+        if ((m.type === 'distance' || m.type === 'line') && m.points.length >= 2) {
+          const d = distanceToSegment({ x, y }, m.points[0], m.points[1]);
+          if (d <= 12) {
+            setSelectedLineId(m.id);
+            onMeasurementSelect?.(m.id);
+            return;
+          }
+        }
+      }
+    }
+
     if (activeTool === 'distance' || activeTool === 'line') {
       if (!isDrawing) {
         setIsDrawing(true);
-        // Snap the first anchor when it lands on an existing endpoint so
-        // chaining lines from endpoints works naturally.
         setDrawingPoints([snappedPoint]);
       } else {
-        const points = [...drawingPoints, snappedPoint];
+        const startPt = drawingPoints[0];
+        const endPoint = applyConstraint(startPt, snappedPoint);
+        const points = [startPt, endPoint];
         const value = calculateMeasurementValue('distance', points);
-        // clear drawing state immediately to avoid rendering a transient
-        // stray point while we commit the new measurement
         setIsDrawing(false);
         setDrawingPoints([]);
         const newMeasurement = {
@@ -2366,15 +2512,28 @@ export function Viewport({
           value,
         } as Measurement;
         emitMeasurementAdd(newMeasurement);
-        // select the newly created measurement so immediate drags hit it
         setSelectedLineId(newMeasurement.id);
         onMeasurementSelect?.(newMeasurement.id);
       }
     } else if (activeTool === 'point') {
+      // Snap point: prefer pointConstraintLineId, fall back to generic snapToLines
+      let pt = snappedPoint;
+      if (pointConstraintLineId) {
+        const refMeas = measurements.find((m) => m.id === pointConstraintLineId);
+        if (refMeas && refMeas.points.length >= 2) {
+          const p0 = refMeas.points[0], p1 = refMeas.points[1];
+          const dx = p1.x - p0.x, dy = p1.y - p0.y;
+          const len2 = dx * dx + dy * dy || 1;
+          const t = ((x - p0.x) * dx + (y - p0.y) * dy) / len2;
+          pt = { x: p0.x + dx * t, y: p0.y + dy * t };
+        }
+      } else if (snapToLines) {
+        pt = snapToNearestLine(x, y) ?? snappedPoint;
+      }
       emitMeasurementAdd({
         id: Date.now().toString(),
         type: 'point',
-        points: [snappedPoint],
+        points: [pt],
         slice: currentSlice,
         plane: measurementPlane,
       });
@@ -2838,6 +2997,9 @@ export function Viewport({
                   }
                   pointerActionRef.current.set(e.pointerId, { last: 'up', ts: Date.now() });
                   handleMouseUp(e as any as React.MouseEvent<HTMLCanvasElement>);
+                  // Fire raw click for parent custom hit-testing
+                  const rect = overlayCanvasRef.current?.getBoundingClientRect();
+                  if (rect) onCanvasClick?.(e.clientX - rect.left, e.clientY - rect.top);
                 }}
                 onPointerLeave={(e) => {
                   handleMouseLeave();
@@ -2855,7 +3017,8 @@ export function Viewport({
               <span className="absolute right-1 top-1/2 -translate-y-1/2 text-[11px] text-white/75 pointer-events-none select-none z-10">{orientationLabels.right}</span>
             </div>
 
-            {/* Vertical slice slider in the non-image area to the right */}
+            {/* Vertical slice slider — hidden for single-slice images */}
+            {maxSlice > 1 && (
             <div ref={sliderRef} className="ml-4 flex flex-col items-center" style={{ height: `${displayH}px`, minHeight: '56px' }}>
               <div className="text-[11px] text-gray-400 mb-1 select-none">{orientationLabels.sliderTop}</div>
               <div className="text-xs text-gray-200 mb-1">{currentSlice + 1}</div>
@@ -2873,6 +3036,7 @@ export function Viewport({
               <div className="text-xs text-gray-200 mt-1">{maxSlice}</div>
               <div className="text-[11px] text-gray-400 mt-1 select-none">{orientationLabels.sliderBottom}</div>
             </div>
+            )}
           </div>
         </div>
       </div>

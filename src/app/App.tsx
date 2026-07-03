@@ -32,6 +32,9 @@ import {
   type SessionAnnotator,
 } from '@/app/lib/sessionAnnotationCsv';
 import { exportProtocolMeasurementsToCsv } from '@/app/lib/protocolMeasurementCsv';
+import { HipXrayViewer } from '@/app/components/hip/HipXrayViewer';
+
+type AppMode = 'select' | 'knee-mri' | 'hip-xray';
 
 /** Compute the image-pixel distance for a distance/line/perpendicular measurement. */
 function computePxDistance(
@@ -188,6 +191,7 @@ function AnnotatorSessionModal({
 
 function App() {
   const [niftiData, setNiftiData] = useState<ArrayBuffer | null>(null);
+  const [appMode, setAppMode] = useState<AppMode>('select');
   const [patientStudies, setPatientStudies] = useState<PatientStudyRecord[]>([]);
   const [activePatientKey, setActivePatientKey] = useState<string | null>(null);
   const [, setFileName] = useState<string>('');
@@ -600,8 +604,96 @@ function App() {
     }
   };
 
+  // ── Mode Selection Screen ────────────────────────────────────────────
+  if (appMode === 'select') {
+    return (
+      <div className="h-screen w-screen bg-gray-950 flex flex-col items-center justify-center overflow-hidden">
+        <div className="text-center max-w-lg px-6">
+          <h1 className="text-3xl font-bold text-white mb-2">Medical Image Viewer</h1>
+          <p className="text-gray-400 text-sm mb-10">
+            Select an imaging modality to begin measurements.
+          </p>
+          <div className="grid grid-cols-1 gap-5">
+            <button
+              type="button"
+              onClick={() => setAppMode('knee-mri')}
+              className="group relative rounded-xl border-2 border-blue-800 bg-blue-950/40 p-8 text-left transition-all hover:border-blue-500 hover:bg-blue-900/40 hover:shadow-lg hover:shadow-blue-900/30"
+            >
+              <div className="text-lg font-bold text-blue-200 group-hover:text-blue-100 mb-2">
+                🦵 Knee MRIs
+              </div>
+              <div className="text-sm text-blue-400/80 group-hover:text-blue-300 leading-relaxed">
+                Multi-planar DICOM studies. Load axial, sagittal, and coronal sequences per knee.
+                TT-TG, Insall–Salvati, and patellar tilt measurement protocols.
+              </div>
+              <div className="mt-3 text-xs text-blue-500/60 group-hover:text-blue-400">
+                Supports NIfTI and DICOM folders →
+              </div>
+            </button>
+            <button
+              type="button"
+              onClick={() => setAppMode('hip-xray')}
+              className="group relative rounded-xl border-2 border-emerald-800 bg-emerald-950/40 p-8 text-left transition-all hover:border-emerald-500 hover:bg-emerald-900/40 hover:shadow-lg hover:shadow-emerald-900/30"
+            >
+              <div className="text-lg font-bold text-emerald-200 group-hover:text-emerald-100 mb-2">
+                🦴 Hip X-rays
+              </div>
+              <div className="text-sm text-emerald-400/80 group-hover:text-emerald-300 leading-relaxed">
+                AP Pelvis computed radiography. Single coronal image per patient with bilateral hip assessment.
+                10-measurement protocol: cortical thickness, neck width, head diameter, axis lengths, offsets, and neck angle.
+              </div>
+              <div className="mt-3 text-xs text-emerald-500/60 group-hover:text-emerald-400">
+                Load a folder of .dcm files (one per patient) →
+              </div>
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Hip X-ray Mode ───────────────────────────────────────────────────
+  if (appMode === 'hip-xray') {
+    return (
+      <div className="h-screen w-screen bg-gray-950 flex flex-col overflow-hidden">
+        <AnnotatorSessionModal open={annotator === null} onSubmit={setAnnotator} />
+        {/* Top bar with back button */}
+        <header className="h-10 border-b border-gray-800 bg-gray-900 flex items-center justify-between px-3 shrink-0">
+          <button
+            type="button"
+            onClick={() => setAppMode('select')}
+            className="text-xs text-gray-400 hover:text-gray-200 transition-colors flex items-center gap-1"
+          >
+            ← Back to mode selection
+          </button>
+          <span className="text-xs text-gray-500">Hip X-ray Measurement Mode</span>
+          <div className="w-20" /> {/* spacer */}
+        </header>
+        <div className="flex-1 min-h-0">
+          <HipXrayViewer
+            sessionUser={annotator?.name}
+            sessionUserEmail={annotator?.email}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  // ── Knee MRI Mode (existing) ─────────────────────────────────────────
   return (
     <div className="h-screen w-screen bg-gray-950 flex flex-col overflow-hidden">
+      {/* Top bar with back button */}
+      <header className="h-10 border-b border-gray-800 bg-gray-900 flex items-center justify-between px-3 shrink-0">
+        <button
+          type="button"
+          onClick={() => setAppMode('select')}
+          className="text-xs text-gray-400 hover:text-gray-200 transition-colors flex items-center gap-1"
+        >
+          ← Back to mode selection
+        </button>
+        <span className="text-xs text-gray-500">Knee MRI Measurement Mode</span>
+        <div className="w-20" /> {/* spacer */}
+      </header>
       <AnnotatorSessionModal open={annotator === null} onSubmit={setAnnotator} />
       <main className="flex-1 overflow-hidden flex min-h-0">
         <aside className="w-72 border-r border-gray-800 bg-gray-900 p-3 overflow-y-auto flex flex-col gap-3 shrink-0">

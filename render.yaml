@@ -2,7 +2,7 @@ services:
   - type: web
     name: msk-annotation-suite
     env: static
-    buildCommand: npm install && npm run build
+    buildCommand: pnpm install && pnpm build
     staticPublishPath: ./dist
     pullRequestPreviewsEnabled: true
     headers:
