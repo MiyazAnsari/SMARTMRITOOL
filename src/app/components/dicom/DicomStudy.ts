@@ -136,7 +136,7 @@ export async function loadDicomStudy(
   const files = Array.from(fileList).filter((f) => isProbablyDicom(f.name));
   const groups = groupFilesByDirectory(files);
 
-  const firstRel = (files[0] as File & { webkitRelativePath?: string })?.webkitRelativePath || files[0]?.name || 'Study';
+  const firstRel = ((files[0] as File & { webkitRelativePath?: string })?.webkitRelativePath || files[0]?.name || 'Study').replace(/\\/g, '/');
   let studyName = studyNameOverride || firstRel.split('/')[0] || 'Study';
 
   // If the folder-derived name looks like a laterality folder (LeftKnee /
@@ -157,13 +157,15 @@ export async function loadDicomStudy(
     );
 
     const firstRelPath =
-      (dirFiles[0] as File & { webkitRelativePath?: string })?.webkitRelativePath || dirFiles[0]?.name || '';
+      ((dirFiles[0] as File & { webkitRelativePath?: string })?.webkitRelativePath || dirFiles[0]?.name || '').replace(/\\/g, '/');
     const dirHint = planeFromName(dir.split('/').pop() || dir);
     const pathHint = planeHintFromRelativePath(firstRelPath);
 
     // Pass folder-name hints to loadDicomSeries — detectPlane will use them
     // only as a last resort after IOP and SeriesDescription.
-    const vol = await loadDicomSeries(buffers, (dirHint ?? pathHint) || undefined);
+    const vol = await loadDicomSeries(buffers, (dirHint ?? pathHint) || undefined, 'left', {
+      allowedModalities: ['MR'],
+    });
     if (!vol) continue;
 
     // DICOM-determined plane (from IOP) is authoritative; folder hints are

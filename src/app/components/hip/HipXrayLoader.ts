@@ -11,6 +11,7 @@ export interface HipXrayImage {
   patientId: string;
   patientName: string;
   studyInstanceUID: string;
+  modality: string;
   fileName: string;
   /** 8-bit normalized pixel data: [slice][row][col] with slice=1 */
   imageData: Uint8Array;
@@ -97,6 +98,11 @@ export function parseHipXrayDicom(buffer: ArrayBuffer, fileName: string): HipXra
   const seriesDescription = (dataSet.string(TAG.seriesDescription) || '').trim();
   const modality = (dataSet.string(TAG.modality) || '').trim();
 
+  if (modality && !['CR', 'DX', 'DR', 'XA'].includes(modality.toUpperCase())) {
+    console.info(`[HipXray] Skipping non-radiograph modality ${modality} in ${fileName}`);
+    return null;
+  }
+
   const sliceSize = rows * cols;
 
   // Read raw pixel data
@@ -162,6 +168,7 @@ export function parseHipXrayDicom(buffer: ArrayBuffer, fileName: string): HipXra
     patientId,
     patientName: patientName || patientId,
     studyInstanceUID,
+    modality: modality || 'CR',
     fileName,
     imageData: normalized,
     header,

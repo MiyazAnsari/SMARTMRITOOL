@@ -28,6 +28,7 @@ export interface DicomVolume {
   plane: Plane;
   laterality: Laterality;
   seriesDescription: string;
+  modality: string;
   patientId: string;
   patientName: string;
   studyInstanceUID: string;
@@ -49,6 +50,7 @@ interface ParsedSlice {
   windowCenter?: number;
   windowWidth?: number;
   seriesDescription: string;
+  modality: string;
   laterality?: string;
   patientId: string;
   patientName: string;
@@ -77,6 +79,7 @@ const tag = {
   imagePositionPatient: 'x00200032',
   imageOrientationPatient: 'x00200037',
   seriesDescription: 'x0008103e',
+  modality: 'x00080060',
   laterality: 'x00200060',
   patientId: 'x00100020',
   patientName: 'x00100010',
@@ -164,6 +167,7 @@ function parseDicomFile(buffer: ArrayBuffer): ParsedSlice | null {
     | [number, number, number, number, number, number]
     | undefined;
   const seriesDescription = dataSet.string(tag.seriesDescription) || '';
+  const modality = (dataSet.string(tag.modality) || '').trim().toUpperCase();
   const laterality = dataSet.string(tag.laterality) || undefined;
   const patientId = (dataSet.string(tag.patientId) || '').trim();
   const patientName = (dataSet.string(tag.patientName) || '').replace(/\^/g, ' ').trim();
@@ -206,6 +210,7 @@ function parseDicomFile(buffer: ArrayBuffer): ParsedSlice | null {
     windowCenter,
     windowWidth,
     seriesDescription,
+    modality,
     laterality,
     patientId,
     patientName,
@@ -264,6 +269,7 @@ export async function loadDicomSeries(
   files: { name: string; buffer: ArrayBuffer }[],
   hint?: string,
   laterality: Laterality = 'left',
+  options?: { allowedModalities?: string[] },
 ): Promise<DicomVolume | null> {
   if (!files.length) return null;
 
@@ -274,10 +280,33 @@ export async function loadDicomSeries(
   }
   if (!parsed.length) return null;
 
+  const allowedModalities = options?.allowedModalities?.map((m) => m.trim().toUpperCase()).filter(Boolean);
+  const modCandidates = allowedModalities && allowedModalities.length > 0 ? allowedModalities : null;
+  const modalityGroups = new Map<string, ParsedSlice[]>();
+  for (const slice of parsed) {
+    const modality = (slice.modality || 'UNKNOWN').toUpperCase();
+    const arr = modalityGroups.get(modality) || [];
+    arr.push(slice);
+    modalityGroups.set(modality, arr);
+  }
+
+  let modalityToUse: string | null = null;
+  if (modCandidates) {
+    modalityToUse = modCandidates.find((m) => modalityGroups.has(m)) || null;
+    if (!modalityToUse) return null;
+  }
+  if (!modalityToUse && modalityGroups.size === 1) {
+    modalityToUse = modalityGroups.keys().next().value || null;
+  }
+  if (!modalityToUse) return null;
+
+  const modalitySlices = modalityGroups.get(modalityToUse) || [];
+  if (!modalitySlices.length) return null;
+
   // All slices in a series should share rows/cols — drop oddballs
-  const baseRows = parsed[0].rows;
-  const baseCols = parsed[0].cols;
-  const consistent = parsed.filter((s) => s.rows === baseRows && s.cols === baseCols);
+  const baseRows = modalitySlices[0].rows;
+  const baseCols = modalitySlices[0].cols;
+  const consistent = modalitySlices.filter((s) => s.rows === baseRows && s.cols === baseCols);
   if (!consistent.length) return null;
 
   const plane = detectPlane(consistent[0], hint);
@@ -406,6 +435,7 @@ export async function loadDicomSeries(
     plane,
     laterality: laterality ?? dicomLaterality ?? 'left',
     seriesDescription: consistent[0].seriesDescription || hint || plane,
+    modality: consistent[0].modality || 'UNKNOWN',
     patientId: consistent[0].patientId || 'unknown-patient',
     patientName: consistent[0].patientName || 'Unknown Patient',
     studyInstanceUID: consistent[0].studyInstanceUID || '',
@@ -423,7 +453,7 @@ export async function loadDicomSeries(
 export function groupFilesByDirectory(files: File[]): Map<string, File[]> {
   const groups = new Map<string, File[]>();
   for (const f of files) {
-    const rel = (f as any).webkitRelativePath || f.name;
+    const rel = ((f as any).webkitRelativePath || f.name || '').replace(/\\/g, '/');
     const parts = rel.split('/');
     const dir = parts.length > 1 ? parts.slice(0, -1).join('/') : '';
     const arr = groups.get(dir) || [];
