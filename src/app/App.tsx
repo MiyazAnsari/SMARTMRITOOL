@@ -494,10 +494,8 @@ function App() {
     // ---- resolve the merge key -------------------------------------------
     // Priority:
     //  1. Same StudyInstanceUID (most reliable)
-    //  2. Same real PatientID AND different batchId — handles left-knee /
-    //     right-knee loaded in separate folder-pick operations.  Studies
-    //     loaded together in the same batch share a batchId token and are
-    //     guaranteed to be different patients — never merge them.
+    //  2. Same real PatientID — merges bilateral studies for the same patient
+    //     whether they were selected together or loaded separately.
     //  3. Fallback: patientId::studyName
     let existingKey: string | undefined;
 
@@ -506,9 +504,7 @@ function App() {
     }
     if (!existingKey && realPatientId) {
       existingKey = prev.find(
-        (r) =>
-          r.study.patientId === realPatientId &&
-          !(study.batchId && r.study.batchId === study.batchId),
+        (r) => r.study.patientId === realPatientId,
       )?.key;
     }
 

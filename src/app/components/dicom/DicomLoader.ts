@@ -27,12 +27,21 @@ export interface DicomVolume {
   defaultWindowLevel: { window: number; level: number };
   plane: Plane;
   laterality: Laterality;
+  /** Raw DICOM Laterality tag (0020,0060) — undefined when absent. */
+  dicomLateralityRaw?: string;
   seriesDescription: string;
   modality: string;
+  seriesNumber?: string;
+  acquisitionNumber?: string;
+  protocolName?: string;
+  studyDescription?: string;
+  bodyPartExamined?: string;
+  imageType?: string;
   patientId: string;
   patientName: string;
   studyInstanceUID: string;
   seriesInstanceUID: string;
+  sopInstanceUID: string;
   sliceCount: number;
   origin: 'dicom';
 }
@@ -51,11 +60,32 @@ interface ParsedSlice {
   windowWidth?: number;
   seriesDescription: string;
   modality: string;
+  seriesNumber?: string;
+  acquisitionNumber?: string;
+  protocolName?: string;
+  studyDescription?: string;
+  bodyPartExamined?: string;
+  imageType?: string;
   laterality?: string;
   patientId: string;
   patientName: string;
   studyInstanceUID: string;
   seriesInstanceUID: string;
+  sopInstanceUID: string;
+}
+
+export interface DicomFileMetadata {
+  patientId: string;
+  patientName: string;
+  studyInstanceUID: string;
+  seriesInstanceUID: string;
+  seriesDescription: string;
+  modality: string;
+  laterality?: string;
+  imagePositionPatient?: [number, number, number];
+  imageOrientationPatient?: [number, number, number, number, number, number];
+  instanceNumber: number;
+  sliceLocation: number;
 }
 
 const tag = {
@@ -80,6 +110,13 @@ const tag = {
   imageOrientationPatient: 'x00200037',
   seriesDescription: 'x0008103e',
   modality: 'x00080060',
+  imageType: 'x00080008',
+  studyDescription: 'x00081030',
+  protocolName: 'x00181030',
+  bodyPartExamined: 'x00180015',
+  seriesNumber: 'x00200011',
+  acquisitionNumber: 'x00200012',
+  sopInstanceUID: 'x00080018',
   laterality: 'x00200060',
   patientId: 'x00100020',
   patientName: 'x00100010',
@@ -168,11 +205,18 @@ function parseDicomFile(buffer: ArrayBuffer): ParsedSlice | null {
     | undefined;
   const seriesDescription = dataSet.string(tag.seriesDescription) || '';
   const modality = (dataSet.string(tag.modality) || '').trim().toUpperCase();
+  const seriesNumber = dataSet.string(tag.seriesNumber) || undefined;
+  const acquisitionNumber = dataSet.string(tag.acquisitionNumber) || undefined;
+  const protocolName = dataSet.string(tag.protocolName) || undefined;
+  const studyDescription = dataSet.string(tag.studyDescription) || undefined;
+  const bodyPartExamined = dataSet.string(tag.bodyPartExamined) || undefined;
+  const imageType = dataSet.string(tag.imageType) || undefined;
   const laterality = dataSet.string(tag.laterality) || undefined;
   const patientId = (dataSet.string(tag.patientId) || '').trim();
   const patientName = (dataSet.string(tag.patientName) || '').replace(/\^/g, ' ').trim();
   const studyInstanceUID = (dataSet.string(tag.studyInstanceUID) || '').trim();
   const seriesInstanceUID = (dataSet.string(tag.seriesInstanceUID) || '').trim();
+  const sopInstanceUID = (dataSet.string(tag.sopInstanceUID) || '').trim();
 
   const numFrames = parseInt(dataSet.string(tag.numberOfFrames) || '1', 10) || 1;
   const sliceSize = rows * cols;
@@ -211,11 +255,56 @@ function parseDicomFile(buffer: ArrayBuffer): ParsedSlice | null {
     windowWidth,
     seriesDescription,
     modality,
+    seriesNumber,
+    acquisitionNumber,
+    protocolName,
+    studyDescription,
+    bodyPartExamined,
+    imageType,
     laterality,
     patientId,
     patientName,
     studyInstanceUID,
     seriesInstanceUID,
+    sopInstanceUID,
+  };
+}
+
+export function peekDicomFileMetadata(buffer: ArrayBuffer): DicomFileMetadata | null {
+  const byteArray = new Uint8Array(buffer);
+  let dataSet: any;
+  try {
+    dataSet = dicomParser.parseDicom(byteArray);
+  } catch (e) {
+    console.info('Skipping non-DICOM or unsupported DICOM file', e);
+    return null;
+  }
+
+  const instanceNumber = parseInt(dataSet.string(tag.instanceNumber) || '0', 10) || 0;
+  const sliceLocation = readFloatString(dataSet, tag.sliceLocation) ?? instanceNumber;
+  return {
+    patientId: (dataSet.string(tag.patientId) || '').trim(),
+    patientName: (dataSet.string(tag.patientName) || '').replace(/\^/g, ' ').trim(),
+    studyInstanceUID: (dataSet.string(tag.studyInstanceUID) || '').trim(),
+    seriesInstanceUID: (dataSet.string(tag.seriesInstanceUID) || '').trim(),
+    seriesDescription: dataSet.string(tag.seriesDescription) || '',
+    modality: (dataSet.string(tag.modality) || '').trim().toUpperCase(),
+    seriesNumber: dataSet.string(tag.seriesNumber) || undefined,
+    acquisitionNumber: dataSet.string(tag.acquisitionNumber) || undefined,
+    protocolName: dataSet.string(tag.protocolName) || undefined,
+    studyDescription: dataSet.string(tag.studyDescription) || undefined,
+    bodyPartExamined: dataSet.string(tag.bodyPartExamined) || undefined,
+    imageType: dataSet.string(tag.imageType) || undefined,
+    laterality: dataSet.string(tag.laterality) || undefined,
+    imagePositionPatient: readFloatArray(dataSet, tag.imagePositionPatient) as
+      | [number, number, number]
+      | undefined,
+    imageOrientationPatient: readFloatArray(dataSet, tag.imageOrientationPatient) as
+      | [number, number, number, number, number, number]
+      | undefined,
+    instanceNumber,
+    sliceLocation,
+    sopInstanceUID: (dataSet.string(tag.sopInstanceUID) || '').trim(),
   };
 }
 
@@ -224,7 +313,16 @@ function parseDicomFile(buffer: ArrayBuffer): ParsedSlice | null {
  * SeriesDescription text, with folder-name hints as the last resort.
  */
 function detectPlane(slice: ParsedSlice, hint?: string): Plane {
-  // 1. ImageOrientationPatient — authoritative DICOM geometry
+  // 1. SeriesDescription text — most reliable for MPR/reformatted images
+  //    where IOP can be ambiguous.  Explicit labels like AX_MPR_LEFT,
+  //    SAG_IW_TSE_LEFT, COR_MPR_LEFT are authoritative.
+  const desc = (slice.seriesDescription || '').toLowerCase();
+  if (/\bax(?:ial)?\b|\btra(?:nsverse)?\b/.test(desc)) return 'axial';
+  if (/\bsag(?:ittal)?\b/.test(desc)) return 'sagittal';
+  if (/\bcor(?:onal)?\b/.test(desc)) return 'coronal';
+
+  // 2. ImageOrientationPatient — DICOM geometry, reliable for original
+  //    acquisitions but can be misleading for DERIVED / MPR images.
   const iop = slice.imageOrientationPatient;
   if (iop && iop.length === 6) {
     const r = [iop[0], iop[1], iop[2]];
@@ -241,12 +339,6 @@ function detectPlane(slice: ParsedSlice, hint?: string): Plane {
     if (ax >= ay && ax >= az) return 'sagittal';
     return 'coronal';
   }
-
-  // 2. SeriesDescription text (often contains "axial", "sagittal", "coronal")
-  const desc = (slice.seriesDescription || '').toLowerCase();
-  if (/\bsag(?:ittal)?\b/.test(desc)) return 'sagittal';
-  if (/\bcor(?:onal)?\b/.test(desc)) return 'coronal';
-  if (/\bax(?:ial)?\b|\btra(?:nsverse)?\b/.test(desc)) return 'axial';
 
   // 3. Folder-name hint (lowest priority — only when DICOM metadata is absent)
   if (hint) {
@@ -293,10 +385,16 @@ export async function loadDicomSeries(
   let modalityToUse: string | null = null;
   if (modCandidates) {
     modalityToUse = modCandidates.find((m) => modalityGroups.has(m)) || null;
-    if (!modalityToUse) return null;
+    if (!modalityToUse) {
+      if (modalityGroups.size === 1 && modalityGroups.has('UNKNOWN')) {
+        modalityToUse = 'UNKNOWN';
+      } else {
+        return null;
+      }
+    }
   }
-  if (!modalityToUse && modalityGroups.size === 1) {
-    modalityToUse = modalityGroups.keys().next().value || null;
+  if (!modalityToUse) {
+    modalityToUse = (modalityGroups.keys().next().value as string | undefined) || null;
   }
   if (!modalityToUse) return null;
 
@@ -434,6 +532,7 @@ export async function loadDicomSeries(
     defaultWindowLevel: { window: defaultWindow, level: defaultLevel },
     plane,
     laterality: laterality ?? dicomLaterality ?? 'left',
+    dicomLateralityRaw: consistent[0].laterality,
     seriesDescription: consistent[0].seriesDescription || hint || plane,
     modality: consistent[0].modality || 'UNKNOWN',
     patientId: consistent[0].patientId || 'unknown-patient',

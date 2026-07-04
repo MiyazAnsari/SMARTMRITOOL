@@ -1,10 +1,9 @@
 import {
   DicomVolume,
   Plane,
-  groupFilesByDirectory,
   isProbablyDicom,
   loadDicomSeries,
-  readLateralityFromDicomBuffer,
+  peekDicomFileMetadata,
 } from './DicomLoader';
 import {
   type Laterality,
@@ -62,30 +61,6 @@ export function mergeStudies(existing: DicomStudy, incoming: DicomStudy): DicomS
   };
 }
 
-const PLANE_HINTS: Array<{ pattern: RegExp; plane: Plane }> = [
-  { pattern: /(^|\W)a[_\s-]*dicom(\W|$)|axial|tra(?:nsverse)?|^ax\b/i, plane: 'axial' },
-  { pattern: /(^|\W)s[_\s-]*dicom(\W|$)|sagittal|^sag\b/i, plane: 'sagittal' },
-  { pattern: /(^|\W)c[_\s-]*dicom(\W|$)|coronal|^cor\b/i, plane: 'coronal' },
-];
-
-function planeFromName(name: string): Plane | null {
-  for (const { pattern, plane } of PLANE_HINTS) {
-    if (pattern.test(name)) return plane;
-  }
-  return null;
-}
-
-/** Scan every path segment (folder or file name) for A_/S_/C_DICOM-style hints. */
-function planeHintFromRelativePath(rel: string): Plane | null {
-  const norm = rel.replace(/\\/g, '/');
-  for (const segment of norm.split('/')) {
-    if (!segment) continue;
-    const p = planeFromName(segment);
-    if (p) return p;
-  }
-  return null;
-}
-
 function assignVolume(
   knees: DicomStudy['knees'],
   laterality: Laterality,
@@ -123,6 +98,39 @@ function rebalanceKneesFromMetadata(knees: DicomStudy['knees']): void {
   }
 }
 
+/** Detect a plane from a SeriesDescription string (same rules as detectPlane). */
+function planeFromSeriesDescription(desc: string | undefined): Plane | null {
+  if (!desc) return null;
+  const d = desc.toLowerCase();
+  if (/\bax(?:ial)?\b|\btra(?:nsverse)?\b/.test(d)) return 'axial';
+  if (/\bsag(?:ittal)?\b/.test(d)) return 'sagittal';
+  if (/\bcor(?:onal)?\b/.test(d)) return 'coronal';
+  return null;
+}
+
+/**
+ * Fix volumes that landed in the wrong plane bucket because detectPlane was
+ * misled by ambiguous IOP values (common for DERIVED / MPR images).  Uses
+ * SeriesDescription to determine the correct plane.
+ */
+function resolvePlaneConflicts(knees: DicomStudy['knees']): void {
+  for (const lat of ['left', 'right'] as Laterality[]) {
+    for (const plane of ['axial', 'sagittal', 'coronal'] as Plane[]) {
+      const vol = knees[lat].volumes[plane];
+      if (!vol) continue;
+      const descPlane = planeFromSeriesDescription(vol.seriesDescription);
+      if (!descPlane || descPlane === plane) continue;
+
+      // This volume's SeriesDescription says it belongs to a different plane.
+      const dest = knees[lat].volumes[descPlane];
+      if (!dest || vol.sliceCount > dest.sliceCount) {
+        knees[lat].volumes[descPlane] = vol;
+      }
+      delete knees[lat].volumes[plane];
+    }
+  }
+}
+
 /**
  * Load a full knee-MRI study (folder containing A_DICOM, S_DICOM, C_DICOM
  * subfolders, optionally under LeftKnee/RightKnee) by reading every file once
@@ -134,58 +142,54 @@ export async function loadDicomStudy(
   studyNameOverride?: string,
 ): Promise<DicomStudy> {
   const files = Array.from(fileList).filter((f) => isProbablyDicom(f.name));
-  const groups = groupFilesByDirectory(files);
+  const records = await Promise.all(
+    files.map(async (file) => ({
+      file,
+      buffer: await file.arrayBuffer(),
+      meta: null as ReturnType<typeof peekDicomFileMetadata>,
+    })),
+  );
 
-  const firstRel = ((files[0] as File & { webkitRelativePath?: string })?.webkitRelativePath || files[0]?.name || 'Study').replace(/\\/g, '/');
-  let studyName = studyNameOverride || firstRel.split('/')[0] || 'Study';
+  for (const record of records) {
+    record.meta = peekDicomFileMetadata(record.buffer);
+  }
 
-  // If the folder-derived name looks like a laterality folder (LeftKnee /
-  // RightKnee), a DICOM plane folder (A_DICOM / S_DICOM / C_DICOM), or a bare
-  // filename with an extension, defer to the DICOM PatientName (or PatientID)
-  // which we will have after parsing the series below.
-  const isGenericFolderName =
-    /^(left|right)[\s_-]*knee|knee[\s_-]*(left|right)|^(lk|rk)$/i.test(studyName) ||
-    /^[asc][_\s-]*dicom$/i.test(studyName) ||
-    /\.[a-z0-9]{1,6}$/i.test(studyName);
+  const studyName = studyNameOverride || 'Study';
+
+  const seriesGroups = new Map<string, typeof records>();
+  for (const record of records) {
+    const meta = record.meta;
+    if (!meta) continue;
+    const key =
+      meta.seriesInstanceUID ||
+      (meta.studyInstanceUID
+        ? `${meta.studyInstanceUID}::${meta.modality || 'UNKNOWN'}::${meta.seriesDescription || record.file.name}`
+        : record.file.name);
+    const arr = seriesGroups.get(key) || [];
+    arr.push(record);
+    seriesGroups.set(key, arr);
+  }
 
   const knees = emptyKnees();
 
-  for (const [dir, dirFiles] of groups) {
-    onProgress?.(`Reading ${dir || 'series'} (${dirFiles.length} files)…`);
-    const buffers = await Promise.all(
-      dirFiles.map(async (f) => ({ name: f.name, buffer: await f.arrayBuffer() })),
-    );
-
-    const firstRelPath =
-      ((dirFiles[0] as File & { webkitRelativePath?: string })?.webkitRelativePath || dirFiles[0]?.name || '').replace(/\\/g, '/');
-    const dirHint = planeFromName(dir.split('/').pop() || dir);
-    const pathHint = planeHintFromRelativePath(firstRelPath);
-
-    // Pass folder-name hints to loadDicomSeries — detectPlane will use them
-    // only as a last resort after IOP and SeriesDescription.
-    const vol = await loadDicomSeries(buffers, (dirHint ?? pathHint) || undefined, 'left', {
-      allowedModalities: ['MR'],
-    });
-    if (!vol) continue;
-
-    // DICOM-determined plane (from IOP) is authoritative; folder hints are
-    // already incorporated by detectPlane as a fallback — don't override.
-    // Only use the raw folder hint if vol.plane is still the hardcoded
-    // default (meaning IOP was absent AND SeriesDescription had no clue).
-    if (
-      vol.plane === 'axial' &&
-      !vol.seriesDescription &&
-      (dirHint || pathHint)
-    ) {
-      vol.plane = (dirHint ?? pathHint)!;
+  for (const [seriesKey, seriesRecords] of seriesGroups) {
+    if (!seriesRecords.length) continue;
+    const seriesMeta = seriesRecords[0].meta;
+    if (!seriesMeta) continue;
+    const modality = (seriesMeta.modality || '').toUpperCase();
+    if (modality && modality !== 'MR' && ['CR', 'DX', 'DR', 'XA', 'RF', 'US', 'CT', 'PT', 'NM'].includes(modality)) {
+      continue;
     }
 
-    const dicomLat = buffers[0] ? readLateralityFromDicomBuffer(buffers[0].buffer) : null;
+    onProgress?.(`Reading series ${seriesMeta.seriesDescription || seriesMeta.seriesInstanceUID || seriesKey} (${seriesRecords.length} files)…`);
+    const buffers = seriesRecords.map((record) => ({ name: record.file.name, buffer: record.buffer }));
+
+    const vol = await loadDicomSeries(buffers, undefined, 'left');
+    if (!vol) continue;
+
     const latHint = detectSeriesLaterality(
       vol.seriesDescription,
-      `${dir}/${firstRelPath}`,
-      studyName,
-      dicomLat ?? undefined,
+      vol.dicomLateralityRaw,
     );
     const occupied = {
       left: Boolean(knees.left.volumes[vol.plane]),
@@ -195,21 +199,23 @@ export async function loadDicomStudy(
     assignVolume(knees, laterality, vol.plane, vol);
   }
 
+  // After all series are loaded, resolve any plane collisions.  Two different
+  // series may get the same plane from detectPlane (common for DERIVED / MPR
+  // images where IOP is ambiguous).  Use SeriesDescription to fix mismatches:
+  // if the description clearly says AX_* but the volume landed in sagittal,
+  // move it to axial (unless axial is already occupied by a real axial).
+  resolvePlaneConflicts(knees);
+
   rebalanceKneesFromMetadata(knees);
 
   const representative = (['left', 'right'] as Laterality[])
     .flatMap((lat) => (['axial', 'sagittal', 'coronal'] as Plane[]).map((p) => knees[lat].volumes[p]))
     .find(Boolean);
 
-  // When the folder-derived study name is a generic label (laterality folder,
-  // plane folder, or bare filename), use the DICOM PatientName / PatientID
-  // instead so the UI shows something meaningful.
   const resolvedStudyName =
-    isGenericFolderName && representative
-      ? representative.patientName && representative.patientName !== 'Unknown Patient'
-        ? representative.patientName
-        : representative.patientId || studyName
-      : studyName;
+    representative?.patientName && representative.patientName !== 'Unknown Patient'
+      ? representative.patientName
+      : representative?.patientId || studyName;
 
   return {
     studyName: resolvedStudyName,
