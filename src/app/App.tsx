@@ -364,6 +364,36 @@ function App() {
     setSessionAnnotations((prev) => prev.filter((r) => r.annotationId !== annotationId && r.baseLineId !== annotationId));
   }, []);
 
+  const removePatient = useCallback((key: string) => {
+    setMeasurementArchive((prev) => {
+      const next = { ...prev };
+      for (const k of Object.keys(next)) {
+        if (k.startsWith(key + '::') || k === key) delete next[k];
+      }
+      return next;
+    });
+    setSessionAnnotations((prev) => prev.filter((r) => r.sourcePatientKey !== key));
+    setActiveLateralityByPatient((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+    setPatientStudies((prev) => {
+      const remaining = prev.filter((p) => p.key !== key);
+      if (activePatientKey === key) {
+        // Switch to another patient so the viewport doesn't stay on the removed one
+        if (remaining.length > 0) {
+          const removedIdx = prev.findIndex((p) => p.key === key);
+          const nextIdx = Math.min(removedIdx, remaining.length - 1);
+          setActivePatientKey(remaining[nextIdx].key);
+        } else {
+          setActivePatientKey(null);
+        }
+      }
+      return remaining;
+    });
+  }, [activePatientKey]);
+
   const updateSessionAnnotation = useCallback(
     (annotationId: string, updater: (row: SessionAnnotationRow) => SessionAnnotationRow) => {
       setSessionAnnotations((prev) => {
@@ -750,6 +780,19 @@ function App() {
                               title={expanded ? 'Collapse' : 'Expand'}
                             >
                               {expanded ? '▼' : '▶'}
+                            </button>
+                            <button
+                              type="button"
+                              className="shrink-0 px-2 text-xs text-red-400 hover:text-red-300 hover:bg-red-900/30 border-r border-gray-700/80"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (confirm('Remove patient ' + (study.patientId || 'unknown') + ' and all their measurements?')) {
+                                  removePatient(key);
+                                }
+                              }}
+                              title="Remove patient"
+                            >
+                              ×
                             </button>
                             <button
                               type="button"

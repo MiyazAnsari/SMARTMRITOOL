@@ -110,6 +110,10 @@ interface ViewportProps {
   /** When set, fires for every click on the overlay canvas with raw CSS coords.
    *  The parent can use this for custom hit-testing (e.g. hip protocol selection). */
   onCanvasClick?: (x: number, y: number) => void;
+  /** 0 = off, 1 = image-only magnifier, 2 = image + annotations magnifier. */
+  magnifierActive?: number;
+  /** When false, measurement label text is hidden. */
+  showLabels?: boolean;
 }
 
 export function Viewport({
@@ -148,6 +152,8 @@ export function Viewport({
   derivedLines = [],
   suppressPerpendicularCreation = false,
   onCanvasClick,
+  magnifierActive = 0,
+  showLabels = true,
 }: ViewportProps) {
   const [wl, setWl] = useState<WindowLevel>(() =>
     sanitizeWindowLevel(defaultWindowLevel.window, defaultWindowLevel.level, defaultWindowLevel),
@@ -218,6 +224,7 @@ export function Viewport({
   const perpendicularBaseLineRef = useRef<string | null>(null);
   const measurementsRef = useRef(measurements);
   const suppressClickRef = useRef(false);
+const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
   const dragMovedRef = useRef(false);
   const lastDragTimestampRef = useRef<number>(0);
   const lastDraggedPointRef = useRef<{ id: string; pointIndex: number; x: number; y: number; ts: number } | null>(null);
@@ -1543,14 +1550,14 @@ export function Viewport({
         // value label: prefer measurement.value (keeps panel/overlay in sync),
         // fall back to viewport calculation if not yet propagated.
         const valueText = measurement.value || calculateMeasurementValue(measurement.type as MeasurementTool, points);
-        if (measurement.label) {
+        if (measurement.label && showLabels) {
           drawLabel(measurement.label, midX, midY - 34, '#0f172a', '#e5e7eb', 96, labelTextAlpha, labelBgAlpha);
         }
         if ((pixelSpacing || measurement.value) && valueText) {
-          drawLabel(valueText, midX, midY - 14, '#0f172a', '#e5e7eb', 96, valueTextAlpha, labelBgAlpha);
+          if (showLabels) drawLabel(valueText, midX, midY - 14, '#0f172a', '#e5e7eb', 96, valueTextAlpha, labelBgAlpha);
         }
         if (measurement.id === hoveredLineId || measurement.id === selectedLineId) {
-          drawLabel('⊥ add', midX, midY + 14, '#ffffff', '#111827', 96, isSelected ? 0.25 : 0.14, 0.08);
+          if (showLabels) drawLabel('⊥ add', midX, midY + 14, '#ffffff', '#111827', 96, isSelected ? 0.25 : 0.14, 0.08);
         }
       } else if (measurement.type === 'perpendicular' && points.length >= 2) {
         ctx.save();
@@ -1571,25 +1578,28 @@ export function Viewport({
         ctx.fill();
         ctx.restore();
         if (measurement.label) {
-          drawLabel(measurement.label, (points[0].x + points[1].x) / 2, (points[0].y + points[1].y) / 2 - 14, '#0f172a', '#e5e7eb', 96, labelTextAlpha, labelBgAlpha);
+          if (showLabels) drawLabel(measurement.label, (points[0].x + points[1].x) / 2, (points[0].y + points[1].y) / 2 - 14, '#0f172a', '#e5e7eb', 96, labelTextAlpha, labelBgAlpha);
         }
       } else if (measurement.type === 'point' && points.length >= 1) {
         const p = points[0];
+        const ptR = magnifierActive ? 3 : 5;
+        const borderR = magnifierActive ? 3.5 : 7;
+        const borderW = magnifierActive ? 0.5 : 1;
         ctx.save();
         ctx.globalAlpha = overlayAlpha;
         ctx.beginPath();
-        ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+        ctx.arc(p.x, p.y, ptR, 0, Math.PI * 2);
         ctx.fill();
         ctx.beginPath();
         ctx.strokeStyle = '#fff';
-        ctx.lineWidth = 1;
-        ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
+        ctx.lineWidth = borderW;
+        ctx.arc(p.x, p.y, borderR, 0, Math.PI * 2);
         ctx.stroke();
         ctx.strokeStyle = '#3b82f6';
         ctx.lineWidth = 2;
         ctx.restore();
         if (measurement.label) {
-          drawLabel(measurement.label, p.x, p.y - 14, '#111827', '#e5e7eb', 96, labelTextAlpha, labelBgAlpha);
+          if (showLabels) drawLabel(measurement.label, p.x, p.y - 14, '#111827', '#e5e7eb', 96, labelTextAlpha, labelBgAlpha);
         }
       } else if (measurement.type === 'angle' && points.length >= 3) {
         ctx.save();
@@ -1607,7 +1617,7 @@ export function Viewport({
         });
         ctx.restore();
         if (measurement.label) {
-          drawLabel(measurement.label, points[1].x, points[1].y - 16, '#111827', '#e5e7eb', 96, labelTextAlpha, labelBgAlpha);
+          if (showLabels) drawLabel(measurement.label, points[1].x, points[1].y - 16, '#111827', '#e5e7eb', 96, labelTextAlpha, labelBgAlpha);
         }
       } else if (measurement.type === 'ellipse' && points.length >= 2) {
         const cx = (points[0].x + points[1].x) / 2;
@@ -1791,11 +1801,94 @@ export function Viewport({
         ctx.roundRect(mx - tw / 2, my - 14, tw, 16, 4);
         ctx.fill();
         ctx.fillStyle = '#fff';
-        ctx.fillText(dl.label, mx, my - 2);
+        if (showLabels) ctx.fillText(dl.label, mx, my - 2);
       }
       ctx.restore();
     }
-  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool, selectedLineId, overlayTick, computedReferenceLines, referenceLine, plane, derivedLines]);
+
+    // ── Magnifier overlay ──────────────────────────────────────────
+    if (magnifierActive && cursorPosRef.current) {
+      const { x: cx, y: cy } = cursorPosRef.current;
+      const magR = 64;
+      const magScale = 3;
+      const dpr = window.devicePixelRatio || 1;
+      const srcR = magR / magScale;
+
+      // Clamp source rect to canvas bounds so edge content stays visible.
+      // The magnifier circle stays at the cursor; only the displayed content
+      // shifts when the cursor is near the edge.
+      const canvasCssW = canvas.width / dpr;
+      const canvasCssH = canvas.height / dpr;
+      let srcCx = Math.max(srcR, Math.min(canvasCssW - srcR, cx));
+      let srcCy = Math.max(srcR, Math.min(canvasCssH - srcR, cy));
+      // Snap source to integer pixel boundaries
+      const sx = Math.floor((srcCx - srcR) * dpr);
+      const sy = Math.floor((srcCy - srcR) * dpr);
+      const sw = Math.min(canvas.width - sx, Math.ceil(srcR * 2 * dpr));
+      const sh = Math.min(canvas.height - sy, Math.ceil(srcR * 2 * dpr));
+
+      // Destination offset to keep the biased source centered in the magnifier
+      const dOffX = (srcCx - cx) * magScale; // CSS pixels shift
+      const dOffY = (srcCy - cy) * magScale;
+
+      // In mode 2 (image+annotations): save overlay snapshot before drawing magnifier
+      let overlaySnapshot: ImageData | undefined;
+      if (magnifierActive === 2 && sw > 0 && sh > 0) {
+        overlaySnapshot = ctx.getImageData(sx, sy, sw, sh);
+      }
+
+      // Draw magnified image content from main canvas
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx, cy, magR, 0, Math.PI * 2);
+      ctx.clip();
+
+      ctx.drawImage(
+        mainCanvas,
+        sx, sy, sw, sh,
+        cx - magR + dOffX,
+        cy - magR + dOffY,
+        magR * 2,
+        magR * 2,
+      );
+
+      // Mode 2: composite saved overlay annotations on top, scaled up.
+      if (overlaySnapshot) {
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = overlaySnapshot.width;
+        tempCanvas.height = overlaySnapshot.height;
+        const tempCtx = tempCanvas.getContext('2d')!;
+        tempCtx.putImageData(overlaySnapshot, 0, 0);
+
+        ctx.drawImage(
+          tempCanvas,
+          0, 0, overlaySnapshot.width, overlaySnapshot.height,
+          cx - magR + dOffX, cy - magR + dOffY,
+          magR * 2, magR * 2,
+        );
+      }
+
+      ctx.restore();
+
+      // Border circle
+      ctx.beginPath();
+      ctx.arc(cx, cy, magR, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Crosshair at center
+      const chLen = 6;
+      ctx.strokeStyle = 'rgba(255,50,50,0.9)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(cx - chLen, cy);
+      ctx.lineTo(cx + chLen, cy);
+      ctx.moveTo(cx, cy - chLen);
+      ctx.lineTo(cx, cy + chLen);
+      ctx.stroke();
+    }
+  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool, selectedLineId, overlayTick, computedReferenceLines, referenceLine, plane, derivedLines, magnifierActive, showLabels]);
 
   // Calculate measurement value (prefer physical units mm when possible)
   const calculateMeasurementValue = (type: MeasurementTool, points: { x: number; y: number }[]): string => {
@@ -2013,6 +2106,12 @@ export function Viewport({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
     const snapped = findSnapPoint(x, y);
+
+    // Track cursor position for magnifier (before any early returns so it follows during drags)
+    cursorPosRef.current = { x, y };
+    if (magnifierActive) {
+      setOverlayTick(t => t + 1);
+    }
 
     if (draggingPerpendicularRef.current) {
       const dragged = draggingPerpendicularRef.current;

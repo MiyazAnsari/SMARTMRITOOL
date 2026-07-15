@@ -43,6 +43,10 @@ interface ViewportGridProps {
   onResetViewport?: (plane: Plane) => void;
   /** Per-plane display size callback for px↔mm conversion. */
   onDisplaySizeChange?: (plane: Plane, size: { width: number; height: number }) => void;
+  /** Magnifier overlay active state (0=off, 1=image only, 2=image+annotations). */
+  magnifierActive?: number;
+  /** Whether to show measurement label text on the viewport. */
+  showLabels?: boolean;
   /** Cross-plane reference line data, keyed by plane.  Only the plane that
    *  hosts the reference line receives the data; other planes get null. */
   referenceLineByPlane?: Record<string, {
@@ -104,6 +108,8 @@ export function ViewportGrid({
   onReferenceLineClick,
   allowedDrawPlane,
   referenceLineFraction,
+  magnifierActive = 0,
+  showLabels = true,
   alwaysAllowPointDrag,
 }: ViewportGridProps) {
   // pixelSpacing is optional and provided by parent when available
@@ -232,6 +238,8 @@ export function ViewportGrid({
               applyWeighting={applyWeighting}
               showCrosshair={showCrosshair}
               onViewportReset={() => onResetViewport?.(viewPlane)}
+              magnifierActive={magnifierActive ?? 0}
+              showLabels={showLabels ?? true}
               onDisplaySizeChange={(size) => onDisplaySizeChange?.(viewPlane, size)}
               referenceLine={referenceLineByPlane?.[viewPlane] ?? null}
               referenceLineFraction={referenceLineFraction}
@@ -317,6 +325,8 @@ export function ViewportGrid({
                 onMeasurementSelect={onMeasurementSelect}
                 applyWeighting={applyWeighting}
                 showCrosshair={showCrosshair}
+                magnifierActive={magnifierActive ?? 0}
+                showLabels={showLabels ?? true}
                 parentWindowHeight={pos.height}
                 onViewportReset={() => onResetViewport?.(w.id)}
                 onClose={() => onHideWindow?.(w.id)}

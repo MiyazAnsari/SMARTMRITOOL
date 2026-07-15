@@ -129,6 +129,9 @@ export interface Measurement {
    *  Stored so protocol `compute` can convert overlay coordinates to physical mm
    *  regardless of the current viewport display size. */
   imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
+  /** DICOM pixel spacing for the source image at the time the measurement was captured.
+   *  Stored so CSV export can correctly convert to mm for every patient, not just the active one. */
+  sourcePixelSpacing?: { x: number; y: number };
 }
 
 interface MedicalImageViewerExtras {
@@ -263,6 +266,8 @@ export function MedicalImageViewer({
   const [customWeighting, setCustomWeighting] = useState({ psi: 90 });
   // UI helpers
   const [showCrosshair, setShowCrosshair] = useState<boolean>(false);
+  const [magnifierActive, setMagnifierActive] = useState(0);
+  const [showLabels, setShowLabels] = useState(true);
   // resizable right panel width (px)
   const [rightWidth, setRightWidth] = useState<number>(288); // default w-72 (18rem)
   const rightResizing = useRef(false);
@@ -1618,6 +1623,8 @@ export function MedicalImageViewer({
             onMeasurementSelect={onMeasurementSelect}
             applyWeighting={applyWeighting}
             showCrosshair={showCrosshair}
+            magnifierActive={magnifierActive}
+            showLabels={showLabels}
             measurementUnits={measurementUnits}
             sequenceWindows={sequenceWindows}
             onWindowFocus={(plane) =>
@@ -1786,6 +1793,37 @@ export function MedicalImageViewer({
               aria-label="Ellipse tool"
             >
               <CircleIcon className="h-4 w-4" />
+            </Button>
+          </ToolTip>
+
+          <ToolTip label={magnifierActive === 0 ? 'Magnifier off' : magnifierActive === 1 ? 'Image only (click for annotations)' : 'Image + annotations (click to off)'}>
+            <Button
+              size="sm"
+              variant={magnifierActive ? 'default' : 'ghost'}
+              className={magnifierActive ? (magnifierActive === 2 ? 'bg-amber-700 text-white' : 'bg-amber-600 text-white') : 'text-gray-300'}
+              onClick={() => setMagnifierActive(v => (v + 1) % 3)}
+              aria-label="Toggle magnifier"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="11" cy="11" r="8" />
+                <line x1="21" y1="21" x2="16.65" y2="16.65" />
+              </svg>
+            </Button>
+          </ToolTip>
+          <ToolTip label={showLabels ? 'Hide label text' : 'Show label text'}>
+            <Button
+              size="sm"
+              variant={showLabels ? 'default' : 'ghost'}
+              className={showLabels ? 'bg-gray-600 text-white' : 'text-gray-300'}
+              onClick={() => setShowLabels(v => !v)}
+              aria-label="Toggle labels"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                <line x1="9" y1="9" x2="15" y2="15" />
+                <line x1="9" y1="15" x2="15" y2="9" />
+                <line x1="15" y1="9" x2="15" y2="15" />
+              </svg>
             </Button>
           </ToolTip>
 

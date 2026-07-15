@@ -143,21 +143,21 @@ function projectOntoLine(
 // ---------------------------------------------------------------------------
 
 const HIP_PROTOCOL_STEPS: ProtocolStep[] = [
-  // ── Guideline 1 ───────────────────────────────────────────────────────
-  {
-    id: 'femur-shaft-midline',
-    label: 'Femur Shaft Midline',
-    instruction:
-      'Use Distance. Draw a guideline collinear to the femur shaft midline. Extend it past the femur and pelvis.',
-    tool: 'distance',
-    primitive: 'distance',
-  },
-  // ── Guideline 2 (perpendicular to G1) ─────────────────────────────────
+  // ── Step 1: Lesser trochanter guideline (free) ─────────────────────────
   {
     id: 'lesser-trochanter-guideline',
     label: 'Lesser Trochanter Guideline',
     instruction:
-      'Use Distance. Draw a line perpendicular to the femur shaft midline, placed under the lesser trochanter. Span the full femur shaft width.',
+      'Use Distance. Draw a line under the lesser trochanter spanning the full femur shaft width.',
+    tool: 'distance',
+    primitive: 'distance',
+  },
+  // ── Step 2: Femur shaft midline (AUTO-CREATED) ────────────────────────
+  {
+    id: 'femur-shaft-midline',
+    label: 'Femur Shaft Midline',
+    instruction:
+      'Auto-created perpendicular to the lesser trochanter guideline through its midpoint.',
     tool: 'distance',
     primitive: 'distance',
   },

@@ -375,6 +375,46 @@ export function exportProtocolMeasurementsToCsv(
     }
   }
 
+  // ── Deduplicate protocol groups ───────────────────────────────────
+  // If multiple groups exist for the same patient + laterality +
+  // protocol, keep only the one with the most recent (largest timestamp)
+  // groupId — this prevents duplicate protocol_result rows from
+  // appearing in the CSV regardless of how the duplicates were created.
+  const protocolGroupToKeep = new Map<string, { compositeKey: string; ts: number }>();
+  for (const [compositeKey, groupMeasurements] of byGroup) {
+    const rawGroupId = compositeKey.includes('::') ? compositeKey.split('::')[1]! : compositeKey;
+    const protocolId = findProtocolIdFromGroupId(rawGroupId);
+    if (!protocolId) continue;
+    const first = groupMeasurements[0];
+    if (!first) continue;
+    const patientId = first.patientId ?? context.patientId ?? '';
+    const laterality = first.laterality ?? context.laterality ?? '';
+    const dedupKey = `${patientId}|${laterality}|${protocolId}`;
+    // groupId format: "<protocolId>-<timestamp>" — extract the numeric suffix.
+    const tsStr = rawGroupId.slice(protocolId.length + 1);
+    const ts = /^\d+$/.test(tsStr) ? parseInt(tsStr, 10) : 0;
+    const existing = protocolGroupToKeep.get(dedupKey);
+    if (!existing || ts > existing.ts) {
+      protocolGroupToKeep.set(dedupKey, { compositeKey, ts });
+    }
+  }
+  const keysToDelete: string[] = [];
+  for (const [compositeKey] of byGroup) {
+    const rawGroupId = compositeKey.includes('::') ? compositeKey.split('::')[1]! : compositeKey;
+    const protocolId = findProtocolIdFromGroupId(rawGroupId);
+    if (!protocolId) continue;
+    const first = byGroup.get(compositeKey)?.[0];
+    if (!first) continue;
+    const patientId = first.patientId ?? context.patientId ?? '';
+    const laterality = first.laterality ?? context.laterality ?? '';
+    const dedupKey = `${patientId}|${laterality}|${protocolId}`;
+    const keep = protocolGroupToKeep.get(dedupKey);
+    if (keep && keep.compositeKey !== compositeKey) {
+      keysToDelete.push(compositeKey);
+    }
+  }
+  for (const key of keysToDelete) byGroup.delete(key);
+
   const rows: CsvValue[][] = [];
 
   const sortedGroups = [...byGroup.entries()].sort(([a], [b]) => a.localeCompare(b));

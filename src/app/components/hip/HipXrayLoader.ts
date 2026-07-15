@@ -189,6 +189,7 @@ export function parseHipXrayDicom(buffer: ArrayBuffer, fileName: string): HipXra
 export async function loadHipXrayFolder(
   fileList: FileList | File[],
   onProgress?: (msg: string) => void,
+  abortSignal?: AbortSignal,
 ): Promise<HipXrayImage[]> {
   const files = Array.from(fileList).filter(
     (f) => /\.dcm$/i.test(f.name) || f.name.toLowerCase().endsWith('.dicom'),
@@ -202,6 +203,7 @@ export async function loadHipXrayFolder(
 
   const results: HipXrayImage[] = [];
   for (let i = 0; i < files.length; i++) {
+    if (abortSignal?.aborted) throw new DOMException('Loading cancelled', 'AbortError');
     const f = files[i];
     onProgress?.(`Parsing ${f.name} (${i + 1}/${files.length})...`);
     const buf = await f.arrayBuffer();
