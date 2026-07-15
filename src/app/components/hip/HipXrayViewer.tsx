@@ -427,7 +427,7 @@ const [showLabels, setShowLabels] = useState(true);
       }
     }
     return lines;
-  }, [protocolActive, measurements, activeLaterality, workflow.stepResults, measurementArchive, activeStorageKey]);
+  }, [protocolActive, measurements, activeLaterality]);
 
   const cascadeDependents = (changedStepId: string | undefined, cur: Measurement[]): Measurement[] => {
     if (!changedStepId) return cur;
