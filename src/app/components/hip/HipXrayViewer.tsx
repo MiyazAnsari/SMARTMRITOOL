@@ -325,11 +325,11 @@ const [showLabels, setShowLabels] = useState(true);
     }
     const g1Points = g2line && g2line.points.length >= 2 ? (() => { const m = { x: (g2line.points[0].x + g2line.points[1].x) / 2, y: (g2line.points[0].y + g2line.points[1].y) / 2 }; const dx = g2line.points[1].x - g2line.points[0].x, dy = g2line.points[1].y - g2line.points[0].y; const l = Math.hypot(dx, dy) || 1; const px = -dy / l, py = dx / l; const h = 300; return [{ x: m.x - px * h, y: m.y - py * h }, { x: m.x + px * h, y: m.y + py * h }]; })() : undefined;
     const ltGuid = measurements.find((m) => m.workflowStepId === 'lesser-trochanter-guideline');
-    // Read from raw archive (not stepResults) so it's always the current hip's data — no stale remnant
+    // Read from raw archive only — stepResults is stale during first render after switching hips.
+    // The cascade already saves midpoint-guideline to the archive immediately, so the archive
+    // always has the current hip's data.
     const archiveForThisHip = activeStorageKey ? (measurementArchive[activeStorageKey] ?? []) : [];
-    const midGuidArchive = archiveForThisHip.find((m) => m.workflowStepId === 'midpoint-guideline');
-    // Fall back to step results for newly created guidelines not yet in archive
-    const midGuid = midGuidArchive ?? workflow.stepResults['midpoint-guideline'];
+    const midGuid = archiveForThisHip.find((m) => m.workflowStepId === 'midpoint-guideline');
     const hipLat = measurements.find((m) => m.workflowStepId === 'hip-axis-lateral');
     const hipMed = measurements.find((m) => m.workflowStepId === 'hip-axis-medial');
 
@@ -490,8 +490,8 @@ const [showLabels, setShowLabels] = useState(true);
         }
       }
 
-      // Re-project points on midpoint guideline (steps 8-10)
-      if (trigger === 'midpoint-guideline' || iteration > 1) {
+      // Re-project points on midpoint guideline (steps 8-10) — trigger on placement too
+      if (trigger === 'hip-axis-lateral' || trigger === 'hip-axis-medial' || trigger === 'neck-axis-medial' || trigger === 'midpoint-guideline' || iteration > 1) {
         next = next.map((m) => {
           if ((m.workflowStepId !== 'hip-axis-lateral' && m.workflowStepId !== 'hip-axis-medial' && m.workflowStepId !== 'neck-axis-medial') || m.points.length < 1) return m;
           const newPts = constrainPoints(m.workflowStepId, m.points, m.points, next);
