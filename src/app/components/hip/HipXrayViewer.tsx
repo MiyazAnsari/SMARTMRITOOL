@@ -325,7 +325,11 @@ const [showLabels, setShowLabels] = useState(true);
     }
     const g1Points = g2line && g2line.points.length >= 2 ? (() => { const m = { x: (g2line.points[0].x + g2line.points[1].x) / 2, y: (g2line.points[0].y + g2line.points[1].y) / 2 }; const dx = g2line.points[1].x - g2line.points[0].x, dy = g2line.points[1].y - g2line.points[0].y; const l = Math.hypot(dx, dy) || 1; const px = -dy / l, py = dx / l; const h = 300; return [{ x: m.x - px * h, y: m.y - py * h }, { x: m.x + px * h, y: m.y + py * h }]; })() : undefined;
     const ltGuid = measurements.find((m) => m.workflowStepId === 'lesser-trochanter-guideline');
-    const midGuid = workflow.stepResults['midpoint-guideline'];
+    // Read from raw archive (not stepResults) so it's always the current hip's data — no stale remnant
+    const archiveForThisHip = activeStorageKey ? (measurementArchive[activeStorageKey] ?? []) : [];
+    const midGuidArchive = archiveForThisHip.find((m) => m.workflowStepId === 'midpoint-guideline');
+    // Fall back to step results for newly created guidelines not yet in archive
+    const midGuid = midGuidArchive ?? workflow.stepResults['midpoint-guideline'];
     const hipLat = measurements.find((m) => m.workflowStepId === 'hip-axis-lateral');
     const hipMed = measurements.find((m) => m.workflowStepId === 'hip-axis-medial');
 
@@ -423,7 +427,7 @@ const [showLabels, setShowLabels] = useState(true);
       }
     }
     return lines;
-  }, [protocolActive, measurements, activeLaterality, workflow.stepResults]);
+  }, [protocolActive, measurements, activeLaterality, workflow.stepResults, measurementArchive, activeStorageKey]);
 
   const cascadeDependents = (changedStepId: string | undefined, cur: Measurement[]): Measurement[] => {
     if (!changedStepId) return cur;
