@@ -456,10 +456,11 @@ const [showLabels, setShowLabels] = useState(true);
         });
       }
 
-      // Recompute midpoint guideline (step 8)
+      // Recompute midpoint guideline (step 8) — only from measurements of the same laterality
       if (trigger === 'femur-neck-width' || trigger === 'femur-head-diameter' || iteration > 1) {
-        const neck = next.find((m) => m.workflowStepId === 'femur-neck-width');
-        const head = next.find((m) => m.workflowStepId === 'femur-head-diameter');
+        const sameLat = next.filter((m) => m.laterality === activeLaterality);
+        const neck = sameLat.find((m) => m.workflowStepId === 'femur-neck-width');
+        const head = sameLat.find((m) => m.workflowStepId === 'femur-head-diameter');
         if (neck && head && neck.points.length >= 2 && head.points.length >= 2) {
           const neckMid = { x: (neck.points[0].x + neck.points[1].x) / 2, y: (neck.points[0].y + neck.points[1].y) / 2 };
           const headMid = { x: (head.points[0].x + head.points[1].x) / 2, y: (head.points[0].y + head.points[1].y) / 2 };
@@ -624,7 +625,9 @@ const [showLabels, setShowLabels] = useState(true);
         guideId = 'midpoint-guideline';
       }
       if (guideId) {
-        const guide = allMeas.find((m) => m.workflowStepId === guideId);
+        // Only constrain to guidelines matching this point's laterality
+        const sameLat = allMeas.filter((m) => m.laterality === activeLaterality);
+        const guide = sameLat.find((m) => m.workflowStepId === guideId);
         if (guide && guide.points.length >= 2) {
           const g0 = guide.points[0], g1 = guide.points[1];
           const dx = g1.x - g0.x, dy = g1.y - g0.y;
@@ -638,7 +641,8 @@ const [showLabels, setShowLabels] = useState(true);
 
     // Parallel constraint: step 7 → step 6
     if (stepId === 'femur-head-diameter' && newPts.length >= 2) {
-      const ref = allMeas.find((m) => m.workflowStepId === 'femur-neck-width');
+      const sameLat = allMeas.filter((m) => m.laterality === activeLaterality);
+      const ref = sameLat.find((m) => m.workflowStepId === 'femur-neck-width');
       if (ref && ref.points.length >= 2) {
         const r0 = ref.points[0], r1 = ref.points[1];
         const rdx = r1.x - r0.x, rdy = r1.y - r0.y;
