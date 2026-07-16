@@ -739,7 +739,8 @@ function App() {
                 </button>
               </CollapsibleTrigger>
             </div>
-            <CollapsibleContent className="p-3 space-y-2">
+            <CollapsibleContent className="p-3">
+                <div className="space-y-2 max-h-[50vh] overflow-y-auto pr-1">
               {patientStudies.length === 0 ? (
                 <p className="text-xs text-gray-500">No DICOM patients loaded yet.</p>
               ) : (
@@ -887,6 +888,7 @@ function App() {
                     })}
                 </div>
               )}
+            </div>
             </CollapsibleContent>
           </Collapsible>
 

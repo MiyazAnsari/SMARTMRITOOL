@@ -109,7 +109,9 @@ export function parseHipXrayDicom(buffer: ArrayBuffer, fileName: string): HipXra
   const dataOffset = pixelDataElement.dataOffset;
   let raw: Int16Array | Uint16Array | Uint8Array;
   if (bitsAllocated === 8) {
-    raw = new Uint8Array(buffer, dataOffset, sliceSize);
+    raw = pixelRepresentation === 1
+      ? new Int8Array(buffer, dataOffset, sliceSize)
+      : new Uint8Array(buffer, dataOffset, sliceSize);
   } else if (pixelRepresentation === 1) {
     raw = new Int16Array(buffer, dataOffset, sliceSize);
   } else {
@@ -137,6 +139,10 @@ export function parseHipXrayDicom(buffer: ArrayBuffer, fileName: string): HipXra
     normalized[i] = Math.round(((floatPixels[i] - dataMin) / range) * 255);
   }
 
+  // For MONOCHROME1, negate DICOM window center to match negated pixel data
+  if (isMonochrome1 && windowCenter != null && Number.isFinite(windowCenter)) {
+    windowCenter = -windowCenter;
+  }
   // Default window/level for X-rays (wide window)
   if (!windowWidth || !Number.isFinite(windowWidth) || windowWidth <= 0) {
     windowWidth = range;
@@ -149,8 +155,9 @@ export function parseHipXrayDicom(buffer: ArrayBuffer, fileName: string): HipXra
   const normWindow = ((windowWidth / range) * 255);
   const normLevel = (((windowCenter - dataMin) / range) * 255);
 
-  const psX = pixelSpacingArr[0] ?? 0;
-  const psY = pixelSpacingArr[1] ?? 0;
+  // DICOM Pixel Spacing (0028,0030) = [row spacing (Y), column spacing (X)]
+  const psY = pixelSpacingArr[0] ?? 0;
+  const psX = pixelSpacingArr[1] ?? 0;
   if (!psX || !psY || psX > 50 || psY > 50) {
     console.warn(`[HipXray] Pixel Spacing implausible for ${patientId}: [${psX}, ${psY}] — using 1 mm/pixel fallback`);
   }
