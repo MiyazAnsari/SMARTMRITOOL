@@ -344,6 +344,8 @@ const [showLabels, setShowLabels] = useState(true);
       midGuid = { points: [nm, hm] };
     }
 
+    const hipLat = measurements.find((m) => m.workflowStepId === 'hip-axis-lateral');
+    const hipMed = measurements.find((m) => m.workflowStepId === 'hip-axis-medial');
     if (headDiam && headDiam.points.length >= 2) {
       const headMid = { x: (headDiam.points[0].x + headDiam.points[1].x) / 2, y: (headDiam.points[0].y + headDiam.points[1].y) / 2 };
       // Horizontal offset
