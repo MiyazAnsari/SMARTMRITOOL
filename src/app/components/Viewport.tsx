@@ -101,6 +101,8 @@ interface ViewportProps {
   snapToLines?: boolean;
   /** When set, point tool snaps to this specific line ID (takes priority over snapToLines). */
   pointConstraintLineId?: string | null;
+  /** When set, point tool snaps to this line's infinite extension (highest priority). */
+  pointConstraintLinePoints?: { x: number; y: number }[] | null;
   /** Set of measurement IDs to render as extended dashed guidelines. */
   guidelineIds?: Set<string> | null;
   /** Derived auto-computed lines to render (e.g. offsets, angles). Black dotted. */
@@ -148,6 +150,7 @@ export function Viewport({
   constraintMode = 'none',
   snapToLines = false,
   pointConstraintLineId = null,
+  pointConstraintLinePoints = null,
   guidelineIds = null,
   derivedLines = [],
   suppressPerpendicularCreation = false,
@@ -314,8 +317,21 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
         best = { x: proj.x, y: proj.y, dist };
       }
     }
+    // Also search derived midpoint guideline for snapping (steps 8-10)
+    for (const dl of derivedLines) {
+      if (dl.label !== 'Midpoint Guideline') continue;
+      if (dl.points.length < 2) continue;
+      const p0 = dl.points[0], p1 = dl.points[1];
+      const dx = p1.x - p0.x, dy = p1.y - p0.y;
+      const len2 = dx * dx + dy * dy || 1;
+      const t = ((x - p0.x) * dx + (y - p0.y) * dy) / len2;
+      const proj = { x: p0.x + dx * t, y: p0.y + dy * t };
+      const dist = Math.hypot(proj.x - x, proj.y - y);
+      if (dist <= 15 && (!best || dist < best.dist))
+        best = { x: proj.x, y: proj.y, dist };
+    }
     return best ? { x: best.x, y: best.y } : null;
-  }, [currentSlice]);
+  }, [currentSlice, derivedLines]);
 
   /** Apply a perpendicular/parallel constraint to a point relative to a start point and reference line. */
   const applyConstraint = useCallback(
@@ -2615,9 +2631,17 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
         onMeasurementSelect?.(newMeasurement.id);
       }
     } else if (activeTool === 'point') {
-      // Snap point: prefer pointConstraintLineId, fall back to generic snapToLines
+      // Snap point: pointConstraintLinePoints > pointConstraintLineId > snapToLines
       let pt = snappedPoint;
-      if (pointConstraintLineId) {
+      let constrained = false;
+      if (pointConstraintLinePoints && pointConstraintLinePoints.length >= 2) {
+        const p0 = pointConstraintLinePoints[0], p1 = pointConstraintLinePoints[1];
+        const dx = p1.x - p0.x, dy = p1.y - p0.y;
+        const len2 = dx * dx + dy * dy || 1;
+        const t = ((x - p0.x) * dx + (y - p0.y) * dy) / len2;
+        pt = { x: p0.x + dx * t, y: p0.y + dy * t };
+        constrained = true;
+      } else if (pointConstraintLineId) {
         const refMeas = measurements.find((m) => m.id === pointConstraintLineId);
         if (refMeas && refMeas.points.length >= 2) {
           const p0 = refMeas.points[0], p1 = refMeas.points[1];
@@ -2625,8 +2649,10 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
           const len2 = dx * dx + dy * dy || 1;
           const t = ((x - p0.x) * dx + (y - p0.y) * dy) / len2;
           pt = { x: p0.x + dx * t, y: p0.y + dy * t };
+          constrained = true;
         }
-      } else if (snapToLines) {
+      }
+      if (!constrained && snapToLines) {
         pt = snapToNearestLine(x, y) ?? snappedPoint;
       }
       emitMeasurementAdd({

@@ -103,11 +103,55 @@ const [showLabels, setShowLabels] = useState(true);
       setMeasurementArchive((prev) => {
         const cur = prev[activeStorageKey] ?? [];
         const next = typeof updater === 'function' ? updater(cur) : updater;
-        return { ...prev, [activeStorageKey]: next };
+        // Guard: strip any measurements whose laterality doesn't match the storage key
+        const keyLaterality = activeStorageKey?.split('::')[1];
+        const clean = keyLaterality ? next.filter((m) => !m.laterality || m.laterality === keyLaterality) : next;
+        return { ...prev, [activeStorageKey]: clean };
       });
     },
     [activeStorageKey],
   );
+
+  // Clean up orphaned midpoint guidelines when switching knees
+  // (stale data from previous bugs may have stored guidelines under wrong keys)
+  useEffect(() => {
+    if (!activeStorageKey) return;
+    setMeasurementArchive((prev) => {
+      const cur = prev[activeStorageKey];
+      if (!cur) return prev;
+      const hasNeck = cur.some((m) => m.workflowStepId === 'femur-neck-width');
+      const hasHead = cur.some((m) => m.workflowStepId === 'femur-head-diameter');
+      // If midpoint guideline exists but no neck/head, it's orphaned — remove it
+      if (!hasNeck || !hasHead) {
+        const filtered = cur.filter((m) => m.workflowStepId !== 'midpoint-guideline');
+        if (filtered.length !== cur.length) {
+          return { ...prev, [activeStorageKey]: filtered };
+        }
+      }
+      return prev;
+    });
+  }, [activeStorageKey]);
+
+  // One-time cleanup of all orphaned midpoint guidelines on mount
+  useEffect(() => {
+    setMeasurementArchive((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const [key, measList] of Object.entries(next)) {
+        const hasNeck = measList.some((m) => m.workflowStepId === 'femur-neck-width');
+        const hasHead = measList.some((m) => m.workflowStepId === 'femur-head-diameter');
+        if (!hasNeck || !hasHead) {
+          const filtered = measList.filter((m) => m.workflowStepId !== 'midpoint-guideline');
+          if (filtered.length !== measList.length) {
+            next[key] = filtered;
+            changed = true;
+          }
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, []); // run once on mount
+
   const [rightWidth, setRightWidth] = useState(288);
   const rightResizing = useRef(false);
   const dicomInputRef = useRef<HTMLInputElement | null>(null);
@@ -144,8 +188,6 @@ const [showLabels, setShowLabels] = useState(true);
         stepResults[m.workflowStepId] = { points: m.points, slice: 0, imageScale: m.imageScale };
       }
     }
-    // Reset auto-step tracker so midpoint-guideline effect fires (was stale from previous knee)
-    prevStepResultsRef.current = {};
     // Auto-create femur shaft midline step result if G2 exists but G1 doesn't
     if (stepResults['lesser-trochanter-guideline'] && !stepResults['femur-shaft-midline']) {
       const g2 = stepResults['lesser-trochanter-guideline'];
@@ -287,6 +329,22 @@ const [showLabels, setShowLabels] = useState(true);
     return null;
   }, [protocolActive, activeStep, measurementArchive, activeStorageKey, activeLaterality]);
 
+  // Point constraint line points: for steps 8-10, pass the midpoint guideline
+  // line directly so the Viewport can snap to it (the guideline is filtered
+  // from measurements so pointConstraintLineId can't resolve it).
+  const pointConstraintLinePoints = useMemo(() => {
+    if (!protocolActive || !activeStep) return null;
+    const stepId = activeStep.id;
+    if (stepId !== 'hip-axis-lateral' && stepId !== 'hip-axis-medial' && stepId !== 'neck-axis-medial') return null;
+    // Compute the midpoint guideline from the current knee's neck-width + head-diameter
+    const neck = measurements.find((m) => m.workflowStepId === 'femur-neck-width');
+    const head = measurements.find((m) => m.workflowStepId === 'femur-head-diameter');
+    if (!neck || !head || neck.points.length < 2 || head.points.length < 2) return null;
+    const nm = { x: (neck.points[0].x + neck.points[1].x) / 2, y: (neck.points[0].y + neck.points[1].y) / 2 };
+    const hm = { x: (head.points[0].x + head.points[1].x) / 2, y: (head.points[0].y + head.points[1].y) / 2 };
+    return [nm, hm];
+  }, [protocolActive, activeStep, measurements]);
+
   // Snap-to-lines for point steps (3, 4)
   const shouldSnapToLines = protocolActive && activeStep?.tool === 'point';
 
@@ -413,7 +471,6 @@ const [showLabels, setShowLabels] = useState(true);
         const neckAngle = bestAngle > Math.PI / 2 ? bestAngle : Math.PI - bestAngle;
         // Draw from hip axis TO shaft midline, in the direction toward the shaft
         let diff = ((bestShaftAngle - bestHipAngle) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI);
-        const shortSweep = Math.min(diff, 2 * Math.PI - diff);
         const towardShaft = diff <= Math.PI ? 1 : -1; // CCW if short way is CCW, else CW
         const arcR = 40;
         const steps = 20;
@@ -427,6 +484,66 @@ const [showLabels, setShowLabels] = useState(true);
     }
     return lines;
   }, [protocolActive, measurements, activeLaterality]);
+
+  // ── Helper: constrain points to maintain live perpendicular/parallel/point-on-line ──
+  const constrainPoints = (
+    stepId: string | undefined,
+    newPts: { x: number; y: number }[],
+    oldPts: { x: number; y: number }[],
+    allMeas: Measurement[],
+    laterality?: string,
+  ): { x: number; y: number }[] => {
+    if (!stepId || newPts.length === 0) return newPts;
+
+    // Point-on-line: steps 3-4 (on lesser trochanter guideline), steps 8-10 (on midpoint guideline)
+    if (newPts.length === 1) {
+      let guideId: string | undefined;
+      if (stepId === 'medial-cortical-point' || stepId === 'lateral-cortical-point') {
+        guideId = 'lesser-trochanter-guideline';
+      } else if (stepId === 'hip-axis-lateral' || stepId === 'hip-axis-medial' || stepId === 'neck-axis-medial') {
+        guideId = 'midpoint-guideline';
+      }
+      if (guideId) {
+        // Only constrain to guidelines matching this point's laterality
+        const lat = laterality ?? activeLaterality;
+        const sameLat = allMeas.filter((m) => m.laterality === lat);
+        const guide = sameLat.find((m) => m.workflowStepId === guideId);
+        if (guide && guide.points.length >= 2) {
+          // DIAGNOSTIC: log when constraining a point to help debug cross-knee issues
+          console.warn(
+            `[constrainPoints] CONSTRAINING step="${stepId}" point_laterality="${lat}" ` +
+            `guideline_laterality="${guide.laterality}" guideline_id="${guide.id}" ` +
+            `activeKey="${activeStorageKey}" activeLaterality="${activeLaterality}"`
+          );
+          const g0 = guide.points[0], g1 = guide.points[1];
+          const dx = g1.x - g0.x, dy = g1.y - g0.y;
+          const len2 = dx * dx + dy * dy || 1;
+          const t = ((newPts[0].x - g0.x) * dx + (newPts[0].y - g0.y) * dy) / len2;
+          return [{ x: g0.x + dx * t, y: g0.y + dy * t }];
+        }
+      }
+      return newPts;
+    }
+
+    // Parallel constraint: step 7 → step 6
+    if (stepId === 'femur-head-diameter' && newPts.length >= 2) {
+      const lat = laterality ?? activeLaterality;
+      const sameLat = allMeas.filter((m) => m.laterality === lat);
+      const ref = sameLat.find((m) => m.workflowStepId === 'femur-neck-width');
+      if (ref && ref.points.length >= 2) {
+        const r0 = ref.points[0], r1 = ref.points[1];
+        const rdx = r1.x - r0.x, rdy = r1.y - r0.y;
+        const rlen = Math.hypot(rdx, rdy) || 1;
+        const dirX = rdx / rlen, dirY = rdy / rlen;
+        const start = newPts[0];
+        const vx = newPts[1].x - start.x, vy = newPts[1].y - start.y;
+        const proj = vx * dirX + vy * dirY;
+        return [start, { x: start.x + dirX * proj, y: start.y + dirY * proj }];
+      }
+    }
+
+    return newPts;
+  };
 
   const cascadeDependents = (changedStepId: string | undefined, cur: Measurement[]): Measurement[] => {
     if (!changedStepId) return cur;
@@ -444,7 +561,7 @@ const [showLabels, setShowLabels] = useState(true);
       if (trigger === 'lesser-trochanter-guideline' || iteration > 1) {
         next = next.map((m) => {
           if ((m.workflowStepId !== 'medial-cortical-point' && m.workflowStepId !== 'lateral-cortical-point') || m.points.length < 1) return m;
-          const newPts = constrainPoints(m.workflowStepId, m.points, m.points, next);
+          const newPts = constrainPoints(m.workflowStepId, m.points, m.points, next, m.laterality);
           if (newPts[0]?.x !== m.points[0]?.x || newPts[0]?.y !== m.points[0]?.y) didChange = true;
           return { ...m, points: newPts };
         });
@@ -454,8 +571,8 @@ const [showLabels, setShowLabels] = useState(true);
       if (trigger === 'femur-neck-width' || iteration > 1) {
         next = next.map((m) => {
           if (m.workflowStepId !== 'femur-head-diameter' || m.points.length < 2) return m;
-          const newPts = constrainPoints('femur-head-diameter', m.points, m.points, next);
-          if (newPts[0]?.x !== m.points[0]?.x || newPts[1]?.x !== m.points[1]?.x) didChange = true;
+          const newPts = constrainPoints('femur-head-diameter', m.points, m.points, next, m.laterality);
+          if (newPts[0]?.x !== m.points[0]?.x || newPts[0]?.y !== m.points[0]?.y || newPts[1]?.x !== m.points[1]?.x || newPts[1]?.y !== m.points[1]?.y) didChange = true;
           return { ...m, points: newPts };
         });
       }
@@ -468,9 +585,9 @@ const [showLabels, setShowLabels] = useState(true);
         if (neck && head && neck.points.length >= 2 && head.points.length >= 2) {
           const neckMid = { x: (neck.points[0].x + neck.points[1].x) / 2, y: (neck.points[0].y + neck.points[1].y) / 2 };
           const headMid = { x: (head.points[0].x + head.points[1].x) / 2, y: (head.points[0].y + head.points[1].y) / 2 };
-          const oldG = next.find((m) => m.workflowStepId === 'midpoint-guideline');
+          const oldG = next.find((m) => m.workflowStepId === 'midpoint-guideline' && m.laterality === activeLaterality);
           if (oldG) {
-            if (oldG.points[0]?.x !== neckMid.x || oldG.points[1]?.x !== headMid.x) {
+            if (oldG.points[0]?.x !== neckMid.x || oldG.points[0]?.y !== neckMid.y || oldG.points[1]?.x !== headMid.x || oldG.points[1]?.y !== headMid.y) {
               didChange = true;
               next = next.map((m) => m.workflowStepId === 'midpoint-guideline' ? { ...m, points: [neckMid, headMid] } : m);
             }
@@ -493,7 +610,7 @@ const [showLabels, setShowLabels] = useState(true);
       if (trigger === 'hip-axis-lateral' || trigger === 'hip-axis-medial' || trigger === 'neck-axis-medial' || trigger === 'midpoint-guideline' || iteration > 1) {
         next = next.map((m) => {
           if ((m.workflowStepId !== 'hip-axis-lateral' && m.workflowStepId !== 'hip-axis-medial' && m.workflowStepId !== 'neck-axis-medial') || m.points.length < 1) return m;
-          const newPts = constrainPoints(m.workflowStepId, m.points, m.points, next);
+          const newPts = constrainPoints(m.workflowStepId, m.points, m.points, next, m.laterality);
           if (newPts[0]?.x !== m.points[0]?.x || newPts[0]?.y !== m.points[0]?.y) didChange = true;
           return { ...m, points: newPts };
         });
@@ -547,7 +664,16 @@ const [showLabels, setShowLabels] = useState(true);
       // Record step result and advance
       if (protocolActive && activeStep) {
         setWorkflow((prev) => {
-          let stepResults = { ...prev.stepResults, [activeStep.id]: { points: tagged.points, slice: 0, imageScale: tagged.imageScale } };
+          // Rebuild stepResults from current archive to avoid stale cross-knee data
+          // (the rebuild effect at line 132 may not have fired yet after a knee switch)
+          const curArchive = activeStorageKey ? (measurementArchive[activeStorageKey] ?? []) : [];
+          let stepResults: Record<string, { points: { x: number; y: number }[]; slice: number; imageScale?: any }> = {};
+          for (const m of curArchive) {
+            if (m.workflowStepId && HIP_MEASUREMENT_PROTOCOL.steps.some((s) => s.id === m.workflowStepId)) {
+              stepResults[m.workflowStepId] = { points: m.points, slice: 0, imageScale: m.imageScale };
+            }
+          }
+          stepResults[activeStep.id] = { points: tagged.points, slice: 0, imageScale: tagged.imageScale };
           // Auto-create femur shaft midline stepResult when lesser trochanter guideline is drawn
           if (activeStep.id === 'lesser-trochanter-guideline' && !stepResults['femur-shaft-midline'] && tagged.points.length >= 2) {
             const g2Mid = { x: (tagged.points[0].x + tagged.points[1].x) / 2, y: (tagged.points[0].y + tagged.points[1].y) / 2 };
@@ -583,7 +709,7 @@ const [showLabels, setShowLabels] = useState(true);
         });
       }
     },
-    [protocolActive, activeStep, activeLaterality, activeImage, setMeasurements],
+    [protocolActive, activeStep, activeLaterality, activeImage, setMeasurements, cascadeDependents, measurementArchive, activeStorageKey],
   );
 
   const handleMeasurementUpdate = useCallback(
@@ -596,86 +722,24 @@ const [showLabels, setShowLabels] = useState(true);
         if (!target) return prev;
         const pts = typeof newPoints === 'function' ? newPoints(target.points) : newPoints;
         // Apply live constraint based on the measurement's workflow step
-        const constrained = constrainPoints(target.workflowStepId, pts, target.points, cur);
+        const constrained = constrainPoints(target.workflowStepId, pts, target.points, cur, target.laterality);
         let next = cur.map((m) => {
           if (m.id !== id) return m;
           return { ...m, points: constrained, value: value ?? m.value, imageScale: imageScale ?? m.imageScale };
         });
         // Cascade: update all dependent measurements
         next = cascadeDependents(target.workflowStepId, next);
-        return { ...prev, [key]: next };
+        // Guard: strip any measurements whose laterality doesn't match the storage key
+        const keyLaterality = key?.split('::')[1];
+        const clean = keyLaterality ? next.filter((m) => !m.laterality || m.laterality === keyLaterality) : next;
+        return { ...prev, [key]: clean };
       });
     },
-    [activeStorageKey],
+    [activeStorageKey, activeLaterality, constrainPoints, cascadeDependents],
   );
 
   // ── Cascade: when a reference measurement is edited, update all dependents ──
 
-  // ── Helper: constrain points to maintain live perpendicular/parallel/point-on-line ──
-  const constrainPoints = (
-    stepId: string | undefined,
-    newPts: { x: number; y: number }[],
-    oldPts: { x: number; y: number }[],
-    allMeas: Measurement[],
-  ): { x: number; y: number }[] => {
-    if (!stepId || newPts.length === 0) return newPts;
-
-    // Point-on-line: steps 3-4 (on lesser trochanter guideline), steps 8-10 (on midpoint guideline)
-    if (newPts.length === 1) {
-      let guideId: string | undefined;
-      if (stepId === 'medial-cortical-point' || stepId === 'lateral-cortical-point') {
-        guideId = 'lesser-trochanter-guideline';
-      } else if (stepId === 'hip-axis-lateral' || stepId === 'hip-axis-medial' || stepId === 'neck-axis-medial') {
-        guideId = 'midpoint-guideline';
-      }
-      if (guideId) {
-        // Only constrain to guidelines matching this point's laterality
-        const sameLat = allMeas.filter((m) => m.laterality === activeLaterality);
-        const guide = sameLat.find((m) => m.workflowStepId === guideId);
-        if (guide && guide.points.length >= 2) {
-          const g0 = guide.points[0], g1 = guide.points[1];
-          const dx = g1.x - g0.x, dy = g1.y - g0.y;
-          const len2 = dx * dx + dy * dy || 1;
-          const t = ((newPts[0].x - g0.x) * dx + (newPts[0].y - g0.y) * dy) / len2;
-          return [{ x: g0.x + dx * t, y: g0.y + dy * t }];
-        }
-      }
-      return newPts;
-    }
-
-    // Parallel constraint: step 7 → step 6
-    if (stepId === 'femur-head-diameter' && newPts.length >= 2) {
-      const sameLat = allMeas.filter((m) => m.laterality === activeLaterality);
-      const ref = sameLat.find((m) => m.workflowStepId === 'femur-neck-width');
-      if (ref && ref.points.length >= 2) {
-        const r0 = ref.points[0], r1 = ref.points[1];
-        const rdx = r1.x - r0.x, rdy = r1.y - r0.y;
-        const rlen = Math.hypot(rdx, rdy) || 1;
-        const dirX = rdx / rlen, dirY = rdy / rlen;
-        const start = newPts[0];
-        const vx = newPts[1].x - start.x, vy = newPts[1].y - start.y;
-        const proj = vx * dirX + vy * dirY;
-        return [start, { x: start.x + dirX * proj, y: start.y + dirY * proj }];
-      }
-    }
-
-    return newPts;
-  };
-
-  // ── Helper: recompute midpoint guideline from neck width and head diameter ──
-  const recomputeMidpointGuideline = (cur: Measurement[]): Measurement[] => {
-    const neck = cur.find((m) => m.workflowStepId === 'femur-neck-width');
-    const head = cur.find((m) => m.workflowStepId === 'femur-head-diameter');
-    if (!neck || !head || neck.points.length < 2 || head.points.length < 2) return cur;
-    const neckMid = { x: (neck.points[0].x + neck.points[1].x) / 2, y: (neck.points[0].y + neck.points[1].y) / 2 };
-    const headMid = { x: (head.points[0].x + head.points[1].x) / 2, y: (head.points[0].y + head.points[1].y) / 2 };
-    return cur.map((m) => {
-      if (m.workflowStepId === 'midpoint-guideline') {
-        return { ...m, points: [neckMid, headMid] };
-      }
-      return m;
-    });
-  };
 
   const handleMeasurementDelete = useCallback((id: string) => {
     // Find the measurement's workflow step before removing
@@ -700,7 +764,14 @@ const [showLabels, setShowLabels] = useState(true);
     const removeArr = Array.from(toRemove);
     setMeasurements((prev) => prev.filter((m) => !removeArr.includes(m.workflowStepId ?? '')));
     setWorkflow((prev) => {
-      const stepResults = { ...prev.stepResults };
+      // Rebuild from current archive to avoid stale cross-knee data
+      const curArchive = activeStorageKey ? (measurementArchive[activeStorageKey] ?? []) : [];
+      const stepResults: Record<string, { points: { x: number; y: number }[]; slice: number; imageScale?: any }> = {};
+      for (const m of curArchive) {
+        if (m.workflowStepId && HIP_MEASUREMENT_PROTOCOL.steps.some((s) => s.id === m.workflowStepId)) {
+          stepResults[m.workflowStepId] = { points: m.points, slice: 0, imageScale: m.imageScale };
+        }
+      }
       for (const sid of removeArr) delete stepResults[sid];
       let minIdx = Infinity;
       for (const sid of removeArr) {
@@ -797,7 +868,6 @@ const [showLabels, setShowLabels] = useState(true);
             if (m10Match) {
               const unsigned = parseFloat(m10Match[1]);
               const obtuse = unsigned < 90 ? 180 - unsigned : unsigned;
-              label = 'M10. Femur Neck Angle (obtuse)';
               val = obtuse.toFixed(1) + '°';
             }
           }
@@ -840,6 +910,38 @@ const [showLabels, setShowLabels] = useState(true);
         stepResults[stepId] = sr;
       }
     }
+    // Rebuild auto-computed guidelines from raw archive to avoid stale workflow data
+    // (cascade updates the archive but not workflow.stepResults after edits)
+    const rawArchive = activeStorageKey ? (measurementArchive[activeStorageKey] ?? []) : [];
+    // Femur shaft midline from G2
+    const g2 = rawArchive.find((m) => m.workflowStepId === 'lesser-trochanter-guideline');
+    if (g2 && g2.points.length >= 2 && !stepResults['femur-shaft-midline']) {
+      const g2Mid = { x: (g2.points[0].x + g2.points[1].x) / 2, y: (g2.points[0].y + g2.points[1].y) / 2 };
+      const dx = g2.points[1].x - g2.points[0].x, dy = g2.points[1].y - g2.points[0].y;
+      const len = Math.hypot(dx, dy) || 1;
+      const perpX = -dy / len, perpY = dx / len;
+      const halfLen = 300;
+      stepResults['femur-shaft-midline'] = {
+        points: [
+          { x: g2Mid.x - perpX * halfLen, y: g2Mid.y - perpY * halfLen },
+          { x: g2Mid.x + perpX * halfLen, y: g2Mid.y + perpY * halfLen },
+        ],
+        slice: 0,
+        imageScale: g2.imageScale,
+      };
+    }
+    // Midpoint guideline from neck-width + head-diameter
+    const neck = rawArchive.find((m) => m.workflowStepId === 'femur-neck-width');
+    const head = rawArchive.find((m) => m.workflowStepId === 'femur-head-diameter');
+    if (neck && head && neck.points.length >= 2 && head.points.length >= 2) {
+      const neckMid = { x: (neck.points[0].x + neck.points[1].x) / 2, y: (neck.points[0].y + neck.points[1].y) / 2 };
+      const headMid = { x: (head.points[0].x + head.points[1].x) / 2, y: (head.points[0].y + head.points[1].y) / 2 };
+      stepResults['midpoint-guideline'] = {
+        points: [neckMid, headMid],
+        slice: 0,
+        imageScale: neck.imageScale,
+      };
+    }
     const raw = HIP_MEASUREMENT_PROTOCOL.compute(stepResults, activePixelSpacing);
     if (!raw) return null;
     // Display the angle as the obtuse (> 90°) unsigned value
@@ -860,50 +962,50 @@ M10. Femur Neck Angle = ? (compute pending)`;
       }
     }
     return { ...raw, summary };
-  }, [protocolActive, measurements, activePixelSpacing, activeLaterality, workflow.stepResults]);
+  }, [protocolActive, measurements, measurementArchive, activeStorageKey, activePixelSpacing, activeLaterality, workflow.stepResults]);
 
-  // ── Auto-create guideline for step 8 when steps 6 & 7 complete ────
-  const prevStepResultsRef = useRef<Record<string, any>>({});
+  // ── Auto-create midpoint guideline when neck-width + head-diameter exist ────
+  // Derive everything from the archive (NOT workflow.stepResults) to avoid
+  // cross-knee contamination during hip-switch race conditions.
   useEffect(() => {
-    if (!protocolActive) return;
-    const neckDone = !!workflow.stepResults['femur-neck-width'];
-    const headDone = !!workflow.stepResults['femur-head-diameter'];
-    const wasNeckDone = !!prevStepResultsRef.current['femur-neck-width'];
-    const wasHeadDone = !!prevStepResultsRef.current['femur-head-diameter'];
-    prevStepResultsRef.current = { ...workflow.stepResults };
-    if (!(neckDone && headDone && (!wasNeckDone || !wasHeadDone))) return;
-
-    const neck = workflow.stepResults['femur-neck-width'];
-    const head = workflow.stepResults['femur-head-diameter'];
+    if (!protocolActive || !activeStorageKey) return;
+    const curArchive = measurementArchive[activeStorageKey] ?? [];
+    // Check if the CURRENT knee's archive has neck-width and head-diameter
+    const neck = curArchive.find((m) => m.workflowStepId === 'femur-neck-width');
+    const head = curArchive.find((m) => m.workflowStepId === 'femur-head-diameter');
     if (!neck || !head || neck.points.length < 2 || head.points.length < 2) return;
+    // Check if a midpoint guideline already exists for this knee
+    const existingGuideline = curArchive.find((m) => m.workflowStepId === 'midpoint-guideline');
+    if (existingGuideline) return;
 
     const neckMid = { x: (neck.points[0].x + neck.points[1].x) / 2, y: (neck.points[0].y + neck.points[1].y) / 2 };
     const headMid = { x: (head.points[0].x + head.points[1].x) / 2, y: (head.points[0].y + head.points[1].y) / 2 };
 
-    const existingGuideline = measurements.find((m) => m.workflowStepId === 'midpoint-guideline');
-    const hasStepResult = !!workflow.stepResults['midpoint-guideline'];
+    const gId = genId();
+    const guideline: Measurement = {
+      id: gId, type: 'distance', points: [neckMid, headMid],
+      slice: 0, plane: 'coronal',
+      laterality: activeLaterality,
+      label: 'Guideline Through Midpoints', workflowStepId: 'midpoint-guideline',
+      timestamp: new Date().toISOString(),
+    };
+    setMeasurements((prev) => [...prev, guideline]);
 
-    if (existingGuideline && hasStepResult) return;
-
-    if (!existingGuideline) {
-      const gId = genId();
-      const guideline: Measurement = {
-        id: gId, type: 'distance', points: [neckMid, headMid],
-        slice: 0, plane: 'coronal',
-        laterality: activeLaterality,
-        label: 'Guideline Through Midpoints', workflowStepId: 'midpoint-guideline',
-        timestamp: new Date().toISOString(),
-      };
-      setMeasurements((prev) => [...prev, guideline]);
+    // Update workflow step result
+    if (!workflow.stepResults['midpoint-guideline']) {
+      setWorkflow((prev) => {
+        const curArchive2 = activeStorageKey ? (measurementArchive[activeStorageKey] ?? []) : [];
+        const stepResults: Record<string, { points: { x: number; y: number }[]; slice: number; imageScale?: any }> = {};
+        for (const m of curArchive2) {
+          if (m.workflowStepId && HIP_MEASUREMENT_PROTOCOL.steps.some((s) => s.id === m.workflowStepId)) {
+            stepResults[m.workflowStepId] = { points: m.points, slice: 0, imageScale: m.imageScale };
+          }
+        }
+        stepResults['midpoint-guideline'] = { points: [neckMid, headMid], slice: 0 };
+        return { ...prev, stepResults };
+      });
     }
-    // Update stepResult regardless (cascade may have created measurement but not stepResult)
-    if (!hasStepResult) {
-      setWorkflow((prev) => ({
-        ...prev,
-        stepResults: { ...prev.stepResults, 'midpoint-guideline': { points: [neckMid, headMid], slice: 0 } },
-      }));
-    }
-  }, [workflow.stepResults, protocolActive, measurements, activeLaterality]);
+  }, [protocolActive, activeStorageKey, measurementArchive]);
 
   const loaded = activeImage !== null;
 
@@ -964,6 +1066,7 @@ M10. Femur Neck Angle = ? (compute pending)`;
             constraintMode={constraintProps.constraintMode}
             snapToLines={shouldSnapToLines}
             pointConstraintLineId={pointConstraintLineId}
+            pointConstraintLinePoints={pointConstraintLinePoints}
             guidelineIds={guidelineIds}
             derivedLines={derivedLines}
             suppressPerpendicularCreation={protocolActive}
@@ -1165,9 +1268,15 @@ M10. Femur Neck Angle = ? (compute pending)`;
 
               <ol className="space-y-1.5 mb-2">
                 {HIP_MEASUREMENT_PROTOCOL.steps.map((step, idx) => {
-                  const done = !!workflow.stepResults[step.id];
-                  const isActive = idx === workflow.activeStepIndex && !done;
+                  // Compute 'done' from workflow.stepResults, but cross-check against
+                  // the archive for non-auto steps to prevent stale cross-knee display
+                  const rawForStep = activeStorageKey ? (measurementArchive[activeStorageKey] ?? []) : [];
+                  const inArchive = rawForStep.some((m) => m.workflowStepId === step.id);
                   const isAuto = step.id === 'femur-shaft-midline' || step.id === 'midpoint-guideline' || step.id === 'shaft-thickness' || step.id === 'horizontal-offset' || step.id === 'vertical-offset' || step.id === 'femoral-neck-angle';
+                  // For auto steps, trust workflow.stepResults (they aren't in archive).
+                  // For user-drawn steps, require the measurement to exist in the current archive.
+                  const done = !!workflow.stepResults[step.id] && (isAuto || inArchive);
+                  const isActive = idx === workflow.activeStepIndex && !done;
                   if (isAuto) {
                     if (done) {
                       return (

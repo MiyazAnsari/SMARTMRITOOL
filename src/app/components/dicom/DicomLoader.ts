@@ -67,6 +67,7 @@ interface ParsedSlice {
   bodyPartExamined?: string;
   imageType?: string;
   laterality?: string;
+  photometricInterpretation: string;
   patientId: string;
   patientName: string;
   studyInstanceUID: string;
@@ -226,7 +227,9 @@ function parseDicomFile(buffer: ArrayBuffer): ParsedSlice | null {
   const dataOffset = pixelDataElement.dataOffset;
   let raw: Int16Array | Uint16Array | Uint8Array;
   if (bitsAllocated === 8) {
-    raw = new Uint8Array(buffer, dataOffset, totalSamples);
+    raw = pixelRepresentation === 1
+      ? new Int8Array(buffer, dataOffset, totalSamples)
+      : new Uint8Array(buffer, dataOffset, totalSamples);
   } else if (pixelRepresentation === 1) {
     raw = new Int16Array(buffer, dataOffset, totalSamples);
   } else {
@@ -262,6 +265,7 @@ function parseDicomFile(buffer: ArrayBuffer): ParsedSlice | null {
     bodyPartExamined,
     imageType,
     laterality,
+    photometricInterpretation: photometric,
     patientId,
     patientName,
     studyInstanceUID,
@@ -462,9 +466,14 @@ export async function loadDicomSeries(
     imageData[i] = Math.max(0, Math.min(255, Math.round(((flat[i] - min) / range) * 255)));
   }
 
+  // For MONOCHROME1, negate DICOM window center to match negated pixel data
+  const isMono1 = consistent[0].photometricInterpretation === 'MONOCHROME1';
   // Default window/level: prefer DICOM-supplied values, scaled into the 0-255 space
-  const wc = consistent[0].windowCenter;
+  let wc = consistent[0].windowCenter;
   const ww = consistent[0].windowWidth;
+  if (isMono1 && wc != null && Number.isFinite(wc)) {
+    wc = -wc;
+  }
   let defaultWindow = 255;
   let defaultLevel = 128;
   if (wc != null && ww != null && ww > 0) {

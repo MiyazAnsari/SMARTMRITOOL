@@ -1254,6 +1254,248 @@ transforms = Compose([
 
 ---
 
+
+---
+
+## Hip X-Ray Annotation System
+
+Second clinical module — 10-measurement protocol for AP Pelvis hip X-rays with automated guideline computation, left/right hip toggling on shared images, and per-side measurement archives. Built on the same DICOM loader infrastructure as the knee viewer.
+
+---
+
+### File-by-File Reference
+
+#### `src/app/components/hip/HipXrayViewer.tsx` (~1,500 lines)
+
+Main hip viewer component. Manages measurement archive keyed by `patientKey::laterality`, protocol workflow, and all measurement CRUD.
+
+**State Architecture:**
+| State | Type | Purpose |
+|-------|------|---------|
+| `measurementArchive` | `Record<string, Measurement[]>` | Per-patient-per-side measurement storage, keyed `patientKey::laterality`, persisted to `localStorage` under `'hip-measurements'` |
+| `activeImageKey` | `string \| null` | Currently selected patient |
+| `activeLaterality` | `'left' \| 'right'` | Which hip is active — toggles between left/right on the same image |
+| `activeStorageKey` | `string \| null` | Computed: `${activeImageKey}::${activeLaterality}` — scopes all reads/writes |
+| `workflow` | `HipWorkflowState` | Protocol step tracking: `stepResults`, `activeStepIndex`, `protocolId` |
+
+**Key Functions:**
+
+- **`storageKey(patientKey, laterality)`** — Constructs archive key: `${patientKey}::${laterality}`. **Critical invariant**: measurements stamped with `laterality: 'left'` must only be stored under keys ending in `::left`.
+
+- **`setMeasurements(updater)`** — Scoped write helper. Captures `activeStorageKey` via `useCallback`. **Safeguard**: filters out measurements whose `laterality` field doesn't match the storage key's laterality suffix (defense-in-depth against cross-knee contamination).
+
+- **`cascadeDependents(changedStepId, cur)`** — Recomputes all dependent measurements when a reference line changes. Iterates up to 5 times:
+  - Re-projects steps 3–4 (cortical points) onto G2 (lesser trochanter guideline)
+  - Re-projects step 7 (femur head diameter) parallel to step 5 (neck width)
+  - Recomputes midpoint guideline (G5) from neck width + head diameter midpoints
+  - Re-projects steps 8–10 (hip axis lateral/medial, neck axis medial) onto G5
+  - **Safeguard**: uses `activeLaterality` filter on `sameLat` to prevent cross-knee recomputation. Checks both `.x` AND `.y` on all change-detection comparisons (was previously X-only — a bug that caused Y-only shifts to not trigger re-cascade).
+
+- **`constrainPoints(stepId, newPts, oldPts, allMeas, laterality)`** — Projects points onto their reference guidelines. **Safeguard**: uses the measurement's own `laterality` field (passed as parameter), NOT the React closure's `activeLaterality`. A hip-axis-lateral point stamped `laterality: 'right'` can only be constrained to a guideline with `laterality: 'right'`.
+
+- **`derivedLines` (useMemo)** — Computes visual overlay lines from `measurements` (scoped to current knee). Includes: Femur Shaft Midline (G1, perpendicular to G2 through G2's midpoint), Midpoint Guideline (G5, through neck and head midpoints), Horizontal/Vertical Offsets, Femoral Neck Angle arc. **Safeguard**: computes midpoint guideline from `measurements` only — never reads from `measurementArchive` or `workflow.stepResults` (that was the original cross-hip leakage bug, now fixed with a comment).
+
+- **`pointConstraintLinePoints` (useMemo)** — Computes the midpoint guideline line for Viewport snapping during steps 8–10. Returns `null` when the current knee lacks neck-width or head-diameter — so points on a fresh knee are never snapped.
+
+- **`handleMeasurementAdd(m)`** — Creates tagged measurement with `laterality: activeLaterality`, stores via `setMeasurements`, runs cascade, and records step result. **Safeguard**: `setWorkflow` rebuilds `stepResults` from `measurementArchive[activeStorageKey]` instead of spreading `prev.stepResults` — prevents left-knee workflow data from leaking into right-knee workflow during the render where the rebuild effect hasn't fired yet.
+
+- **`handleMeasurementUpdate(id, newPoints, ...)`** — Constrains points to guidelines, runs cascade. **Safeguard**: same archive-sourced stepResult rebuild; passes `target.laterality` to `constrainPoints`.
+
+- **`handleMeasurementDelete(id)`** / **`clearSteps(stepIds)`** — Clean up measurements and workflow. **Safeguard**: `clearSteps` rebuilds stepResults from archive instead of spreading `prev.stepResults`.
+
+**Arbitrary Measurement Requirement:** Each knee is independent. There must be **zero shared constraints** between left and right hips. The left hip's midpoint guideline must never affect right hip points, and vice versa.
+
+**Effects:**
+
+| Effect | Trigger | Purpose | Safeguard |
+|--------|---------|---------|-----------|
+| Rebuild workflow (line ~172) | `activeStorageKey` or `measurementArchive` change | Rebuilds `workflow.stepResults` from current archive | Returns early when key unchanged |
+| Orphan cleanup — knee switch | `activeStorageKey` change | Deletes midpoint guidelines lacking supporting neck/head in the new knee's archive | Filters by workflowStepId |
+| Orphan cleanup — one-time | Mount (`[]`) | Sweeps all archive keys for orphan guidelines on app load | Idempotent |
+| Auto-create midpoint guideline | `measurementArchive[activeStorageKey]` changes | Creates midpoint guideline when neck-width AND head-diameter both exist | **Safeguard**: reads `neck`/`head` from `curArchive` (current knee's archive), NOT from `workflow.stepResults`. Was previously the root cause of cross-knee phantom guidelines — `workflow.stepResults` could be stale from the previous knee during hip-switch renders. |
+| Save archive | `measurementArchive` change | Persists to `localStorage` | — |
+| Step list done check | — | Cross-checks `workflow.stepResults` against `measurementArchive[activeStorageKey]`. Non-auto steps require measurement existence in the current archive. | Prevents stale `workflow.stepResults` from showing phantom "done" states |
+
+**⚠️ Cross-Knee Contamination — Diagnostic Guide:**
+If hip-axis points on one knee appear constrained to the other knee's guideline:
+1. Check browser console for `[constrainPoints] CONSTRAINING` warnings — they log `point_laterality`, `guideline_laterality`, and `activeKey`
+2. Run `JSON.parse(localStorage.getItem('hip-measurements'))` and check for orphan midpoint guidelines (keys where `midpoint-guideline` exists but `femur-neck-width` does not)
+3. The one-time cleanup effect removes orphans on mount; the knee-switch cleanup removes them on toggle
+4. If issues persist after a hard refresh, the storage-level guard strips mismatched-laterality measurements on every write
+
+---
+
+#### `src/app/components/hip/HipMeasurementProtocols.ts` (~450 lines)
+
+Protocol definition and clinical measurement computations. Defines 10 steps with auto-computed derived values.
+
+**Protocol Steps (0-indexed):**
+| Index | ID | Primitive | Auto? | Description |
+|-------|----|-----------|-------|-------------|
+| 0 | `lesser-trochanter-guideline` | distance | No | G2 — line under lesser trochanter spanning full shaft width |
+| 1 | `femur-shaft-midline` | distance | Yes | G1 — perpendicular to G2 through its midpoint |
+| 2 | `medial-cortical-point` | point | No | Point on G2 at medial cortical edge |
+| 3 | `lateral-cortical-point` | point | No | Point on G2 at lateral cortical edge |
+| 4 | `femur-neck-width` | distance | No | G3 — shortest line across narrowest femoral neck |
+| 5 | `femur-head-diameter` | distance | No | G4 — parallel to G3 at widest femoral head |
+| 6 | `midpoint-guideline` | distance | Yes | G5 — line through midpoints of G3 and G4 |
+| 7 | `hip-axis-lateral` | point | No | Point on G5 at lateral femur edge |
+| 8 | `hip-axis-medial` | point | No | Point on G5 at medial pelvis edge |
+| 9 | `neck-axis-medial` | point | No | Point on G5 at medial femur head edge |
+
+**Geometry Helpers:**
+| Function | Purpose | Notes |
+|----------|---------|-------|
+| `toPhysical(p, ps, is)` | CSS px → physical mm | Includes imageScale offset correction |
+| `distMm(a, b, ps, is)` | Distance in mm | `hypot(dx×sx, dy×sy)` |
+| `perpDistMm(pt, p1, p2, ps, is)` | Perp distance to infinite line | Cross-product formula, verified correct |
+| `midpoint(a, b)` | Average of two points | — |
+| `angleBetweenLinesDeg(p1,p2,p3,p4,ps,is)` | Unsigned angle [0,180] | Uses `acos` of normalized dot product. Direction depends on drawing order — mitigated by `< 90°` obtuse heuristic in display. |
+| `signedAngleDeg(p1,p2,p3,p4,ps,is)` | Signed angle (-180,180] | Uses `atan2(cross, dot)`. CCW positive. |
+| `projectOntoLine(pt, p1, p2)` | Project point onto line | Returns fraction t for `p1 + t×(p2-p1)` |
+
+**`compute(results, ps, imageScale)`** — Produces clinical values M1–M10:
+- **M1/M2**: Medial/Lateral Cortical Thickness — distance from G2 endpoint to projected cortical point. Depends on correct G2 endpoint placement at bone edges.
+- **M3**: Shaft Thickness — distance between projected medial and lateral cortical points on G2.
+- **M4/M5**: Neck Width / Head Diameter — direct distances.
+- **M6**: Hip Axis Length — distance between hip-axis-lateral and hip-axis-medial projected onto G5.
+- **M7**: Femoral Neck Axis Length — distance between hip-axis-lateral and neck-axis-medial projected onto G5.
+- **M8**: Horizontal Offset — perpendicular from femoral head midpoint to G1 (shaft midline).
+- **M9**: Vertical Offset — perpendicular from femoral head midpoint to G2 (lesser trochanter guideline).
+- **M10**: Femur Neck Angle — angle between hip axis (on G5) and G1 (shaft midline). Displayed as obtuse (>90°) via `< 90° → 180−angle` heuristic.
+
+---
+
+#### `src/app/components/hip/HipXrayLoader.ts` (~220 lines)
+
+DICOM loader for individual hip X-ray files (CR/DX). Each file = one patient.
+
+**`parseHipXrayDicom(buffer, fileName)`** — Parses a single DICOM file:
+- Reads pixel data (8/16-bit, signed/unsigned), applies rescale slope/intercept
+- **Safeguard**: 8-bit signed data uses `Int8Array` (not `Uint8Array` as was previously)
+- **Safeguard**: MONOCHROME1 window center negated to match inverted pixel data
+- **Critical**: `pixelSpacing = { x: arr[1], y: arr[0] }` — DICOM Pixel Spacing `(0028,0030)` is `[row spacing, column spacing]` = `[Y, X]`. `arr[1]` → X, `arr[0]` → Y.
+- **Critical**: `pixDims = [0, psX, psY, 1]` — NIfTI convention: index 1 = column (X) spacing, index 2 = row (Y) spacing. Must be consistent with `dicom/DicomLoader.ts` and `dicom/dicomAffine.ts` which all use the same convention.
+
+**`loadHipXrayFolder(files, onProgress, abortSignal)`** — Loads a folder of DICOM files, returning `HipXrayImage[]`.
+
+---
+
+#### `src/app/components/dicom/DicomLoader.ts` (~580 lines)
+
+Shared DICOM volume loader for knee MRI series. Handles multi-slice volumes with plane detection.
+
+**`parseDicomFile(buffer)`** — Parses a single DICOM slice:
+- Same 8-bit signed and MONOCHROME1 safeguards as HipXrayLoader
+- Returns `ParsedSlice` with `photometricInterpretation` for downstream MONOCHROME1 handling
+
+**`loadDicomSeries(files, hint, laterality, options)`** — Builds 3D volume from slice stack:
+- Groups by modality, filters consistent rows/cols
+- Sorts slices by ImagePositionPatient projection on slice normal
+- Normalizes to 0–255 for Viewport compatibility
+- **Safeguard**: `dx = pixelSpacing[1]` (column), `dy = pixelSpacing[0]` (row) — consistent with DICOM `[Y,X]` storage order
+
+---
+
+#### `src/app/components/dicom/dicomAffine.ts` (~220 lines)
+
+3D affine transforms for cross-plane point mapping. Implements DICOM patient coordinate system.
+
+**`getDicomAffine(header)`** — Extracts affine from volume header: `dr = pixDims[2]` (row), `dc = pixDims[1]` (column). Requires pixDims to follow NIfTI convention (index 1 = column, index 2 = row).
+
+**`voxelToPatient(voxel, affine)`** — Maps `[row, col, slice]` → `[x, y, z]` in patient mm: `IPP + row×dr×rowDir + col×dc×colDir + slice×ds×sliceDir`
+
+**`patientToVoxel(patient, affine)`** — Inverse via general 3×3 cofactor expansion. Returns `[row, col, slice]`.
+
+**`mapPoint3D(srcX, srcY, srcSlice, srcAffine, dstAffine)`** — Cross-plane: maps a point from one series to another via patient space. Used for cross-plane protocols like Sulcus Angle 3 cm.
+
+**`validateAffine(affine, label)`** — Checks direction vector norms, orthogonality, spacing positivity, and matrix determinant.
+
+**`roundTripTest(affine, label, dims)`** — Verifies `patientToVoxel(voxelToPatient(v)) ≈ v` for corner/midpoint samples.
+
+---
+
+#### `src/app/components/dicom/laterality.ts` (~110 lines)
+
+Laterality detection from DICOM tags, series descriptions, and folder names. Priority: DICOM tag `(0020,0060)` > Series Description text > path heuristics.
+
+**`lateralityFromDicomTag(value)`** — Handles `'L'`, `'LEFT'`, `'R'`, `'RIGHT'`. **Note**: DICOM also allows `'LT'`, `'RT'`, `'B'` which are not currently handled (rare in practice).
+
+---
+
+#### `src/app/components/Viewport.tsx` (~3,200 lines)
+
+Shared canvas rendering component used by both knee and hip viewers.
+
+**Hip-specific snapping (point placement priority):**
+1. `pointConstraintLinePoints` — explicit line points from `HipXrayViewer`. Only set when neck+head exist for the current knee.
+2. `pointConstraintLineId` — measurement ID lookup (works for steps 3–4: G2 is in `measurements`; fails for steps 8–10: G5 is filtered out).
+3. `snapToNearestLine` — searches `measurements` + derived lines labeled `'Midpoint Guideline'`. **Safeguard**: derived lines filter by label to prevent snapping to G1 (Femur Shaft Midline), H-Offset, or V-Offset lines.
+
+**`derivedLines` prop** — Rendered as black dotted lines. Includes Midpoint Guideline from `HipXrayViewer.derivedLines`.
+
+---
+
+### Data Flow: Hip Measurement to Clinical Value
+
+```
+User draws on Viewport canvas (CSS px)
+  → Viewport emits Measurement with CSS-pixel points
+  → HipXrayViewer.handleMeasurementAdd stamps laterality, workflowStepId
+  → setMeasurements stores under measurementArchive[patientKey::laterality]
+  → cascadeDependents constrains point to guideline (if guideline exists)
+  → setWorkflow records step result
+  → HipMeasurementProtocols.compute() calculates M1–M10 in physical mm
+  → Result displayed in sidebar, exportable as CSV
+```
+
+---
+
+### Storage Architecture
+
+```
+localStorage['hip-measurements'] = {
+  "hip-9000798::left": [
+    { id: "hip-...", workflowStepId: "lesser-trochanter-guideline", laterality: "left", points: [...] },
+    { id: "hip-...", workflowStepId: "femur-neck-width", laterality: "left", points: [...] },
+    { id: "hip-...", workflowStepId: "femur-head-diameter", laterality: "left", points: [...] },
+    { id: "hip-...", workflowStepId: "midpoint-guideline", laterality: "left", points: [...] },
+    { id: "hip-...", workflowStepId: "hip-axis-lateral", laterality: "left", points: [...] },
+  ],
+  "hip-9000798::right": [
+    { id: "hip-...", workflowStepId: "lesser-trochanter-guideline", laterality: "right", points: [...] },
+  ],
+}
+```
+
+**Invariant**: Every measurement in `key::LATERALITY` must have `laterality: LATERALITY`. Enforced by storage-level guard on every write.
+
+**Filtered from `measurements` prop (but present in archive):**
+- `femur-shaft-midline` — rendered as derived line
+- `midpoint-guideline` — rendered as derived line, used for point constraint
+
+**Not stored in archive (computed on the fly):**
+- `shaft-thickness` — distance between cortical points
+- `horizontal-offset` — perpendicular from head midpoint to shaft midline
+- `vertical-offset` — perpendicular from head midpoint to G2
+- `femoral-neck-angle` — angle between hip axis and shaft midline
+
+---
+
+### Known Historical Bugs (Now Fixed)
+
+| Bug | Root Cause | Fix | File |
+|-----|-----------|-----|------|
+| Cross-knee phantom guidelines | Auto-create effect read `workflow.stepResults` which was stale during hip-switch render; `prevStepResultsRef` reset by rebuild effect allowed guard to pass | Read neck/head from `measurementArchive[activeStorageKey]` directly | `HipXrayViewer.tsx` |
+| Stale workflow contamination | `setWorkflow` spread `prev.stepResults` which carried previous knee's data | Rebuild `stepResults` from archive in all three `setWorkflow` calls | `HipXrayViewer.tsx` |
+| Pixel spacing X/Y swapped | DICOM `[row, col]` assigned to `psX, psY` | Swapped: `psY = arr[0]`, `psX = arr[1]`; fixed `pixDims` order to NIfTI convention | `HipXrayLoader.ts` |
+| 8-bit signed data misread | `Uint8Array` used for signed 8-bit | `pixelRepresentation === 1 ? Int8Array : Uint8Array` | Both loaders |
+| MONOCHROME1 window level | DICOM WC/WW not negated for inverted pixels | Negate `windowCenter` when `isMonochrome1` | Both loaders |
+| Cascade Y-only change missed | Change detection only compared `.x` | Added `.y` comparisons to parallel and midpoint recompute checks | `HipXrayViewer.tsx` |
+| Viewport snap to wrong line | `snapToNearestLine` searched all derived lines (including G1) | Added label filter `'Midpoint Guideline'` and explicit `pointConstraintLinePoints` prop | `Viewport.tsx` |
+| TDZ const errors | `constrainPoints` defined after dependents | Moved before `cascadeDependents` | `HipXrayViewer.tsx` |
+
+
 ## License
 
 PolyForm Noncommercial License 1.0.0 — free for personal, educational, academic research, and noncommercial clinical use. Commercial use requires a separate license. See [LICENSE](LICENSE) for full terms.
