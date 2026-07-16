@@ -325,26 +325,23 @@ const [showLabels, setShowLabels] = useState(true);
     }
     const g1Points = g2line && g2line.points.length >= 2 ? (() => { const m = { x: (g2line.points[0].x + g2line.points[1].x) / 2, y: (g2line.points[0].y + g2line.points[1].y) / 2 }; const dx = g2line.points[1].x - g2line.points[0].x, dy = g2line.points[1].y - g2line.points[0].y; const l = Math.hypot(dx, dy) || 1; const px = -dy / l, py = dx / l; const h = 300; return [{ x: m.x - px * h, y: m.y - py * h }, { x: m.x + px * h, y: m.y + py * h }]; })() : undefined;
     const ltGuid = measurements.find((m) => m.workflowStepId === 'lesser-trochanter-guideline');
-    // Read from raw archive only — stepResults is stale during first render after switching hips.
-    // The cascade already saves midpoint-guideline to the archive immediately, so the archive
-    // always has the current hip's data.
-    const archiveForThisHip = activeStorageKey ? (measurementArchive[activeStorageKey] ?? []) : [];
-    const midGuid = archiveForThisHip.find((m) => m.workflowStepId === 'midpoint-guideline');
-    const hipLat = measurements.find((m) => m.workflowStepId === 'hip-axis-lateral');
-    const hipMed = measurements.find((m) => m.workflowStepId === 'hip-axis-medial');
-
-    // Midpoint guideline (auto-created, show as black dashed derived line)
-    if (midGuid && midGuid.points.length >= 2) {
-      // Extend to edges
-      const p0 = midGuid.points[0], p1 = midGuid.points[1];
-      const dx = p1.x - p0.x, dy = p1.y - p0.y;
+    // Compute midpoint guideline on the fly from current hip's neck-width + head-diameter.
+    // Never read from archive or stepResults — that's what caused cross-hip leakage.
+    const neckW = measurements.find((m) => m.workflowStepId === 'femur-neck-width');
+    const headD = measurements.find((m) => m.workflowStepId === 'femur-head-diameter');
+    let midGuid: { points: { x: number; y: number }[] } | undefined;
+    if (neckW && headD && neckW.points.length >= 2 && headD.points.length >= 2) {
+      const nm = { x: (neckW.points[0].x + neckW.points[1].x) / 2, y: (neckW.points[0].y + neckW.points[1].y) / 2 };
+      const hm = { x: (headD.points[0].x + headD.points[1].x) / 2, y: (headD.points[0].y + headD.points[1].y) / 2 };
+      const dx = hm.x - nm.x, dy = hm.y - nm.y;
       const len = Math.hypot(dx, dy) || 1;
       const ux = dx / len, uy = dy / len;
       const big = 5000;
       lines.push({ points: [
-        { x: p0.x - ux * big, y: p0.y - uy * big },
-        { x: p1.x + ux * big, y: p1.y + uy * big }
-      ], label: 'Midpoint' });
+        { x: nm.x - ux * big, y: nm.y - uy * big },
+        { x: hm.x + ux * big, y: hm.y + uy * big }
+      ], label: 'Midpoint Guideline' });
+      midGuid = { points: [nm, hm] };
     }
 
     if (headDiam && headDiam.points.length >= 2) {
