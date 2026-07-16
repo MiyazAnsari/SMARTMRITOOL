@@ -278,14 +278,14 @@ const [showLabels, setShowLabels] = useState(true);
       const g = measurements.find((m) => m.workflowStepId === 'lesser-trochanter-guideline');
       return g?.id ?? null;
     }
-    // Steps 8-10: snap to midpoint guideline (search raw archive, not filtered measurements)
+    // Steps 8-10: snap to midpoint guideline — same laterality only
     if (stepId === 'hip-axis-lateral' || stepId === 'hip-axis-medial' || stepId === 'neck-axis-medial') {
       const raw = activeStorageKey ? (measurementArchive[activeStorageKey] ?? []) : [];
-      const g = raw.find((m) => m.workflowStepId === 'midpoint-guideline');
+      const g = raw.find((m) => m.workflowStepId === 'midpoint-guideline' && m.laterality === activeLaterality);
       return g?.id ?? null;
     }
     return null;
-  }, [protocolActive, activeStep, measurementArchive, activeStorageKey]);
+  }, [protocolActive, activeStep, measurementArchive, activeStorageKey, activeLaterality]);
 
   // Snap-to-lines for point steps (3, 4)
   const shouldSnapToLines = protocolActive && activeStep?.tool === 'point';
