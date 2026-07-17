@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""scripts_v4.py
+"""Synced from scripts_v4.ipynb (notebook is the blueprint).
+Keep scripts.py and scripts_v4.ipynb identical in analysis logic.
+"""
+
+"""
+scripts_v4.py
 
 Derived from scripts_v3.ipynb (Colab inter-rater reliability notebook).
 
@@ -70,7 +75,6 @@ import pandas as pd
 import os
 from pathlib import Path
 
-# Colab/notebook helper — in plain Python, fall back to printing the object
 try:
     from IPython.display import display  # type: ignore
 except ImportError:
@@ -78,16 +82,36 @@ except ImportError:
         print(obj)
 
 # =============================================================================
-# PATH CONFIG — edit LOCAL_PROJECT_PATH only if auto-detect cannot find Drive
+# PATH CONFIG — identical in scripts_v4.ipynb and scripts.py
 # =============================================================================
-# After Google Drive for Desktop is installed and signed in, leave this as None
-# and the script will look for:
-#   .../My Drive/Current Knee MRI Project Folder/csv exports
-# If you prefer, paste the full Finder path here (right-click folder → Option→Copy
-# as Pathname), e.g.:
+# Leave LOCAL_PROJECT_PATH as None to auto-detect Google Drive for Desktop.
+# Or paste a Finder path, e.g.:
 #   LOCAL_PROJECT_PATH = "/Users/you/Library/CloudStorage/GoogleDrive-you@email/My Drive/Current Knee MRI Project Folder"
-LOCAL_PROJECT_PATH = None
 
+# ── Ensure analysis packages exist (Colab + local) ──────────────────────────
+import sys
+import subprocess
+
+def _ensure_packages(pkgs):
+    missing = []
+    for pkg, mod in pkgs:
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        print('Installing:', ', '.join(missing))
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', *missing])
+
+_ensure_packages([
+    ('pingouin', 'pingouin'),
+    ('openpyxl', 'openpyxl'),
+    ('seaborn', 'seaborn'),
+    ('scipy', 'scipy'),
+    ('matplotlib', 'matplotlib'),
+])
+
+LOCAL_PROJECT_PATH = None
 PROJECT_FOLDER_NAME = 'Current Knee MRI Project Folder'
 CSV_SUBFOLDER_NAME = 'csv exports'
 
@@ -96,112 +120,134 @@ def _candidate_drive_project_paths():
     """Likely locations of the shared folder once Drive for Desktop is syncing."""
     home = Path.home()
     candidates = []
-
+    if LOCAL_PROJECT_PATH:
+        candidates.append(Path(LOCAL_PROJECT_PATH).expanduser())
     cloud = home / 'Library' / 'CloudStorage'
     if cloud.is_dir():
         for entry in sorted(cloud.iterdir()):
             if entry.name.startswith('GoogleDrive'):
                 candidates.append(entry / 'My Drive' / PROJECT_FOLDER_NAME)
                 candidates.append(entry / 'MyDrive' / PROJECT_FOLDER_NAME)
-
-    # Legacy / alternate mount points some Macs still use
     for base in (
         home / 'Google Drive' / 'My Drive',
         home / 'Google Drive',
         Path('/Volumes/GoogleDrive/My Drive'),
     ):
         candidates.append(base / PROJECT_FOLDER_NAME)
-
-    if LOCAL_PROJECT_PATH:
-        candidates.insert(0, Path(LOCAL_PROJECT_PATH).expanduser())
-
-    # Last resort: csv exports sitting inside this git repo
-    candidates.append(Path(__file__).resolve().parent / PROJECT_FOLDER_NAME)
-    candidates.append(Path(__file__).resolve().parent)
-
+    # Last resort: folder next to this file / notebook working dir
+    try:
+        here = Path(__file__).resolve().parent
+    except NameError:
+        here = Path.cwd()
+    candidates.append(here / PROJECT_FOLDER_NAME)
+    candidates.append(here)
     return candidates
+
+
+def _in_colab():
+    try:
+        import google.colab  # type: ignore  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 def resolve_project_path():
     """Colab Drive mount if available; otherwise Drive Desktop / local folder."""
-    try:
+    if _in_colab():
         from google.colab import drive  # type: ignore
         drive.mount('/content/drive')
-        return Path('/content/drive/MyDrive') / PROJECT_FOLDER_NAME
-    except Exception:
-        pass
+        project = Path('/content/drive/MyDrive') / PROJECT_FOLDER_NAME
+        csv_dir = project / CSV_SUBFOLDER_NAME
+        if not csv_dir.is_dir():
+            raise FileNotFoundError(
+                'Colab mounted Drive, but the project CSV folder was not found.\n\n'
+                f'Expected: {csv_dir}\n\n'
+                'Fix: In Google Drive (browser), open Shared with me → '
+                f'"{PROJECT_FOLDER_NAME}" → Organize → Add shortcut to Drive → My Drive. '
+                'Then Runtime → Restart session and re-run.'
+            )
+        return project
 
     for project in _candidate_drive_project_paths():
-        csv_dir = project / CSV_SUBFOLDER_NAME
-        if csv_dir.is_dir():
+        if (project / CSV_SUBFOLDER_NAME).is_dir():
             return project
-
     searched = '\n'.join(f'  - {p / CSV_SUBFOLDER_NAME}' for p in _candidate_drive_project_paths())
     raise FileNotFoundError(
         'Could not find the measurement CSV folder.\n\n'
         f'Looking for: "{PROJECT_FOLDER_NAME}/{CSV_SUBFOLDER_NAME}"\n\n'
         'Fix checklist:\n'
         '  1. Install Google Drive for Desktop and sign in.\n'
-        '  2. In drive.google.com, add the shared project as a shortcut to My Drive.\n'
-        '  3. Wait until Finder shows that folder under Google Drive.\n'
-        '  4. Or set LOCAL_PROJECT_PATH near the top of scripts.py to the Finder path.\n\n'
+        '  2. Add the shared project as a shortcut to My Drive.\n'
+        '  3. Or set LOCAL_PROJECT_PATH near the top of this cell/file.\n\n'
         f'Paths tried:\n{searched}'
     )
 
 
-project_path = resolve_project_path()
-csv_folder = project_path / CSV_SUBFOLDER_NAME
-figures_folder = project_path / 'figures'
+project_path = str(resolve_project_path())
+csv_folder = os.path.join(project_path, CSV_SUBFOLDER_NAME)
 print(f'Using project folder: {project_path}')
 print(f'Using CSV folder:     {csv_folder}')
-print(f'Figures will save to: {figures_folder}')
 
-# ── Load every CSV file, tag with source filename, concatenate ───────────────
+if not os.path.exists(csv_folder):
+    raise FileNotFoundError(f"CSV folder not found: {csv_folder}")
+
+# ── Load every CSV file, tag with source filename and file mtime ───────────
 csv_files = sorted(f for f in os.listdir(csv_folder) if f.lower().endswith('.csv'))
-print(f"Found {len(csv_files)} CSV file(s): {csv_files}")
+print(f"Found {len(csv_files)} CSV file(s)")
 
 raw_frames = []
 for fname in csv_files:
-    fdf = pd.read_csv(os.path.join(csv_folder, fname))
+    fpath = os.path.join(csv_folder, fname)
+    try:
+        # Using engine='python' to more robustly handle 'on_bad_lines' and avoid C-buffer overflows
+        fdf = pd.read_csv(fpath, on_bad_lines='warn', engine='python')
+    except UnicodeDecodeError:
+        try:
+            # Fallback to cp1252 with error replacement for characters like 0x9d
+            fdf = pd.read_csv(fpath, encoding='cp1252', encoding_errors='replace', on_bad_lines='warn', engine='python')
+        except Exception as e:
+            print(f"⚠ Skipping unreadable CSV '{fname}': {e}")
+            continue
+    except Exception as e:
+        print(f"⚠ Skipping unreadable CSV '{fname}': {e}")
+        continue
+
+    # Skip non-export files (e.g. Pages docs renamed .csv)
+    required_cols = {'groupId', 'recordType'}
+    if not required_cols.issubset(set(fdf.columns)):
+        print(
+            f"⚠ Skipping '{fname}': missing required columns "
+            f"{sorted(required_cols - set(fdf.columns))} (not a protocol measurement export)"
+        )
+        continue
+
     fdf['__source_file'] = fname
+    # Capture file modification time to determine 'latest'
+    fdf['__file_mtime'] = os.path.getmtime(fpath)
+    # Capture original row index to handle ties within a single file
+    fdf['__row_index'] = fdf.index
     raw_frames.append(fdf)
 
-all_rows = pd.concat(raw_frames, ignore_index=True)
+if not raw_frames:
+    raise FileNotFoundError(f'No readable CSV files in {csv_folder}')
 
-# ── Derive true_protocol from groupId ─────────────────────────────────────────
-# groupId format: '<protocol-slug>-<timestamp>'  e.g. 'sulcus-angle-3cm-1781115379010'
-# protocolId is unreliable for sulcus-angle vs sulcus-angle-3cm (both stored as 'sulcus-angle')
+all_rows = pd.concat(raw_frames, ignore_index=True)
 all_rows['true_protocol'] = all_rows['groupId'].str.extract(r'^([a-z][a-z0-9]*(?:-[a-z0-9]+)*?)-\d+$')
 
-# ── Identify raters by (sessionUser, sessionUserEmail) — NOT by filename ─────
 if 'sessionUserEmail' in all_rows.columns and all_rows['sessionUserEmail'].notna().any():
     id_cols = ['sessionUser', 'sessionUserEmail']
 else:
-    # Fallback: no identity columns present, treat each source file as one rater
-    print("⚠ sessionUser/sessionUserEmail not found — falling back to filename as rater identity.")
     id_cols = ['__source_file']
 
 all_rows['rater_key'] = all_rows[id_cols].astype(str).agg(' | '.join, axis=1)
 
-# ── Split into per-rater dataframes ───────────────────────────────────────────
 dataframes = {key: grp.copy() for key, grp in all_rows.groupby('rater_key')}
 rater_keys = sorted(dataframes.keys())
+print(f"Raters identified: {len(rater_keys)}")
 
-print(f"\nRaters identified ({len(rater_keys)}):")
-for rk in rater_keys:
-    df = dataframes[rk]
-    files = df['__source_file'].unique().tolist()
-    print(f"  '{rk}': {len(df)} rows from {len(files)} file(s) {files}")
-
-if len(rater_keys) < 2:
-    raise ValueError(
-        f"Need at least 2 raters for comparison. Found: {rater_keys}\n"
-        "Check that sessionUser/sessionUserEmail are populated correctly in each export."
-    )
-
-print(f"\nDefaulting to comparing all {len(rater_keys)} raters: {rater_keys}")
-
-"""### 1.5. Line Standardization — Endpoints and Sulcus Anatomical Matching
+"""
+### 1.5. Line Standardization — Endpoints and Sulcus Anatomical Matching
 
 Raters may draw the same anatomical line in opposite directions (top↔bottom,
 left↔right). Sulcus-angle raters may also swap lateral vs. medial condyle labels,
@@ -534,7 +580,8 @@ print(f"  Raters: {standardized_landmarks_df['rater_key'].nunique()}")
 print(f"  Saved to: {landmarks_out}")
 display(standardized_landmarks_df.head(10))
 
-"""### 2. Preview Annotations
+"""
+### 2. Preview Annotations
 Record types, true protocol coverage, and column layout per rater — a sanity check
 before any statistics are computed.
 """
@@ -547,7 +594,8 @@ for rk in rater_keys:
     print(f"true_protocol  : {df['true_protocol'].value_counts().to_dict()}")
     display(df[df['recordType'] == 'protocol_result'].head(3))
 
-"""---
+"""
+---
 ## Part II — Clinical Value Agreement
 
 Before trusting any single landmark click, we first ask the coarser question: do raters
@@ -573,7 +621,6 @@ Reports, in order of preference:
 import sys
 import subprocess
 from itertools import combinations
-
 import numpy as np
 
 try:
@@ -582,187 +629,214 @@ except ImportError:
     subprocess.run([sys.executable, '-m', 'pip', 'install', 'pingouin', '-q'])
     import pingouin as pg
 
-CASE_KEY = ['patientId', 'laterality', 'true_protocol']
-
+# User defined reliable composite key for deduplication
+CASE_KEY = [
+    'recordType', 'patientId', 'sessionUser', 'sessionUserEmail',
+    'laterality', 'sequenceName', 'plane', 'protocolId'
+]
 
 def extract_results(df, rater_key):
-    """One protocol_result row per case per rater; median resultValue when re-run duplicates exist."""
+    """Extract protocol_result rows using a robust composite key, selecting the latest measurement via groupId timestamp."""
     result_df = df[df['recordType'] == 'protocol_result'].copy()
-    sub = result_df[CASE_KEY + ['resultValue', 'resultUnit']].copy()
 
-    dup_mask = sub.duplicated(subset=CASE_KEY, keep=False)
-    if dup_mask.any():
-        n_dup = dup_mask.sum()
-        sub = (
-            sub.groupby(CASE_KEY, as_index=False)
-               .agg(resultValue=('resultValue', 'median'),
-                    resultUnit=('resultUnit', 'first'))
-        )
-        print(f"  {rater_key.split(' | ')[0]}: collapsed {n_dup} duplicate row(s) → median per case")
+    # Extract Unix timestamp from the end of the groupId (e.g., protocol-id-1712345678000)
+    # We use (\\d+) digits at the end of the string
+    result_df['__group_timestamp'] = pd.to_numeric(
+        result_df['groupId'].str.extract(r'-(\d+)$')[0],
+        errors='coerce'
+    ).fillna(0)
 
-    return sub.rename(columns={'resultValue': f'value_{rater_key}',
-                               'resultUnit':  f'unit_{rater_key}'})
+    # Sort by the embedded timestamp (desc) then original row index (desc) to get latest first
+    sub = result_df.sort_values(['__group_timestamp', '__row_index'], ascending=False)
 
+    # Drop duplicates using the comprehensive composite key, keeping the first (latest)
+    before_len = len(sub)
+    sub = sub.drop_duplicates(subset=CASE_KEY, keep='first')
+    n_dup = before_len - len(sub)
 
-# ── Wide merge: one value column per rater ───────────────────────────────────
-print("Extracting protocol_result rows (one value per rater per case)...")
+    if n_dup > 0:
+        print(f"  {rater_key.split(' | ')[0]}: ignored {n_dup} older duplicate measurement(s) based on groupId timestamp")
+
+    return sub[['patientId', 'laterality', 'true_protocol', 'resultValue', 'resultUnit']].rename(
+        columns={'resultValue': f'value_{rater_key}', 'resultUnit': f'unit_{rater_key}'}
+    )
+
+print("Extracting protocol_result rows (selecting latest measurement using groupId timestamps)... ")
 processed = [extract_results(dataframes[k], k) for k in rater_keys]
+
+# Re-bind JOIN_KEYS for the outer merge operation
+JOIN_KEYS = ['patientId', 'laterality', 'true_protocol']
 
 comparison_df = processed[0]
 for nxt in processed[1:]:
-    comparison_df = comparison_df.merge(nxt, on=CASE_KEY, how='outer')
+    comparison_df = comparison_df.merge(nxt, on=JOIN_KEYS, how='outer')
 
 value_cols = [f'value_{k}' for k in rater_keys]
-comparison_df = comparison_df[comparison_df[value_cols].notna().sum(axis=1) >= 2].reset_index(drop=True)
-comparison_df['mean_val'] = comparison_df[value_cols].mean(axis=1, skipna=True)
 comparison_df['n_raters_present'] = comparison_df[value_cols].notna().sum(axis=1)
+comparison_df = comparison_df[comparison_df['n_raters_present'] >= 2].reset_index(drop=True)
 
-print(f"\nMatched records (≥2 raters present): {len(comparison_df)}")
-print(f"Protocols: {sorted(comparison_df['true_protocol'].dropna().unique())}")
-print(f"Raters: {[k.split(' | ')[0] for k in rater_keys]}")
+print(f"\nMatched records (≥2 raters): {len(comparison_df)}")
+display(comparison_df.groupby('true_protocol')[value_cols].count())
 
-print("\nRater coverage per protocol:")
-coverage = comparison_df.groupby('true_protocol')[value_cols].apply(lambda g: g.notna().sum())
-display(coverage)
+# Used by Bland-Altman, bias summary, redo queue, and planar cells
+rater_pairs = list(combinations(rater_keys, 2))
+print(f"Rater pairs: {len(rater_pairs)}")
 
-# ── Default rater pairs for every pairwise output in this notebook ──────────
-# Override e.g. RATER_PAIRS_OVERRIDE = [('alice | a@x.com', 'bob | b@x.com')]
-RATER_PAIRS_OVERRIDE = None
-rater_pairs = RATER_PAIRS_OVERRIDE or list(combinations(rater_keys, 2))
-print(f"\nRater pairs for all pairwise outputs ({len(rater_pairs)}): {rater_pairs}")
+"""
+### 3.1. Statistical Reliability Metrics (ICC and Pearson r)
 
-# ── Per-protocol ICC(2,1) across ALL raters — primary clinical metric ───────
-print("\nPer-protocol ICC(2,1) — two-way mixed, absolute agreement, all raters jointly:")
-icc_rows = []
-for protocol, grp in comparison_df.groupby('true_protocol'):
-    complete = grp.dropna(subset=value_cols)
-    if len(complete) < 3:
-        print(f"  {protocol}: skipped (n={len(complete)} cases with all raters present)")
+We calculate **ICC(2,1)** (two-way random effects, absolute agreement, single rater) to assess the reliability of the clinical values across all raters. We also compute pairwise **Pearson correlation coefficients** for each rater pair per protocol.
+"""
+
+icc_results = []
+pearson_results = []
+
+# Get list of protocols present in the comparison dataframe
+protocols = sorted(comparison_df['true_protocol'].dropna().unique())
+
+for protocol in protocols:
+    # Subset data for this protocol
+    prot_df = comparison_df[comparison_df['true_protocol'] == protocol].copy()
+    if prot_df.empty:
         continue
-    long = complete.melt(
-        id_vars=CASE_KEY[:2],
+
+    # 1. ICC Calculation
+    # Convert wide to long format for pingouin
+    long_df = prot_df.melt(
+        id_vars=['patientId', 'laterality'],
         value_vars=value_cols,
-        var_name='rater', value_name='value'
-    )
-    long['subject'] = long['patientId'].astype(str) + '_' + long['laterality'].astype(str)
-    long['rater']   = long['rater'].str.replace('value_', '', regex=False)
-    try:
-        icc_p = pg.intraclass_corr(long, targets='subject', raters='rater', ratings='value')
-        icc2 = icc_p[icc_p['Type'].isin(['ICC2', 'ICC2k'])]
-        if icc2.empty:
-            raise ValueError(f"ICC2 row not found; types: {icc_p['Type'].tolist()}")
-        row = icc2.iloc[0]
-        icc_rows.append({
-            'Protocol': protocol,
-            'n_cases': len(complete),
-            'n_raters': len(rater_keys),
-            'ICC2,1': round(row['ICC'], 3),
-            'CI_lower': round(row['CI95%'][0], 3),
-            'CI_upper': round(row['CI95%'][1], 3),
-            'p': f"{row['pval']:.3e}",
-            'Interpretation': (
-                'Excellent (≥0.90)' if row['ICC'] >= 0.90 else
-                'Good (0.75–0.89)'  if row['ICC'] >= 0.75 else
-                'Moderate (0.50–0.74)' if row['ICC'] >= 0.50 else
-                'Poor (<0.50)'
-            ),
-        })
-    except Exception as e:
-        print(f"  {protocol}: ICC error — {e}")
+        var_name='rater',
+        value_name='value'
+    ).dropna()
 
-icc_df = pd.DataFrame(icc_rows)
-display(icc_df)
+    # Create a unique subject ID for the ICC
+    long_df['subject'] = long_df['patientId'].astype(str) + '_' + long_df['laterality'].astype(str)
 
-# ── Per-protocol pairwise Pearson r (secondary view) ─────────────────────────
-print("\nPairwise Pearson r by protocol (pairwise complete cases within each protocol):")
-pearson_rows = []
-for protocol in sorted(comparison_df['true_protocol'].dropna().unique()):
-    sub = comparison_df.loc[comparison_df['true_protocol'] == protocol, value_cols]
-    for ra, rb in rater_pairs:
-        pair = sub[[f'value_{ra}', f'value_{rb}']].dropna()
-        if len(pair) < 3:
-            continue
-        r = pair[f'value_{ra}'].corr(pair[f'value_{rb}'])
-        pearson_rows.append({
-            'Protocol': protocol,
-            'Rater A': ra.split(' | ')[0],
-            'Rater B': rb.split(' | ')[0],
-            'n': len(pair),
-            'Pearson r': round(r, 4),
-        })
+    # Filter to subjects that have at least 2 ratings for this specific protocol
+    subject_counts = long_df['subject'].value_counts()
+    valid_subjects = subject_counts[subject_counts >= 2].index
+    long_df_balanced = long_df[long_df['subject'].isin(valid_subjects)]
 
-pearson_df = pd.DataFrame(pearson_rows)
-display(pearson_df)
+    if long_df_balanced['rater'].nunique() > 1 and len(valid_subjects) >= 5:
+        try:
+            # Using nan_policy='omit' to handle unbalanced data
+            try:
+                icc = pg.intraclass_corr(
+                    data=long_df_balanced, targets='subject', raters='rater',
+                    ratings='value', nan_policy='omit',
+                )
+            except TypeError:
+                # Older pingouin (common on Colab) has no nan_policy=
+                icc = pg.intraclass_corr(
+                    data=long_df_balanced, targets='subject', raters='rater',
+                    ratings='value',
+                )
+            icc['Protocol'] = protocol
+            icc_results.append(icc)
+        except Exception as e:
+            print(f"Could not calculate ICC for {protocol}: {e}")
 
-# ── Pooled Pearson correlation matrix (reference only) ──────────────────────
-print("\nPooled Pearson correlation matrix (reference only; use per-protocol ICC clinically):")
-display(comparison_df[value_cols].corr().round(4))
+    # 2. Pairwise Pearson r
+    for ra, rb in combinations(rater_keys, 2):
+        v_a, v_b = f'value_{ra}', f'value_{rb}'
+        pair_sub = prot_df[[v_a, v_b]].dropna()
+        if len(pair_sub) > 2:
+            r = pair_sub[v_a].corr(pair_sub[v_b])
+            pearson_results.append({
+                'Protocol': protocol,
+                'Rater A': ra.split(' | ')[0],
+                'Rater B': rb.split(' | ')[0],
+                'n': len(pair_sub),
+                'Pearson r': round(r, 4)
+            })
 
-"""### 4. Clinical Agreement, Visually — Bland-Altman per Protocol
+# Display ICC Results
+if icc_results:
+    icc_df = pd.concat(icc_results)
+    # Select Absolute Agreement (ICC2) regardless of label convention
+    icc_summary = icc_df[icc_df['Type'].str.contains('ICC2|ICC\\(A,1\\)')].copy()
+    print("\n--- Inter-Rater Reliability: ICC(2,1) per Protocol ---")
+    ci_col = 'CI95' if 'CI95' in icc_summary.columns else 'CI95%'
+    cols_to_show = ['Protocol', 'Type', 'ICC', 'F', 'df1', 'df2', 'pval', ci_col]
+    display(icc_summary[cols_to_show].round(3))
+
+# Display Pearson Results
+if pearson_results:
+    pearson_df = pd.DataFrame(pearson_results)
+    print("\n--- Pairwise Pearson Correlation (Mean per Protocol) ---")
+    display(pearson_df.groupby('Protocol')['Pearson r'].mean().to_frame())
+
+"""
+### 6. Planar Coordinate Variability and ICC
+
+We now measure how consistent the raw **(x, y) landmark clicks** are in the imaging plane, using the Hungarian algorithm to match points and calculating pairwise planar distances.
+"""
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import pandas as pd
+from scipy.optimize import linear_sum_assignment
+from itertools import combinations
+
+# Define missing dependencies needed by this cell
+step_cols = ['patientId', 'laterality', 'true_protocol', 'stepId', 'stepLabel',
+             'plane', 'sliceIndex', 'measurementType', 'pointCount',
+             'stepPointsMmJson', 'pointsJson']
+step_frames = {
+    rk: dataframes[rk][dataframes[rk]['recordType'] == 'step_measurement'][step_cols].copy()
+    for rk in rater_keys
+}
+STEP_MERGE_KEYS = ['patientId', 'laterality', 'true_protocol', 'stepId']
+
+def match_points_xy(pts_a, pts_b):
+    n = len(pts_a)
+    if n == 0 or n != len(pts_b):
+        return pts_b
+    a_xy = np.array([[p['x'], p['y']] for p in pts_a])
+    b_xy = np.array([[p['x'], p['y']] for p in pts_b])
+    cost_matrix = np.linalg.norm(a_xy[:, np.newaxis, :] - b_xy[np.newaxis, :, :], axis=2)
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+    return [pts_b[i] for i in col_ind]
+
+def planar_distance_for_pair(ra, rb):
+    merged = step_frames[ra].merge(step_frames[rb], on=STEP_MERGE_KEYS, suffixes=('_a', '_b'))
+    rows = []
+    for _, row in merged.iterrows():
+        pts_a = parse_points_json(row['stepPointsMmJson_a'])[:2]
+        pts_b = parse_points_json(row['stepPointsMmJson_b'])[:2]
+        if len(pts_a) != len(pts_b) or len(pts_a) == 0: continue
+        pts_b_matched = match_points_xy(pts_a, pts_b)
+        for i, (p_a, p_b) in enumerate(zip(pts_a, pts_b_matched)):
+            dist = np.linalg.norm([p_a['x'] - p_b['x'], p_a['y'] - p_b['y']])
+            rows.append({'rater_a': ra, 'rater_b': rb, 'stepId': row['stepId'], 'dist_mm': dist})
+    return pd.DataFrame(rows)
+
+rater_pairs = list(combinations(rater_keys, 2))
+pairwise_planar_dfs = [planar_distance_for_pair(ra, rb) for ra, rb in rater_pairs]
+planar_variability_df = pd.concat(pairwise_planar_dfs, ignore_index=True)
+
+display(planar_variability_df.groupby('stepId')['dist_mm'].agg(['mean', 'std', 'max']).round(2))
+
+planar_stats = planar_variability_df.groupby('stepId')['dist_mm'].agg(['mean', 'std', 'max', 'count']).round(2)
+planar_out_path = os.path.join(project_path, 'planar_variability_summary.csv')
+planar_stats.to_csv(planar_out_path)
+print(f"Planar variability summary saved to: {planar_out_path}")
+display(planar_stats)
+
+"""
+### 4. Clinical Agreement, Visually — Bland-Altman per Protocol
 
 **Bland-Altman is inherently pairwise** (it plots difference vs. mean for two raters),
 so with N raters it is produced for every pair: $\\binom{N}{2}$ figures, each with one
 row per protocol. With many raters this can be a lot of plots — restrict
 `RATER_PAIRS_OVERRIDE` in Section 3 if needed.
-
-Figures are written to `{project}/figures/` on Google Drive. Each run clears that
-folder first so previous plots are overwritten by the latest analysis.
 """
 
-import re
-import shutil
-
-import matplotlib
-matplotlib.use('Agg')  # save files only — no popup windows
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 sns.set_theme(style='whitegrid')
-plt.rcParams.update({
-    'figure.dpi': 110,
-    'savefig.dpi': 150,
-    'axes.titlesize': 11,
-    'axes.labelsize': 10,
-    'xtick.labelsize': 9,
-    'ytick.labelsize': 9,
-    'legend.fontsize': 8,
-})
-
-
-def short_rater(rater_key):
-    """Display name only — full email keys smash axis labels."""
-    return str(rater_key).split(' | ')[0]
-
-
-def slugify(text):
-    """Safe filesystem name from a display string."""
-    s = re.sub(r'[^a-z0-9]+', '-', str(text).strip().lower())
-    return s.strip('-') or 'figure'
-
-
-def prepare_figures_folder(folder):
-    """Create figures/ and remove prior plot files so each run overwrites cleanly."""
-    folder = Path(folder)
-    if folder.exists():
-        for p in folder.iterdir():
-            if p.is_file():
-                p.unlink()
-            elif p.is_dir():
-                shutil.rmtree(p)
-    else:
-        folder.mkdir(parents=True, exist_ok=True)
-    print(f'\nFigures folder ready (cleared for this run): {folder}')
-
-
-def save_figure(fig, stem):
-    """Write figure PNG into the Drive figures folder; returns saved path."""
-    path = figures_folder / f'{stem}.png'
-    fig.savefig(path, bbox_inches='tight', facecolor='white')
-    print(f'  saved {path.name}')
-    return path
-
-
-prepare_figures_folder(figures_folder)
 
 # Reference ranges from MSK README per true_protocol
 PROTOCOL_META = {
@@ -776,19 +850,22 @@ PROTOCOL_META = {
 
 protocols = sorted(comparison_df['true_protocol'].dropna().unique())
 
-# One figure per rater-pair × protocol (2 panels). A single 6×2 mega-figure
-# compresses on screen and causes title / label / legend collisions.
 for ra, rb in rater_pairs:
+    # Use the deduplicated comparison_df
     pair_df = comparison_df.dropna(subset=[f'value_{ra}', f'value_{rb}']).copy()
     if pair_df.empty:
-        print(f"\nNo overlapping cases for pair ({ra}, {rb}) — skipping.")
         continue
-    pair_df['diff'] = pair_df[f'value_{ra}'] - pair_df[f'value_{rb}']
-    ra_s, rb_s = short_rater(ra), short_rater(rb)
 
-    for protocol in protocols:
+    pair_df['diff'] = pair_df[f'value_{ra}'] - pair_df[f'value_{rb}']
+
+    n_prot    = len(protocols)
+    fig, axes = plt.subplots(n_prot, 2, figsize=(14, 5 * n_prot), squeeze=False)
+    fig.suptitle(f'Rater comparison (Deduplicated): {ra} vs {rb}', fontsize=14, y=1.0)
+
+    for ax_row, protocol in zip(axes, protocols):
         sub = pair_df[pair_df['true_protocol'] == protocol]
         if sub.empty:
+            ax_row[0].axis('off'); ax_row[1].axis('off')
             continue
 
         diff = sub['diff']
@@ -796,48 +873,31 @@ for ra, rb in rater_pairs:
         md_, sd_ = diff.mean(), diff.std()
         meta = PROTOCOL_META.get(protocol, {})
         unit = meta.get('unit', '')
-        ref_bits = []
-        if meta.get('normal'):
-            ref_bits.append(f"normal {meta['normal']}")
-        if meta.get('borderline'):
-            ref_bits.append(f"borderline {meta['borderline']}")
-        ref_line = ' · '.join(ref_bits)
 
-        fig, (ax_hist, ax_ba) = plt.subplots(
-            1, 2, figsize=(12, 4.8), constrained_layout=True
-        )
-        fig.suptitle(
-            f'{ra_s} vs {rb_s}  —  {protocol}'
-            + (f'  ({ref_line})' if ref_line else ''),
-            fontsize=12,
-        )
+        sns.histplot(diff, kde=True, ax=ax_row[0], color='steelblue')
+        ax_row[0].axvline(0, color='red', linestyle='--', linewidth=1.5)
+        ax_row[0].set_title(f'{protocol} [{unit}]\nDifference Distribution')
+        ax_row[0].set_xlabel(f'{ra} − {rb}')
 
-        sns.histplot(diff, kde=True, ax=ax_hist, color='steelblue')
-        ax_hist.axvline(0, color='red', linestyle='--', linewidth=1.5)
-        ax_hist.set_title(f'Difference distribution [{unit}]')
-        ax_hist.set_xlabel(f'{ra_s} − {rb_s}')
-        ax_hist.set_ylabel('Count')
-
-        ax_ba.scatter(mean, diff, alpha=0.6, color='steelblue', s=28)
+        ax_row[1].scatter(mean, diff, alpha=0.6, color='steelblue')
         for level, label, ls, color in [
-            (md_,              f'Bias: {md_:.3f}',               '--', 'red'),
-            (md_ + 1.96 * sd_, f'+1.96 SD: {md_+1.96*sd_:.3f}', ':',  'gray'),
-            (md_ - 1.96 * sd_, f'−1.96 SD: {md_-1.96*sd_:.3f}', ':',  'gray'),
+            (md_,              f'Bias: {md_:.3f}',               "--", "red"),
+            (md_ + 1.96 * sd_, f"+1.96 SD: {md_+1.96*sd_:.3f}", ":",  "gray"),
+            (md_ - 1.96 * sd_, f"−1.96 SD: {md_-1.96*sd_:.3f}", ":",  "gray"),
         ]:
-            ax_ba.axhline(level, linestyle=ls, color=color, label=label)
-        ax_ba.set_title(f'Bland–Altman  (n={len(sub)})')
-        ax_ba.set_xlabel(f'Mean of {ra_s} & {rb_s}')
-        ax_ba.set_ylabel(f'{ra_s} − {rb_s}  [{unit}]')
-        # Keep legend inside plot area so constrained_layout does not clip it
-        ax_ba.legend(loc='best', framealpha=0.92)
+            ax_row[1].axhline(level, linestyle=ls, color=color, label=label)
 
-        save_figure(
-            fig,
-            f'bland-altman__{slugify(ra_s)}__vs__{slugify(rb_s)}__{slugify(protocol)}',
-        )
-        plt.close(fig)
+        subtitle = f"Normal: {meta['normal']}" if meta.get('normal') else ''
+        ax_row[1].set_title(f'{protocol}\nBland-Altman (n={len(sub)})\n{subtitle}')
+        ax_row[1].set_xlabel('Mean of pair')
+        ax_row[1].set_ylabel(f'{ra} − {rb} [{unit}]')
+        ax_row[1].legend(fontsize=8)
 
-"""### 5. Bias Summary — Pooled Bland-Altman Statistics
+    plt.tight_layout()
+    plt.show()
+
+"""
+### 5. Bias Summary — Pooled Bland-Altman Statistics
 
 The numeric counterpart to Section 4: bias and 95% limits-of-agreement (LoA) per
 `true_protocol`, computed per rater pair and then pooled. Ratios (CDI, IS) have
@@ -884,7 +944,219 @@ display(summary_df.groupby('Protocol').agg(
     mean_LoA_width=('LoA_width', 'mean'),
 ).round(4).reset_index())
 
-"""---
+"""
+### 5.1 Redo Queue — Who Needs to Re-annotate Which Cases
+
+Builds an actionable **per-person redo list** from clinical outliers:
+
+- A case is flagged when two raters' difference is **> 2 SD from that pair's mean bias** for the same protocol (same rule as the cell above).
+- **Both raters in the disagreeing pair** get a review/redo task for that `patientId + laterality + protocol`.
+- The rater farther from the multi-rater median on that case is marked `suggested_focus = Yes` (likely the odd measurement).
+- Exports to Drive:
+  - `redo_queue.csv` — flat list for filters / scripts
+  - `redo_queue.xlsx` — sheets: **Redo_Queue** (edit `status` / `done_date` / `notes`), **By_Rater**, **Unique_Cases**
+
+Re-run this cell after new annotations; it **overwrites** those files. Keep your Done marks in a copy if you need history across runs.
+"""
+
+import sys
+import subprocess
+try:
+    import openpyxl  # noqa: F401
+except ImportError:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'openpyxl'])
+
+import re
+from pathlib import Path
+
+# ── Config ──────────────────────────────────────────────────────────────────
+REDO_Z_THRESHOLD = 2.0          # |diff - pair_mean| / pair_std
+REDO_MIN_PAIR_N = 5             # skip unstable pair/protocol groups
+STATUS_DEFAULT = 'Pending'      # Pending | Done | Skipped
+
+# ── Build outlier events (pair × protocol × case) ───────────────────────────
+outlier_events = []
+
+for ra, rb in rater_pairs:
+    va, vb = f'value_{ra}', f'value_{rb}'
+    pair_df = comparison_df.dropna(subset=[va, vb]).copy()
+    if pair_df.empty:
+        continue
+
+    pair_df['diff'] = pair_df[va] - pair_df[vb]
+    ra_name, rb_name = ra.split(' | ')[0], rb.split(' | ')[0]
+    ra_email = ra.split(' | ')[1] if ' | ' in ra else ''
+    rb_email = rb.split(' | ')[1] if ' | ' in rb else ''
+
+    for protocol, grp in pair_df.groupby('true_protocol'):
+        if len(grp) < REDO_MIN_PAIR_N:
+            continue
+        m_bias = grp['diff'].mean()
+        std_bias = grp['diff'].std(ddof=1)
+        if pd.isna(std_bias) or std_bias == 0:
+            continue
+
+        z = (grp['diff'] - m_bias) / std_bias
+        flagged = grp.loc[z.abs() > REDO_Z_THRESHOLD].copy()
+        flagged['z_score'] = z.loc[flagged.index]
+
+        meta = PROTOCOL_META.get(protocol, {})
+        unit = meta.get('unit', '')
+
+        for _, row in flagged.iterrows():
+            # Multi-rater consensus on this case (median of all present raters)
+            case_mask = (
+                (comparison_df['patientId'] == row['patientId'])
+                & (comparison_df['laterality'] == row['laterality'])
+                & (comparison_df['true_protocol'] == protocol)
+            )
+            case_vals = {}
+            for rk in rater_keys:
+                col = f'value_{rk}'
+                if col in comparison_df.columns:
+                    v = comparison_df.loc[case_mask, col]
+                    if len(v) and pd.notna(v.iloc[0]):
+                        case_vals[rk] = float(v.iloc[0])
+            consensus = float(np.median(list(case_vals.values()))) if case_vals else np.nan
+
+            for rater_key, rater_name, rater_email, their_col, other_name, other_col in [
+                (ra, ra_name, ra_email, va, rb_name, vb),
+                (rb, rb_name, rb_email, vb, ra_name, va),
+            ]:
+                their_val = float(row[their_col])
+                other_val = float(row[other_col])
+                dist_consensus = abs(their_val - consensus) if pd.notna(consensus) else np.nan
+                other_dist = abs(other_val - consensus) if pd.notna(consensus) else np.nan
+                suggested = (
+                    'Yes' if pd.notna(dist_consensus) and pd.notna(other_dist)
+                    and dist_consensus > other_dist else
+                    'Tie' if pd.notna(dist_consensus) and pd.notna(other_dist)
+                    and dist_consensus == other_dist else
+                    ''
+                )
+                outlier_events.append({
+                    'assigned_rater': rater_name,
+                    'assigned_email': rater_email,
+                    'patientId': row['patientId'],
+                    'laterality': row['laterality'],
+                    'protocol': protocol,
+                    'unit': unit,
+                    'their_value': round(their_val, 4),
+                    'other_rater': other_name,
+                    'other_value': round(other_val, 4),
+                    'difference_A_minus_B': round(float(row['diff']), 4),
+                    'pair_mean_bias': round(float(m_bias), 4),
+                    'pair_std': round(float(std_bias), 4),
+                    'z_score': round(float(row['z_score']), 3),
+                    'case_median_all_raters': round(consensus, 4) if pd.notna(consensus) else np.nan,
+                    'abs_dist_from_median': round(dist_consensus, 4) if pd.notna(dist_consensus) else np.nan,
+                    'suggested_focus': suggested,
+                    'status': STATUS_DEFAULT,
+                    'done_date': '',
+                    'notes': '',
+                })
+
+redo_df = pd.DataFrame(outlier_events)
+
+if redo_df.empty:
+    print(
+        f'No clinical redo tasks found '
+        f'(threshold |z| > {REDO_Z_THRESHOLD}, min n per pair/protocol = {REDO_MIN_PAIR_N}).'
+    )
+else:
+    # One task per person × case × protocol (same case may appear in multiple pairs)
+    redo_df = redo_df.assign(_abs_z=redo_df['z_score'].abs())
+    redo_df = (
+        redo_df.sort_values(
+            ['assigned_rater', 'protocol', 'patientId', 'laterality', '_abs_z'],
+            ascending=[True, True, True, True, False],
+        )
+        .drop_duplicates(
+            subset=['assigned_rater', 'patientId', 'laterality', 'protocol'],
+            keep='first',
+        )
+        .drop(columns='_abs_z')
+        .reset_index(drop=True)
+    )
+    redo_df.insert(0, 'redo_id', [f'R{i+1:04d}' for i in range(len(redo_df))])
+
+    # ── Easy views ──────────────────────────────────────────────────────────
+    by_rater = (
+        redo_df.groupby(['assigned_rater', 'assigned_email', 'status'], dropna=False)
+        .size()
+        .reset_index(name='n_tasks')
+        .sort_values(['assigned_rater', 'status'])
+    )
+    unique_cases = (
+        redo_df.groupby(['patientId', 'laterality', 'protocol'], as_index=False)
+        .agg(
+            n_assignees=('assigned_rater', 'nunique'),
+            assignees=('assigned_rater', lambda s: ', '.join(sorted(s.unique()))),
+            max_abs_z=('z_score', lambda s: round(float(s.abs().max()), 3)),
+        )
+        .sort_values(['protocol', 'patientId', 'laterality'])
+    )
+
+    print('=== Redo queue (per person) ===')
+    display(redo_df)
+    print('\n=== Tasks by rater ===')
+    display(by_rater)
+    print('\n=== Unique cases to review ===')
+    display(unique_cases)
+    print(
+        f"\n{len(redo_df)} tasks · {redo_df['assigned_rater'].nunique()} raters · "
+        f"{len(unique_cases)} unique case/protocol rows"
+    )
+
+    # ── Export CSV + XLSX into Drive project folder ─────────────────────────
+    out_dir = Path(project_path)
+    csv_path = out_dir / 'redo_queue.csv'
+    xlsx_path = out_dir / 'redo_queue.xlsx'
+
+    redo_df.to_csv(csv_path, index=False)
+
+    try:
+        with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
+            redo_df.to_excel(writer, sheet_name='Redo_Queue', index=False)
+            by_rater.to_excel(writer, sheet_name='By_Rater', index=False)
+            unique_cases.to_excel(writer, sheet_name='Unique_Cases', index=False)
+
+            # Freeze header + auto filter on main sheet for easy tracking
+            ws = writer.sheets['Redo_Queue']
+            ws.freeze_panes = 'A2'
+            ws.auto_filter.ref = ws.dimensions
+            # Highlight suggested_focus = Yes
+            from openpyxl.styles import PatternFill
+            focus_fill = PatternFill('solid', fgColor='FFF2CC')
+            headers = {cell.value: idx for idx, cell in enumerate(ws[1], start=1)}
+            focus_col = headers.get('suggested_focus')
+            status_col = headers.get('status')
+            if focus_col:
+                for r in range(2, ws.max_row + 1):
+                    if ws.cell(r, focus_col).value == 'Yes':
+                        for c in range(1, ws.max_column + 1):
+                            ws.cell(r, c).fill = focus_fill
+            if status_col:
+                pending_fill = PatternFill('solid', fgColor='FCE4D6')
+                done_fill = PatternFill('solid', fgColor='C6EFCE')
+                for r in range(2, ws.max_row + 1):
+                    cell = ws.cell(r, status_col)
+                    if cell.value == 'Pending':
+                        cell.fill = pending_fill
+                    elif cell.value == 'Done':
+                        cell.fill = done_fill
+        print(f'\nSaved: {xlsx_path}')
+    except ImportError:
+        print('\n⚠ openpyxl not installed — wrote CSV only. Install with: pip install openpyxl')
+
+    print(f'Saved: {csv_path}')
+    print(
+        '\nHow to track: open redo_queue.xlsx → sheet Redo_Queue → '
+        'set status to Done, fill done_date / notes. Filter by assigned_rater.'
+    )
+
+"""
+---
 ## Part III — Planar Landmark Agreement
 
 Clinical-value agreement (Part II) tells us whether the *final number* is reproducible,
@@ -932,6 +1204,8 @@ lines and line directions are already aligned — Hungarian matching remains use
 perpendicular anchor points and any residual ordering ambiguity.
 """
 
+import matplotlib.pyplot as plt
+import seaborn as sns
 from scipy.optimize import linear_sum_assignment
 
 
@@ -1008,20 +1282,13 @@ planar_variability_df = (
 print("Planar coordinate variability (Hungarian-matched landmarks, all rater pairs pooled):")
 if not planar_variability_df.empty:
     display(planar_variability_df.groupby('stepId')['dist_mm'].agg(['mean', 'std', 'max']).round(2))
-    n_steps = planar_variability_df['stepId'].nunique()
-    fig_w = max(12, 0.85 * n_steps + 3)
-    fig, ax = plt.subplots(figsize=(fig_w, 6.5), constrained_layout=True)
-    sns.barplot(
-        data=planar_variability_df, x='stepId', y='dist_mm',
-        errorbar='sd', ax=ax, color='steelblue',
-    )
-    ax.set_xticks(ax.get_xticks())
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=40, ha='right', rotation_mode='anchor')
-    ax.set_title('Planar Coordinate Variability by Step (Hungarian-Matched)')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('Planar Distance Error (mm)')
-    save_figure(fig, 'planar-variability-by-step')
-    plt.close(fig)
+    plt.figure(figsize=(14, 6))
+    sns.barplot(data=planar_variability_df, x='stepId', y='dist_mm', errorbar='sd')
+    plt.xticks(rotation=45, ha='right')
+    plt.title('Planar Coordinate Variability by Step (Hungarian-Matched)')
+    plt.ylabel('Planar Distance Error (mm)')
+    plt.tight_layout()
+    plt.show()
 else:
     print('No overlapping data.')
 
@@ -1081,7 +1348,8 @@ if not planar_pivot_df.empty:
 else:
     print("\nNo landmarks were found that all raters annotated — cannot compute a balanced planar ICC.")
 
-"""### 7. Outlier Triage — Largest Planar Disagreements
+"""
+### 7. Outlier Triage — Largest Planar Disagreements
 
 Surfaces the specific landmarks with the largest planar error, so they can be reviewed
 manually (mislabeled laterality, wrong anatomical structure, genuine ambiguity, etc.).
@@ -1100,24 +1368,18 @@ if not extreme_outliers.empty:
     outlier_summary = extreme_outliers.sort_values('dist_mm', ascending=False).head(20)
     display(outlier_summary)
 
-    n_steps = extreme_outliers['stepId'].nunique()
-    fig_w = max(10, 0.9 * n_steps + 3)
-    fig, ax = plt.subplots(figsize=(fig_w, 5.5), constrained_layout=True)
-    sns.stripplot(
-        data=extreme_outliers, x='stepId', y='dist_mm',
-        hue='stepId', legend=False, ax=ax, size=6, jitter=0.25,
-    )
-    ax.set_xticks(ax.get_xticks())
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=40, ha='right', rotation_mode='anchor')
-    ax.set_title(f'Outlier Landmarks (planar error > {PLANAR_OUTLIER_THRESHOLD_MM} mm)')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('Planar Distance Error (mm)')
-    save_figure(fig, 'planar-outliers-by-step')
-    plt.close(fig)
+    plt.figure(figsize=(10, 5))
+    sns.stripplot(data=extreme_outliers, x='stepId', y='dist_mm', hue='stepId', legend=False)
+    plt.xticks(rotation=45, ha='right')
+    plt.title(f'Outlier Landmarks (planar error > {PLANAR_OUTLIER_THRESHOLD_MM} mm)')
+    plt.ylabel('Planar Distance Error (mm)')
+    plt.tight_layout()
+    plt.show()
 else:
     print(f"No extreme outliers (> {PLANAR_OUTLIER_THRESHOLD_MM} mm) found in the current matching set.")
 
-"""---
+"""
+---
 ## Part IV — Ground Truth and Readiness
 
 ### 8. ML Ground Truth — Averaged Clinical Values
@@ -1133,11 +1395,14 @@ if comparison_df.empty:
     print("comparison_df is empty — run Section 3 first.")
 else:
     ml_data = comparison_df.copy()
+
+    # Calculate the mean ground truth across all available raters for each record
     ml_data['ground_truth'] = ml_data[value_cols].mean(axis=1, skipna=True)
     ml_data['ground_truth_std'] = ml_data[value_cols].std(axis=1, skipna=True)
 
-    if not icc_df.empty:
-        icc_map = icc_df.set_index('Protocol')['ICC2,1'].to_dict()
+    # Map ICC weights if available, default to 1.0 if not
+    if 'icc_summary' in locals() and not icc_summary.empty:
+        icc_map = icc_summary.set_index('Protocol')['ICC'].to_dict()
         ml_data['gt_icc_weight'] = ml_data['true_protocol'].map(icc_map).fillna(1.0)
     else:
         ml_data['gt_icc_weight'] = 1.0
@@ -1145,13 +1410,16 @@ else:
     output_file = os.path.join(project_path, 'ml_ready_annotations.csv')
     ml_data.to_csv(output_file, index=False)
 
+    print(f"--- ML Ground Truth Generated ---")
+    print(f"Total unique measurement events: {len(ml_data)}")
     display(ml_data[['patientId', 'laterality', 'true_protocol', 'n_raters_present',
-                      'ground_truth', 'ground_truth_std', 'gt_icc_weight']].head())
-    print(f"\nSaved to: {output_file}")
-    print(f"Cases with all {len(rater_keys)} raters present: "
-          f"{(ml_data['n_raters_present'] == len(rater_keys)).sum()} / {len(ml_data)}")
+                      'ground_truth', 'ground_truth_std', 'gt_icc_weight']].head(10))
 
-"""### 9. Annotation Versioning and Duplicate-Run Checks
+    print(f"\nSaved labels to: {output_file}")
+    print(f"Average raters per record: {ml_data['n_raters_present'].mean():.2f}")
+
+"""
+### 9. Annotation Versioning and Duplicate-Run Checks
 
 The README flags a production gap: neither CSV export includes `annotationVersion`,
 `correctionOf`, or `modelVersion`. This section detects missing columns and flags
@@ -1221,7 +1489,8 @@ if len(large):
 else:
     print("\n✓ All pt[1]–pt[2] distances ≤ 1 mm, across all raters.")
 
-"""### 10. Per-Protocol ML Readiness Summary
+"""
+### 10. Per-Protocol ML Readiness Summary
 
 Counts per `true_protocol` (from `groupId`), summed across **all raters** — the only way
 to correctly separate `sulcus-angle` from `sulcus-angle-3cm`, and to credit every

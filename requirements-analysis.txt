@@ -5,3 +5,4 @@ matplotlib>=3.7
 seaborn>=0.13
 scipy>=1.11
 pingouin>=0.5
+openpyxl>=3.1
