@@ -945,18 +945,18 @@ display(summary_df.groupby('Protocol').agg(
 ).round(4).reset_index())
 
 """
-### 5.1 Redo Queue — Who Needs to Re-annotate Which Cases
+### 5.1 Redo Queue — Pair Disagreement (≥10% + Bland–Altman)
 
-Builds an actionable **per-person redo list** from clinical outliers:
+Builds a **per-person redo list** when two raters disagree in a way that is both clinically meaningful and unusual for that pair:
 
-- A case is flagged when two raters' difference is **> 2 SD from that pair's mean bias** for the same protocol (same rule as the cell above).
-- **Both raters in the disagreeing pair** get a review/redo task for that `patientId + laterality + protocol`.
-- The rater farther from the multi-rater median on that case is marked `suggested_focus = Yes` (likely the odd measurement).
-- Exports to Drive:
-  - `redo_queue.csv` — flat list for filters / scripts
-  - `redo_queue.xlsx` — sheets: **Redo_Queue** (edit `status` / `done_date` / `notes`), **By_Rater**, **Unique_Cases**
+- Require `|A − B| / scale ≥ 10%` (protocol floor on the scale so near-zero values don’t explode).
+- **And** require the pair difference outside that pair’s Bland–Altman band (`|z| ≥ 1.96` vs the pair’s mean bias/SD).
+- **Only the rater farther from the case median** is assigned (ties → both).
 
-Re-run this cell after new annotations; it **overwrites** those files. Keep your Done marks in a copy if you need history across runs.
+This dual gate avoids the old “|z| alone” over-flagging (tiny BA SD) and also avoids listing every ≥10% gap when the pair’s usual scatter already covers it.
+
+**Output:** pair pages inside combined `redo_tracker.xlsx` (plus `redo_queue.csv`). Run §5.2 afterward to merge consensus pages into the same workbook.
+
 """
 
 import sys
@@ -969,10 +969,131 @@ except ImportError:
 import re
 from pathlib import Path
 
+
+# ── Human-readable tracker helpers ──────────────────────────────────────────
+PROTOCOL_DISPLAY = {
+    'tt-tg': 'TT-TG distance',
+    'insall-salvati': 'Insall–Salvati ratio',
+    'patellar-tilt': 'Patellar tilt',
+    'sulcus-angle': 'Sulcus angle',
+    'sulcus-angle-3cm': 'Sulcus angle (3 cm)',
+    'caton-deschamps': 'Caton–Deschamps ratio',
+}
+
+def _friendly_protocol(p):
+    return PROTOCOL_DISPLAY.get(str(p), str(p))
+
+def _friendly_side(s):
+    s = str(s).strip().lower()
+    return {'left': 'Left', 'right': 'Right'}.get(s, str(s).title())
+
+def _style_tracker_sheet(ws, status_header='Status', highlight_header=None, highlight_value='Yes',
+                         highlight_fill='FFF2CC'):
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    ws.freeze_panes = 'A2'
+    ws.auto_filter.ref = ws.dimensions
+    header_fill = PatternFill('solid', fgColor='1F4E79')
+    header_font = Font(color='FFFFFF', bold=True)
+    thin = Border(
+        left=Side(style='thin', color='D9D9D9'),
+        right=Side(style='thin', color='D9D9D9'),
+        top=Side(style='thin', color='D9D9D9'),
+        bottom=Side(style='thin', color='D9D9D9'),
+    )
+    pending_fill = PatternFill('solid', fgColor='FCE4D6')
+    done_fill = PatternFill('solid', fgColor='C6EFCE')
+    skip_fill = PatternFill('solid', fgColor='E7E6E6')
+    focus_fill = PatternFill('solid', fgColor=highlight_fill)
+
+    headers = {cell.value: idx for idx, cell in enumerate(ws[1], start=1)}
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(wrap_text=True, vertical='center')
+    ws.row_dimensions[1].height = 32
+
+    status_col = headers.get(status_header)
+    focus_col = headers.get(highlight_header) if highlight_header else None
+
+    for r in range(2, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(r, c)
+            cell.border = thin
+            cell.alignment = Alignment(wrap_text=True, vertical='center')
+        if focus_col and ws.cell(r, focus_col).value == highlight_value:
+            for c in range(1, ws.max_column + 1):
+                ws.cell(r, c).fill = focus_fill
+        if status_col:
+            st = ws.cell(r, status_col)
+            if st.value == 'Pending':
+                st.fill = pending_fill
+            elif st.value == 'Done':
+                st.fill = done_fill
+            elif st.value == 'Skipped':
+                st.fill = skip_fill
+
+    # Reasonable column widths
+    for idx in range(1, ws.max_column + 1):
+        letter = get_column_letter(idx)
+        header = ws.cell(1, idx).value or ''
+        width = 14
+        if header in ('What to redo', 'Why this was flagged', 'Action'):
+            width = 42
+        elif header in ('Protocol', 'Assigned to', 'Compared with', 'Partner who agreed'):
+            width = 22
+        elif header in ('Notes',):
+            width = 28
+        elif header in ('Status', 'Side', 'Unit'):
+            width = 10
+        elif 'Measurement' in str(header) or 'Median' in str(header):
+            width = 16
+        ws.column_dimensions[letter].width = width
+
+def _write_instructions_sheet(writer, title, bullets):
+    instr = pd.DataFrame({
+        'How to use this tracker': [
+            title,
+            '',
+            *bullets,
+        ]
+    })
+    instr.to_excel(writer, sheet_name='Instructions', index=False)
+    ws = writer.sheets['Instructions']
+    ws.column_dimensions['A'].width = 100
+    from openpyxl.styles import Font, Alignment
+    ws['A1'].font = Font(bold=True, size=14)
+    for r in range(1, ws.max_row + 1):
+        ws.cell(r, 1).alignment = Alignment(wrap_text=True, vertical='top')
+        ws.row_dimensions[r].height = 18
+
 # ── Config ──────────────────────────────────────────────────────────────────
-REDO_Z_THRESHOLD = 2.0          # |diff - pair_mean| / pair_std
-REDO_MIN_PAIR_N = 5             # skip unstable pair/protocol groups
-STATUS_DEFAULT = 'Pending'      # Pending | Done | Skipped
+# Pairwise redo: require a CLINICALLY meaningful gap (≈10% relative), not only a
+# high z-score. Bland–Altman bias is often small; tiny SD makes |z|>2/3 flag many
+# cases that are still clinically close. Aligns with mentor 10% rule.
+PAIR_PCT_MIN = 0.10               # |A−B| / scale ≥ 10%
+BA_Z_MIN = 1.96                   # also outside this pair's Bland–Altman band
+REDO_MIN_PAIR_N = 5               # skip unstable pair/protocol groups
+STATUS_DEFAULT = 'Pending'        # Pending | Done | Skipped
+
+# Denominator floors so near-zero values (e.g. tilt≈0) don't inflate % gaps
+PROTOCOL_PCT_FLOOR_51 = {
+    'tt-tg': 10.0,             # mm
+    'patellar-tilt': 5.0,      # degrees
+    'sulcus-angle': 100.0,     # degrees
+    'sulcus-angle-3cm': 100.0,
+    'insall-salvati': 0.8,     # ratio
+    'caton-deschamps': 0.8,
+}
+
+def _pair_pct_diff(val_a, val_b, protocol):
+    """Relative disagreement between two raters on one case."""
+    va, vb = float(val_a), float(val_b)
+    mid = 0.5 * (va + vb)
+    floor = float(PROTOCOL_PCT_FLOOR_51.get(protocol, 1.0))
+    denom = max(abs(mid), floor)
+    return abs(va - vb) / denom
 
 # ── Build outlier events (pair × protocol × case) ───────────────────────────
 outlier_events = []
@@ -993,18 +1114,27 @@ for ra, rb in rater_pairs:
             continue
         m_bias = grp['diff'].mean()
         std_bias = grp['diff'].std(ddof=1)
-        if pd.isna(std_bias) or std_bias == 0:
-            continue
-
-        z = (grp['diff'] - m_bias) / std_bias
-        flagged = grp.loc[z.abs() > REDO_Z_THRESHOLD].copy()
-        flagged['z_score'] = z.loc[flagged.index]
+        # z used with BA_Z_MIN dual gate below (plus 10% relative)
+        if pd.notna(std_bias) and std_bias > 0:
+            z_series = (grp['diff'] - m_bias) / std_bias
+        else:
+            z_series = pd.Series(np.nan, index=grp.index)
 
         meta = PROTOCOL_META.get(protocol, {})
         unit = meta.get('unit', '')
 
-        for _, row in flagged.iterrows():
-            # Multi-rater consensus on this case (median of all present raters)
+        for idx_row, row in grp.iterrows():
+            val_a = float(row[va])
+            val_b = float(row[vb])
+            pct = _pair_pct_diff(val_a, val_b, protocol)
+            z_score = float(z_series.loc[idx_row]) if idx_row in z_series.index else np.nan
+            # Dual gate: clinically meaningful AND unusual for this pair (BA band)
+            if pct < PAIR_PCT_MIN:
+                continue
+            if pd.isna(z_score) or abs(z_score) < BA_Z_MIN:
+                continue
+
+            # Case MEDIAN across all raters present
             case_mask = (
                 (comparison_df['patientId'] == row['patientId'])
                 & (comparison_df['laterality'] == row['laterality'])
@@ -1019,20 +1149,30 @@ for ra, rb in rater_pairs:
                         case_vals[rk] = float(v.iloc[0])
             consensus = float(np.median(list(case_vals.values()))) if case_vals else np.nan
 
-            for rater_key, rater_name, rater_email, their_col, other_name, other_col in [
-                (ra, ra_name, ra_email, va, rb_name, vb),
-                (rb, rb_name, rb_email, vb, ra_name, va),
-            ]:
-                their_val = float(row[their_col])
-                other_val = float(row[other_col])
+            # Only the rater farther from the group MEDIAN redoes (tie → both)
+            candidates = [
+                (ra_name, ra_email, val_a, rb_name, val_b),
+                (rb_name, rb_email, val_b, ra_name, val_a),
+            ]
+            scored = []
+            for rater_name, rater_email, their_val, other_name, other_val in candidates:
                 dist_consensus = abs(their_val - consensus) if pd.notna(consensus) else np.nan
                 other_dist = abs(other_val - consensus) if pd.notna(consensus) else np.nan
+                scored.append((dist_consensus, other_dist, rater_name, rater_email, their_val, other_name, other_val))
+
+            dists = [s[0] for s in scored if pd.notna(s[0])]
+            if dists:
+                max_dist = max(dists)
+                chosen = [s for s in scored if pd.notna(s[0]) and s[0] >= max_dist - 1e-12]
+            else:
+                # no group median — assign both when 10% pair gap
+                chosen = scored
+
+            for dist_consensus, other_dist, rater_name, rater_email, their_val, other_name, other_val in chosen:
                 suggested = (
-                    'Yes' if pd.notna(dist_consensus) and pd.notna(other_dist)
-                    and dist_consensus > other_dist else
-                    'Tie' if pd.notna(dist_consensus) and pd.notna(other_dist)
-                    and dist_consensus == other_dist else
-                    ''
+                    'Yes' if pd.notna(other_dist) and pd.notna(dist_consensus) and dist_consensus > other_dist else
+                    'Tie' if pd.notna(other_dist) and pd.notna(dist_consensus) and dist_consensus == other_dist else
+                    'Yes'
                 )
                 outlier_events.append({
                     'assigned_rater': rater_name,
@@ -1045,9 +1185,10 @@ for ra, rb in rater_pairs:
                     'other_rater': other_name,
                     'other_value': round(other_val, 4),
                     'difference_A_minus_B': round(float(row['diff']), 4),
-                    'pair_mean_bias': round(float(m_bias), 4),
-                    'pair_std': round(float(std_bias), 4),
-                    'z_score': round(float(row['z_score']), 3),
+                    'pair_mean_bias': round(float(m_bias), 4) if pd.notna(m_bias) else np.nan,
+                    'pair_std': round(float(std_bias), 4) if pd.notna(std_bias) else np.nan,
+                    'z_score': round(z_score, 3) if pd.notna(z_score) else np.nan,
+                    'pair_pct_diff': round(pct, 4),
                     'case_median_all_raters': round(consensus, 4) if pd.notna(consensus) else np.nan,
                     'abs_dist_from_median': round(dist_consensus, 4) if pd.notna(dist_consensus) else np.nan,
                     'suggested_focus': suggested,
@@ -1058,102 +1199,888 @@ for ra, rb in rater_pairs:
 
 redo_df = pd.DataFrame(outlier_events)
 
+
 if redo_df.empty:
     print(
         f'No clinical redo tasks found '
-        f'(threshold |z| > {REDO_Z_THRESHOLD}, min n per pair/protocol = {REDO_MIN_PAIR_N}).'
+        f'(≥{PAIR_PCT_MIN*100:.0f}% relative gap AND |z|≥{BA_Z_MIN} vs pair BA; '
+        f'furthest from case MEDIAN; min n={REDO_MIN_PAIR_N}).'
     )
 else:
     # One task per person × case × protocol (same case may appear in multiple pairs)
-    redo_df = redo_df.assign(_abs_z=redo_df['z_score'].abs())
+    redo_df = redo_df.assign(_rank=redo_df['pair_pct_diff'].fillna(redo_df['z_score'].abs()))
     redo_df = (
         redo_df.sort_values(
-            ['assigned_rater', 'protocol', 'patientId', 'laterality', '_abs_z'],
+            ['assigned_rater', 'protocol', 'patientId', 'laterality', '_rank'],
             ascending=[True, True, True, True, False],
         )
         .drop_duplicates(
             subset=['assigned_rater', 'patientId', 'laterality', 'protocol'],
             keep='first',
         )
-        .drop(columns='_abs_z')
+        .drop(columns='_rank')
         .reset_index(drop=True)
     )
     redo_df.insert(0, 'redo_id', [f'R{i+1:04d}' for i in range(len(redo_df))])
 
-    # ── Easy views ──────────────────────────────────────────────────────────
+    # ── Build rater-friendly tracker view ───────────────────────────────────
+    tracker_rows = []
+    for _, r in redo_df.iterrows():
+        focus = str(r.get('suggested_focus', '') or '')
+        zabs = abs(float(r['z_score'])) if pd.notna(r.get('z_score')) else float('nan')
+        pct = float(r['pair_pct_diff']) if pd.notna(r.get('pair_pct_diff')) else float('nan')
+        if focus == 'Yes':
+            action = 'Priority: recheck YOUR landmarks — you are farther from the group median.'
+        elif focus == 'Tie':
+            action = 'Recheck this case together with the other rater (both equally far from the median).'
+        else:
+            action = 'Recheck this case (either rater may need a correction).'
+        why = (
+            f"You and {r['other_rater']} differ by ~{pct*100:.0f}% on {_friendly_protocol(r['protocol'])} "
+            f"(≥{PAIR_PCT_MIN*100:.0f}% threshold) and outside your usual Bland–Altman band "
+            f"(|z|={zabs:.1f}). You are farther from the group median, so you recheck."
+        )
+        tracker_rows.append({
+            'Task ID': r['redo_id'],
+            'Status': r['status'],
+            'Done date': r['done_date'],
+            'Notes': r['notes'],
+            'Assigned to': r['assigned_rater'],
+            'Email': r['assigned_email'],
+            'Patient ID': r['patientId'],
+            'Side': _friendly_side(r['laterality']),
+            'Protocol': _friendly_protocol(r['protocol']),
+            'Unit': r['unit'],
+            'What to redo': (
+                f"Re-annotate { _friendly_protocol(r['protocol']) } on patient {r['patientId']} "
+                f"({_friendly_side(r['laterality'])} side)."
+            ),
+            'Action': action,
+            'Priority focus (you look like the outlier)?': (
+                'Yes — start here' if focus == 'Yes' else ('Tie' if focus == 'Tie' else 'No')
+            ),
+            'Your measurement': r['their_value'],
+            'Compared with': r['other_rater'],
+            'Their measurement': r['other_value'],
+            'Group median (all raters)': r['case_median_all_raters'],
+            'Why this was flagged': why,
+            'Relative disagreement %': round(float(r['pair_pct_diff'])*100, 1) if 'pair_pct_diff' in r.index and pd.notna(r.get('pair_pct_diff')) else round(zabs, 2),
+        })
+
+    tracker_df = pd.DataFrame(tracker_rows)
+
+    # Keep technical raw table on a Details sheet
+    details_df = redo_df.rename(columns={
+        'redo_id': 'Task ID',
+        'assigned_rater': 'Assigned to',
+        'assigned_email': 'Email',
+        'patientId': 'Patient ID',
+        'laterality': 'Side',
+        'protocol': 'Protocol code',
+        'unit': 'Unit',
+        'their_value': 'Your measurement',
+        'other_rater': 'Compared with',
+        'other_value': 'Their measurement',
+        'difference_A_minus_B': 'Pair difference (A−B)',
+        'pair_mean_bias': 'Pair usual bias',
+        'pair_std': 'Pair SD',
+        'z_score': 'Z-score',
+        'case_median_all_raters': 'Group median',
+        'abs_dist_from_median': 'Distance from group median',
+        'suggested_focus': 'Suggested focus',
+        'status': 'Status',
+        'done_date': 'Done date',
+        'notes': 'Notes',
+    })
+
     by_rater = (
-        redo_df.groupby(['assigned_rater', 'assigned_email', 'status'], dropna=False)
+        tracker_df.groupby(['Assigned to', 'Email', 'Status'], dropna=False)
         .size()
-        .reset_index(name='n_tasks')
-        .sort_values(['assigned_rater', 'status'])
+        .reset_index(name='Number of tasks')
+        .sort_values(['Assigned to', 'Status'])
     )
     unique_cases = (
-        redo_df.groupby(['patientId', 'laterality', 'protocol'], as_index=False)
+        tracker_df.groupby(['Patient ID', 'Side', 'Protocol'], as_index=False)
         .agg(
-            n_assignees=('assigned_rater', 'nunique'),
-            assignees=('assigned_rater', lambda s: ', '.join(sorted(s.unique()))),
-            max_abs_z=('z_score', lambda s: round(float(s.abs().max()), 3)),
+            **{
+                'People assigned': ('Assigned to', 'nunique'),
+                'Assigned names': ('Assigned to', lambda s: ', '.join(sorted(s.unique()))),
+                'Max relative disagreement %': ('Relative disagreement %', 'max'),
+            }
         )
-        .sort_values(['protocol', 'patientId', 'laterality'])
+        .sort_values(['Protocol', 'Patient ID', 'Side'])
     )
 
-    print('=== Redo queue (per person) ===')
-    display(redo_df)
-    print('\n=== Tasks by rater ===')
+    print('=== Redo tracker (pair-disagreement queue) ===')
+    display(tracker_df.head(20))
+    print('\n=== Workload by person ===')
     display(by_rater)
-    print('\n=== Unique cases to review ===')
+    print('\n=== Unique cases ===')
     display(unique_cases)
     print(
-        f"\n{len(redo_df)} tasks · {redo_df['assigned_rater'].nunique()} raters · "
+        f"\n{len(tracker_df)} tasks · {tracker_df['Assigned to'].nunique()} people · "
         f"{len(unique_cases)} unique case/protocol rows"
     )
 
-    # ── Export CSV + XLSX into Drive project folder ─────────────────────────
     out_dir = Path(project_path)
     csv_path = out_dir / 'redo_queue.csv'
-    xlsx_path = out_dir / 'redo_queue.xlsx'
+    xlsx_path = out_dir / 'redo_tracker.xlsx'
 
-    redo_df.to_csv(csv_path, index=False)
+    # Persist pair tracker for §5.2 combined workbook rebuild
+    tracker_df.to_csv(csv_path, index=False)
+    details_df.to_csv(out_dir / 'redo_queue_details.csv', index=False)
+    by_rater.to_csv(out_dir / 'redo_queue_by_rater.csv', index=False)
+    unique_cases.to_csv(out_dir / 'redo_queue_unique_cases.csv', index=False)
 
     try:
         with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
-            redo_df.to_excel(writer, sheet_name='Redo_Queue', index=False)
-            by_rater.to_excel(writer, sheet_name='By_Rater', index=False)
-            unique_cases.to_excel(writer, sheet_name='Unique_Cases', index=False)
-
-            # Freeze header + auto filter on main sheet for easy tracking
-            ws = writer.sheets['Redo_Queue']
-            ws.freeze_panes = 'A2'
-            ws.auto_filter.ref = ws.dimensions
-            # Highlight suggested_focus = Yes
-            from openpyxl.styles import PatternFill
-            focus_fill = PatternFill('solid', fgColor='FFF2CC')
-            headers = {cell.value: idx for idx, cell in enumerate(ws[1], start=1)}
-            focus_col = headers.get('suggested_focus')
-            status_col = headers.get('status')
-            if focus_col:
-                for r in range(2, ws.max_row + 1):
-                    if ws.cell(r, focus_col).value == 'Yes':
-                        for c in range(1, ws.max_column + 1):
-                            ws.cell(r, c).fill = focus_fill
-            if status_col:
-                pending_fill = PatternFill('solid', fgColor='FCE4D6')
-                done_fill = PatternFill('solid', fgColor='C6EFCE')
-                for r in range(2, ws.max_row + 1):
-                    cell = ws.cell(r, status_col)
-                    if cell.value == 'Pending':
-                        cell.fill = pending_fill
-                    elif cell.value == 'Done':
-                        cell.fill = done_fill
-        print(f'\nSaved: {xlsx_path}')
+            _write_instructions_sheet(writer, 'Combined redo tracker', [
+                'This workbook has TWO task lists (different methods):',
+                '  • "Pair disagreement" (§5.1) — unusual disagreement between two specific raters.',
+                '  • "Consensus redo" (§5.2) — outside an agreeing cluster (plus Difficult/Calibration group pages).',
+                '',
+                'How to work:',
+                '1. Open "Pair disagreement" and/or "Consensus redo".',
+                '2. Filter "Assigned to" to your name.',
+                '3. Follow What to redo + Action. Mark Status = Done when finished.',
+                '4. "Workload by person" summarizes both lists.',
+                '5. Ignore "Details …" sheets unless you are analyzing the stats.',
+                '',
+                'Note: Re-run §5.2 after §5.1 to refresh the full combined workbook.',
+                '§5.1 alone writes the pair pages; §5.2 merges both into this file.',
+            ])
+            tracker_df.to_excel(writer, sheet_name='Pair disagreement', index=False)
+            by_rater.to_excel(writer, sheet_name='Pair — workload', index=False)
+            unique_cases.to_excel(writer, sheet_name='Pair — unique cases', index=False)
+            details_df.to_excel(writer, sheet_name='Pair — details', index=False)
+            _style_tracker_sheet(
+                writer.sheets['Pair disagreement'],
+                status_header='Status',
+                highlight_header='Priority focus (you look like the outlier)?',
+                highlight_value='Yes — start here',
+            )
+            _style_tracker_sheet(writer.sheets['Pair — workload'], status_header='Status')
+        print(f'\nSaved combined tracker (pair pages): {xlsx_path}')
+        print('(Run §5.2 next to add Consensus pages into the same file.)')
     except ImportError:
-        print('\n⚠ openpyxl not installed — wrote CSV only. Install with: pip install openpyxl')
+        print('\n⚠ openpyxl not installed — wrote CSV only.')
 
     print(f'Saved: {csv_path}')
     print(
-        '\nHow to track: open redo_queue.xlsx → sheet Redo_Queue → '
-        'set status to Done, fill done_date / notes. Filter by assigned_rater.'
+        '\nOpen redo_tracker.xlsx → Instructions, then "Pair disagreement". '
+        'After §5.2 runs, Consensus pages appear in the same workbook.'
     )
+
+"""
+### 5.2 Consensus Redo Queue — Majority Cluster (+ Difficult / Calibration)
+
+Complements §5.1. Replaces furthest-from-median (which always picked someone when
+values were merely spread out).
+
+**Redo (cluster outsider):**
+1. On each `patientId + laterality + protocol` with ≥3 raters, find the largest
+   **agreeing cluster** (every member within `AGREE`% of each other on the protocol scale).
+2. Cluster must meet min size: **2 if n=3**, else **max(3, ⌈n/2⌉−1)** (scales to 5–6 raters).
+3. Cluster median = median of cluster members only. Assign redo to raters **outside**
+   the cluster who are **≥10%** from that median.
+
+**No valid cluster (or two opposing camps):**
+- **Calibration / style conflict** — case ordering matches known protocol-level rater
+  high/low tendencies (systematic camps, not a one-off hard case).
+- **Difficult** — residual ambiguity / tricky patient; **no redo assigned**.
+
+**Output:** same `redo_tracker.xlsx` with Consensus redo + Difficult + Calibration sheets.
+"""
+
+import sys
+import subprocess
+try:
+    import openpyxl  # noqa: F401
+except ImportError:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'openpyxl'])
+
+from pathlib import Path
+from itertools import combinations
+import math
+
+
+# ── Human-readable tracker helpers ──────────────────────────────────────────
+PROTOCOL_DISPLAY = {
+    'tt-tg': 'TT-TG distance',
+    'insall-salvati': 'Insall–Salvati ratio',
+    'patellar-tilt': 'Patellar tilt',
+    'sulcus-angle': 'Sulcus angle',
+    'sulcus-angle-3cm': 'Sulcus angle (3 cm)',
+    'caton-deschamps': 'Caton–Deschamps ratio',
+}
+
+def _friendly_protocol(p):
+    return PROTOCOL_DISPLAY.get(str(p), str(p))
+
+def _friendly_side(s):
+    s = str(s).strip().lower()
+    return {'left': 'Left', 'right': 'Right'}.get(s, str(s).title())
+
+def _style_tracker_sheet(ws, status_header='Status', highlight_header=None, highlight_value='Yes',
+                         highlight_fill='FFF2CC'):
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    ws.freeze_panes = 'A2'
+    ws.auto_filter.ref = ws.dimensions
+    header_fill = PatternFill('solid', fgColor='1F4E79')
+    header_font = Font(color='FFFFFF', bold=True)
+    thin = Border(
+        left=Side(style='thin', color='D9D9D9'),
+        right=Side(style='thin', color='D9D9D9'),
+        top=Side(style='thin', color='D9D9D9'),
+        bottom=Side(style='thin', color='D9D9D9'),
+    )
+    pending_fill = PatternFill('solid', fgColor='FCE4D6')
+    done_fill = PatternFill('solid', fgColor='C6EFCE')
+    skip_fill = PatternFill('solid', fgColor='E7E6E6')
+    focus_fill = PatternFill('solid', fgColor=highlight_fill)
+
+    headers = {cell.value: idx for idx, cell in enumerate(ws[1], start=1)}
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(wrap_text=True, vertical='center')
+    ws.row_dimensions[1].height = 32
+
+    status_col = headers.get(status_header)
+    focus_col = headers.get(highlight_header) if highlight_header else None
+
+    for r in range(2, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(r, c)
+            cell.border = thin
+            cell.alignment = Alignment(wrap_text=True, vertical='center')
+        if focus_col and ws.cell(r, focus_col).value == highlight_value:
+            for c in range(1, ws.max_column + 1):
+                ws.cell(r, c).fill = focus_fill
+        if status_col:
+            st = ws.cell(r, status_col)
+            if st.value == 'Pending':
+                st.fill = pending_fill
+            elif st.value == 'Done':
+                st.fill = done_fill
+            elif st.value == 'Skipped':
+                st.fill = skip_fill
+
+    for idx in range(1, ws.max_column + 1):
+        letter = get_column_letter(idx)
+        header = ws.cell(1, idx).value or ''
+        width = 14
+        if header in ('What to redo', 'Why this was flagged', 'Action', 'Notes', 'Why marked'):
+            width = 42
+        elif header in ('Protocol', 'Assigned to', 'Compared with', 'Cluster members', 'High-tendency raters', 'Low-tendency raters'):
+            width = 22
+        elif header in ('Status', 'Side', 'Unit'):
+            width = 10
+        elif 'Measurement' in str(header) or 'Median' in str(header):
+            width = 16
+        ws.column_dimensions[letter].width = width
+
+def _write_instructions_sheet(writer, title, bullets):
+    instr = pd.DataFrame({'How to use this tracker': [title, '', *bullets]})
+    instr.to_excel(writer, sheet_name='Instructions', index=False)
+    ws = writer.sheets['Instructions']
+    ws.column_dimensions['A'].width = 100
+    from openpyxl.styles import Font, Alignment
+    ws['A1'].font = Font(bold=True, size=14)
+    for r in range(1, ws.max_row + 1):
+        ws.cell(r, 1).alignment = Alignment(wrap_text=True, vertical='top')
+        ws.row_dimensions[r].height = 18
+
+# ── Config ──────────────────────────────────────────────────────────────────
+CONSENSUS_MIN_RATERS = 3
+CLUSTER_AGREE_PCT = 0.05          # members of a cluster agree within 5%
+CLUSTER_OUT_PCT = 0.10            # outsider redo if ≥10% from cluster median
+STYLE_BIAS_MIN = 0.05             # |mean signed % vs case median| to call a rater high/low
+STYLE_MATCH_FRAC = 0.60           # fraction of raters matching their usual side → Calibration
+STATUS_DEFAULT_52 = 'Pending'
+
+PROTOCOL_PCT_FLOOR = {
+    'tt-tg': 10.0,
+    'patellar-tilt': 5.0,
+    'sulcus-angle': 100.0,
+    'sulcus-angle-3cm': 100.0,
+    'insall-salvati': 0.8,
+    'caton-deschamps': 0.8,
+}
+
+def _protocol_scale(values, protocol):
+    floor = float(PROTOCOL_PCT_FLOOR.get(protocol, 1.0))
+    return max(abs(float(np.median(values))), floor)
+
+def _pct_diff(value, ref, protocol=None):
+    ref = float(ref)
+    value = float(value)
+    floor = float(PROTOCOL_PCT_FLOOR.get(protocol, 1.0)) if protocol is not None else 1.0
+    denom = max(abs(ref), floor)
+    return abs(value - ref) / denom
+
+def _min_cluster_size(n):
+    """Scale cluster requirement with annotator count (3 now → 5–6 later)."""
+    if n <= 3:
+        return 2
+    return max(3, int(math.ceil(n / 2) - 1))  # 4→3, 5→3, 6→3
+
+def _largest_agreeing_clusters(vals_by_name, protocol):
+    """Return non-overlapping clusters (largest first) with internal spread ≤ AGREE%."""
+    names = list(vals_by_name)
+    n = len(names)
+    sc = _protocol_scale(list(vals_by_name.values()), protocol)
+    found = []
+    for k in range(n, 1, -1):
+        for comb in combinations(names, k):
+            vs = [vals_by_name[x] for x in comb]
+            spread = (max(vs) - min(vs)) / sc
+            if spread <= CLUSTER_AGREE_PCT:
+                found.append((set(comb), spread))
+        if found:
+            break
+    if not found:
+        return [], sc
+    # Prefer larger, then tighter; greedily take non-overlapping
+    found.sort(key=lambda t: (-len(t[0]), t[1]))
+    chosen = []
+    used = set()
+    for cluster, spread in found:
+        if cluster.isdisjoint(used):
+            chosen.append((cluster, spread))
+            used |= cluster
+    return chosen, sc
+
+# ── Build per-case wide values ──────────────────────────────────────────────
+case_keys_52 = ['patientId', 'laterality', 'true_protocol']
+wide = comparison_df[case_keys_52 + value_cols].copy()
+
+# Pass 1: protocol-level rater tendency (signed % vs case median) for Calibration routing
+_tendency_rows = []
+for _, row in wide.iterrows():
+    protocol = row['true_protocol']
+    present = []
+    for rk in rater_keys:
+        col = f'value_{rk}'
+        if col in row.index and pd.notna(row[col]):
+            present.append((rk.split(' | ')[0], float(row[col])))
+    if len(present) < CONSENSUS_MIN_RATERS:
+        continue
+    vals = [v for _, v in present]
+    med = float(np.median(vals))
+    sc = _protocol_scale(vals, protocol)
+    for name, val in present:
+        _tendency_rows.append({
+            'protocol': protocol,
+            'rater': name,
+            'signed_pct': (val - med) / sc,
+        })
+
+tendency_df = pd.DataFrame(_tendency_rows)
+if len(tendency_df):
+    rater_bias = (
+        tendency_df.groupby(['protocol', 'rater'])['signed_pct']
+        .agg(mean_signed_pct='mean', n_cases='count')
+        .reset_index()
+    )
+else:
+    rater_bias = pd.DataFrame(columns=['protocol', 'rater', 'mean_signed_pct', 'n_cases'])
+
+bias_lookup = {
+    (r['protocol'], r['rater']): float(r['mean_signed_pct'])
+    for _, r in rater_bias.iterrows()
+}
+
+# Pass 2: classify each case
+redo_events = []
+difficult_events = []
+calibration_events = []
+case_outcomes = []
+
+for _, row in wide.iterrows():
+    protocol = row['true_protocol']
+    present = []  # (rk, name, email, val)
+    for rk in rater_keys:
+        col = f'value_{rk}'
+        if col in row.index and pd.notna(row[col]):
+            name = rk.split(' | ')[0]
+            email = rk.split(' | ')[1] if ' | ' in rk else ''
+            present.append((rk, name, email, float(row[col])))
+    n = len(present)
+    if n < CONSENSUS_MIN_RATERS:
+        continue
+
+    vals_by_name = {name: val for _, name, _, val in present}
+    email_by_name = {name: email for _, name, email, _ in present}
+    unit = PROTOCOL_META.get(protocol, {}).get('unit', '')
+    need = _min_cluster_size(n)
+    clusters, sc = _largest_agreeing_clusters(vals_by_name, protocol)
+    valid = [(c, sp) for c, sp in clusters if len(c) >= need]
+    all_vals = list(vals_by_name.values())
+    case_median = float(np.median(all_vals))
+    case_spread_pct = (max(all_vals) - min(all_vals)) / sc
+
+    base_case = {
+        'patientId': row['patientId'],
+        'laterality': row['laterality'],
+        'protocol': protocol,
+        'unit': unit,
+        'n_raters_on_case': n,
+        'case_median_all': round(case_median, 4),
+        'case_spread_pct': round(100.0 * case_spread_pct, 1),
+        'min_cluster_needed': need,
+        'best_cluster_size': len(clusters[0][0]) if clusters else 1,
+    }
+
+    # Two opposing valid camps → Difficult (split), not forced redo
+    if len(valid) >= 2:
+        meds = [float(np.median([vals_by_name[x] for x in c])) for c, _ in valid[:2]]
+        if abs(meds[0] - meds[1]) / sc >= CLUSTER_OUT_PCT:
+            camp_a = ', '.join(sorted(valid[0][0]))
+            camp_b = ', '.join(sorted(valid[1][0]))
+            difficult_events.append({
+                **base_case,
+                'mark_type': 'split_camps',
+                'cluster_median': np.nan,
+                'cluster_members': f'{camp_a} || {camp_b}',
+                'why': (
+                    f'Two agreeing camps differ by ≥{CLUSTER_OUT_PCT*100:.0f}% '
+                    f'({camp_a} vs {camp_b}). Escalate / discuss — do not assign personal redo.'
+                ),
+            })
+            case_outcomes.append({**base_case, 'outcome': 'Difficult_split'})
+            continue
+
+    if len(valid) >= 1:
+        cluster, spread = valid[0]
+        cmed = float(np.median([vals_by_name[x] for x in cluster]))
+        outsiders = [name for name in vals_by_name if name not in cluster]
+        any_redo = False
+        for name in outsiders:
+            val = vals_by_name[name]
+            pct = _pct_diff(val, cmed, protocol)
+            if pct < CLUSTER_OUT_PCT:
+                continue
+            any_redo = True
+            redo_events.append({
+                **base_case,
+                'assigned_rater': name,
+                'assigned_email': email_by_name.get(name, ''),
+                'their_value': round(val, 4),
+                'cluster_median': round(cmed, 4),
+                'cluster_members': ', '.join(sorted(cluster)),
+                'cluster_spread_pct': round(100.0 * spread, 1),
+                'pct_from_cluster': round(100.0 * pct, 1),
+                'reason': (
+                    f'Outside agreeing cluster [{", ".join(sorted(cluster))}] '
+                    f'(cluster median={cmed:.4f}, you={val:.4f}, '
+                    f'{pct*100:.1f}% ≥ {CLUSTER_OUT_PCT*100:.0f}% threshold)'
+                ),
+                'status': STATUS_DEFAULT_52,
+                'done_date': '',
+                'notes': '',
+            })
+        case_outcomes.append({
+            **base_case,
+            'outcome': 'Redo' if any_redo else 'Consensus_ok',
+            'cluster_members': ', '.join(sorted(cluster)),
+        })
+        continue
+
+    # No valid cluster — Calibration vs Difficult
+    signs_match = []
+    high_names, low_names = [], []
+    for name, val in vals_by_name.items():
+        bias = bias_lookup.get((protocol, name), 0.0)
+        case_sign = 0 if abs(val - case_median) / sc < 1e-9 else (1 if val > case_median else -1)
+        bias_sign = 0 if abs(bias) < STYLE_BIAS_MIN else (1 if bias > 0 else -1)
+        if bias_sign != 0:
+            if bias_sign > 0:
+                high_names.append(name)
+            else:
+                low_names.append(name)
+            if case_sign != 0:
+                signs_match.append(case_sign == bias_sign)
+
+    match_frac = (sum(signs_match) / len(signs_match)) if signs_match else 0.0
+    strong_style = (
+        len(signs_match) >= 2
+        and match_frac >= STYLE_MATCH_FRAC
+        and (len(high_names) >= 1 and len(low_names) >= 1)
+    )
+
+    if strong_style:
+        calibration_events.append({
+            **base_case,
+            'mark_type': 'style_conflict',
+            'high_tendency_raters': ', '.join(sorted(set(high_names))),
+            'low_tendency_raters': ', '.join(sorted(set(low_names))),
+            'style_match_pct': round(100.0 * match_frac, 0),
+            'why': (
+                f'No agreeing cluster (need ≥{need} within {CLUSTER_AGREE_PCT*100:.0f}%). '
+                f'Case order matches known protocol style camps '
+                f'(high: {", ".join(sorted(set(high_names))) or "—"}; '
+                f'low: {", ".join(sorted(set(low_names))) or "—"}). '
+                f'Landmark calibration / training — not a one-off difficult patient.'
+            ),
+        })
+        case_outcomes.append({**base_case, 'outcome': 'Calibration'})
+    else:
+        difficult_events.append({
+            **base_case,
+            'mark_type': 'no_cluster',
+            'cluster_median': np.nan,
+            'cluster_members': '',
+            'why': (
+                f'No agreeing cluster of ≥{need} raters within {CLUSTER_AGREE_PCT*100:.0f}% '
+                f'(spread {100*case_spread_pct:.0f}%). Likely tricky / ambiguous landmarks — '
+                f'no personal redo assigned.'
+            ),
+        })
+        case_outcomes.append({**base_case, 'outcome': 'Difficult'})
+
+redo_df = pd.DataFrame(redo_events)
+difficult_df = pd.DataFrame(difficult_events)
+calibration_df = pd.DataFrame(calibration_events)
+outcomes_df = pd.DataFrame(case_outcomes)
+
+print('=== §5.2 case outcomes (cluster consensus) ===')
+if len(outcomes_df):
+    print(outcomes_df['outcome'].value_counts().to_string())
+    print('\nBy protocol:')
+    print(pd.crosstab(outcomes_df['protocol'], outcomes_df['outcome']).to_string())
+else:
+    print('No multi-rater cases.')
+
+# Protocol-level calibration summary (who tends high/low)
+calib_summary_rows = []
+for protocol, gbias in rater_bias.groupby('protocol'):
+    highs = gbias[gbias['mean_signed_pct'] >= STYLE_BIAS_MIN].sort_values('mean_signed_pct', ascending=False)
+    lows = gbias[gbias['mean_signed_pct'] <= -STYLE_BIAS_MIN].sort_values('mean_signed_pct')
+    n_cal = int((calibration_df['protocol'] == protocol).sum()) if len(calibration_df) else 0
+    n_diff = int((difficult_df['protocol'] == protocol).sum()) if len(difficult_df) else 0
+    n_redo = int((redo_df['protocol'] == protocol).sum()) if len(redo_df) else 0
+    calib_summary_rows.append({
+        'Protocol': _friendly_protocol(protocol),
+        'High-tendency raters': ', '.join(
+            f"{r['rater']} ({100*r['mean_signed_pct']:+.0f}%)" for _, r in highs.iterrows()
+        ) or '—',
+        'Low-tendency raters': ', '.join(
+            f"{r['rater']} ({100*r['mean_signed_pct']:+.0f}%)" for _, r in lows.iterrows()
+        ) or '—',
+        'Calibration cases': n_cal,
+        'Difficult cases': n_diff,
+        'Consensus redo tasks': n_redo,
+        'Note': (
+            'Style camps present — prefer landmark review over mass redo'
+            if (len(highs) and len(lows) and n_cal >= 3)
+            else ('Mostly tight agreement' if n_diff + n_cal == 0 else 'Mixed')
+        ),
+    })
+calib_summary_df = pd.DataFrame(calib_summary_rows)
+
+# ── Build tracker views ─────────────────────────────────────────────────────
+out_dir = Path(project_path)
+
+if len(redo_df):
+    redo_df = redo_df.sort_values(
+        ['assigned_rater', 'protocol', 'patientId', 'laterality', 'pct_from_cluster'],
+        ascending=[True, True, True, True, False],
+    ).reset_index(drop=True)
+    redo_df.insert(0, 'redo_id', [f'C{i+1:04d}' for i in range(len(redo_df))])
+
+    tracker_rows = []
+    for _, r in redo_df.iterrows():
+        tracker_rows.append({
+            'Task ID': r['redo_id'],
+            'Status': r['status'],
+            'Done date': r['done_date'],
+            'Notes': r['notes'],
+            'Assigned to': r['assigned_rater'],
+            'Email': r['assigned_email'],
+            'Patient ID': r['patientId'],
+            'Side': _friendly_side(r['laterality']),
+            'Protocol': _friendly_protocol(r['protocol']),
+            'Unit': r['unit'],
+            'What to redo': (
+                f"Re-annotate {_friendly_protocol(r['protocol'])} on patient {r['patientId']} "
+                f"({_friendly_side(r['laterality'])} side)."
+            ),
+            'Issue type': 'Outside agreeing cluster',
+            'Action': (
+                'Recheck YOUR landmarks — a clear group agreed with each other and you are outside that cluster.'
+            ),
+            'Your measurement': r['their_value'],
+            'Cluster median': r['cluster_median'],
+            'Cluster members': r['cluster_members'],
+            '# raters on this case': r['n_raters_on_case'],
+            '% away from cluster': r['pct_from_cluster'],
+            'Why this was flagged': r['reason'],
+        })
+    tracker_df = pd.DataFrame(tracker_rows)
+else:
+    tracker_df = pd.DataFrame()
+
+if len(difficult_df):
+    difficult_df = difficult_df.sort_values(
+        ['protocol', 'patientId', 'laterality']
+    ).reset_index(drop=True)
+    difficult_df.insert(0, 'case_id', [f'D{i+1:04d}' for i in range(len(difficult_df))])
+    difficult_tracker = pd.DataFrame([{
+        'Case ID': r['case_id'],
+        'Status': 'Open',
+        'Notes': '',
+        'Patient ID': r['patientId'],
+        'Side': _friendly_side(r['laterality']),
+        'Protocol': _friendly_protocol(r['protocol']),
+        'Unit': r['unit'],
+        'Mark type': 'Split camps' if r['mark_type'] == 'split_camps' else 'No agreeing cluster',
+        '# raters': r['n_raters_on_case'],
+        'Case spread %': r['case_spread_pct'],
+        'Best cluster size': r['best_cluster_size'],
+        'Min cluster needed': r['min_cluster_needed'],
+        'Camps / members': r.get('cluster_members', ''),
+        'Action': 'Do NOT assign personal redo — review as a group / mentor if needed.',
+        'Why marked': r['why'],
+    } for _, r in difficult_df.iterrows()])
+else:
+    difficult_tracker = pd.DataFrame()
+
+if len(calibration_df):
+    calibration_df = calibration_df.sort_values(
+        ['protocol', 'patientId', 'laterality']
+    ).reset_index(drop=True)
+    calibration_df.insert(0, 'case_id', [f'K{i+1:04d}' for i in range(len(calibration_df))])
+    calibration_tracker = pd.DataFrame([{
+        'Case ID': r['case_id'],
+        'Status': 'Open',
+        'Notes': '',
+        'Patient ID': r['patientId'],
+        'Side': _friendly_side(r['laterality']),
+        'Protocol': _friendly_protocol(r['protocol']),
+        'Unit': r['unit'],
+        'Mark type': 'Style / calibration conflict',
+        '# raters': r['n_raters_on_case'],
+        'Case spread %': r['case_spread_pct'],
+        'High-tendency raters': r['high_tendency_raters'],
+        'Low-tendency raters': r['low_tendency_raters'],
+        'Style match %': r['style_match_pct'],
+        'Action': (
+            'Landmark calibration — discuss consistent high/low camps for this protocol; '
+            'not treated as a difficult patient redo.'
+        ),
+        'Why marked': r['why'],
+    } for _, r in calibration_df.iterrows()])
+else:
+    calibration_tracker = pd.DataFrame()
+
+by_rater_c = (
+    tracker_df.groupby(['Assigned to', 'Email', 'Status'], dropna=False)
+    .size().reset_index(name='Number of tasks')
+    .sort_values(['Assigned to', 'Status'])
+    if len(tracker_df) else pd.DataFrame(columns=['Assigned to', 'Email', 'Status', 'Number of tasks'])
+)
+by_flag = (
+    tracker_df.groupby('Issue type').size().reset_index(name='Number of tasks')
+    if len(tracker_df) else pd.DataFrame(columns=['Issue type', 'Number of tasks'])
+)
+unique_cases_c = (
+    tracker_df.groupby(['Patient ID', 'Side', 'Protocol'], as_index=False)
+    .agg(**{
+        'People assigned': ('Assigned to', 'nunique'),
+        'Assigned names': ('Assigned to', lambda s: ', '.join(sorted(s.unique()))),
+        'Max % away from cluster': ('% away from cluster', 'max'),
+    })
+    .sort_values(['Protocol', 'Patient ID', 'Side'])
+    if len(tracker_df) else pd.DataFrame()
+)
+
+print('\n=== Consensus redo (cluster outsiders) ===')
+if len(tracker_df):
+    display(tracker_df.head(20))
+    print('\n=== Workload by person ===')
+    display(by_rater_c)
+    print(
+        f"\n{len(tracker_df)} redo tasks · {tracker_df['Assigned to'].nunique()} people · "
+        f"{len(unique_cases_c)} unique case/protocol rows"
+    )
+else:
+    print('No cluster-outsider redo tasks.')
+
+print(f'\nDifficult cases: {len(difficult_tracker)}')
+print(f'Calibration cases: {len(calibration_tracker)}')
+if len(calib_summary_df):
+    print('\n=== Protocol style summary ===')
+    display(calib_summary_df)
+
+# Persist CSVs
+csv_path_c = out_dir / 'redo_queue_consensus.csv'
+if len(tracker_df):
+    tracker_df.to_csv(csv_path_c, index=False)
+else:
+    pd.DataFrame(columns=[
+        'Task ID', 'Status', 'Assigned to', 'Patient ID', 'Side', 'Protocol'
+    ]).to_csv(csv_path_c, index=False)
+if len(redo_df):
+    redo_df.to_csv(out_dir / 'redo_queue_consensus_details.csv', index=False)
+difficult_tracker.to_csv(out_dir / 'redo_queue_difficult.csv', index=False)
+calibration_tracker.to_csv(out_dir / 'redo_queue_calibration.csv', index=False)
+calib_summary_df.to_csv(out_dir / 'redo_queue_calibration_summary.csv', index=False)
+outcomes_df.to_csv(out_dir / 'redo_queue_consensus_outcomes.csv', index=False)
+
+# Load §5.1 pair tracker
+pair_tracker = pair_by_rater = pair_unique = pair_details = None
+try:
+    pair_csv = out_dir / 'redo_queue.csv'
+    if pair_csv.exists():
+        pair_tracker = pd.read_csv(pair_csv)
+    pbr = out_dir / 'redo_queue_by_rater.csv'
+    puc = out_dir / 'redo_queue_unique_cases.csv'
+    pdet = out_dir / 'redo_queue_details.csv'
+    if pbr.exists():
+        pair_by_rater = pd.read_csv(pbr)
+    if puc.exists():
+        pair_unique = pd.read_csv(puc)
+    if pdet.exists():
+        pair_details = pd.read_csv(pdet)
+except Exception as e:
+    print(f'⚠ Could not load §5.1 pair tracker CSVs: {e}')
+
+workload_parts = []
+if pair_tracker is not None and len(pair_tracker):
+    tmp = pair_tracker.groupby(['Assigned to', 'Email', 'Status'], dropna=False).size().reset_index(name='Number of tasks')
+    tmp.insert(0, 'List', 'Pair disagreement')
+    workload_parts.append(tmp)
+if len(tracker_df):
+    tmp = tracker_df.groupby(['Assigned to', 'Email', 'Status'], dropna=False).size().reset_index(name='Number of tasks')
+    tmp.insert(0, 'List', 'Consensus redo')
+    workload_parts.append(tmp)
+# Difficult / Calibration are case lists (not per-person tasks) — show counts in summary rows
+if len(difficult_tracker):
+    workload_parts.append(pd.DataFrame([{
+        'List': 'Difficult cases',
+        'Assigned to': '(group review)',
+        'Email': '',
+        'Status': 'Open',
+        'Number of tasks': len(difficult_tracker),
+    }]))
+if len(calibration_tracker):
+    workload_parts.append(pd.DataFrame([{
+        'List': 'Calibration cases',
+        'Assigned to': '(landmark training)',
+        'Email': '',
+        'Status': 'Open',
+        'Number of tasks': len(calibration_tracker),
+    }]))
+workload_all = (
+    pd.concat(workload_parts, ignore_index=True).sort_values(['List', 'Assigned to', 'Status'])
+    if workload_parts else pd.DataFrame()
+)
+
+xlsx_path = out_dir / 'redo_tracker.xlsx'
+try:
+    with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
+        _write_instructions_sheet(writer, 'Combined redo tracker (§5.1 + §5.2)', [
+            'One workbook — pair disagreement plus cluster consensus:',
+            '',
+            'PAGES FOR RATERS',
+            '  • Pair disagreement — unusual gap vs another rater (§5.1: ≥10% and outside BA band).',
+            '  • Consensus redo — you are outside an agreeing cluster (≥2–3 raters within 5%; you ≥10% away).',
+            '  • Workload by person — how many redo tasks you have.',
+            '',
+            'PAGES FOR MENTORS / GROUP (not personal redo)',
+            '  • Difficult cases — no clear agreeing cluster (or split camps). Tricky patient; no assignee.',
+            '  • Calibration cases — disagreement matches known high/low rater style camps for that protocol.',
+            '  • Calibration summary — who tends high vs low per protocol.',
+            '',
+            'HOW TO USE',
+            '1. Filter "Assigned to" to your name on Pair disagreement and Consensus redo.',
+            '2. Re-annotate that Patient ID + Side + Protocol; set Status → Done.',
+            '3. Do not treat Difficult / Calibration rows as personal redo queues.',
+            '',
+            'Details / outcomes CSVs are optional. Re-running the notebook overwrites this file.',
+        ])
+
+        if pair_tracker is not None and len(pair_tracker):
+            pair_tracker.to_excel(writer, sheet_name='Pair disagreement', index=False)
+            if pair_by_rater is not None:
+                pair_by_rater.to_excel(writer, sheet_name='Pair — workload', index=False)
+            if pair_unique is not None:
+                pair_unique.to_excel(writer, sheet_name='Pair — unique cases', index=False)
+            if pair_details is not None:
+                pair_details.to_excel(writer, sheet_name='Pair — details', index=False)
+
+        if len(tracker_df):
+            tracker_df.to_excel(writer, sheet_name='Consensus redo', index=False)
+            by_rater_c.to_excel(writer, sheet_name='Consensus — workload', index=False)
+            by_flag.to_excel(writer, sheet_name='Consensus — issue types', index=False)
+            if len(unique_cases_c):
+                unique_cases_c.to_excel(writer, sheet_name='Consensus — unique cases', index=False)
+            redo_df.to_excel(writer, sheet_name='Consensus — details', index=False)
+        else:
+            pd.DataFrame({'Note': ['No cluster-outsider redo tasks under current thresholds.']}).to_excel(
+                writer, sheet_name='Consensus redo', index=False
+            )
+
+        if len(difficult_tracker):
+            difficult_tracker.to_excel(writer, sheet_name='Difficult cases', index=False)
+        else:
+            pd.DataFrame({'Note': ['No difficult (no-cluster / split) cases.']}).to_excel(
+                writer, sheet_name='Difficult cases', index=False
+            )
+
+        if len(calibration_tracker):
+            calibration_tracker.to_excel(writer, sheet_name='Calibration cases', index=False)
+        if len(calib_summary_df):
+            calib_summary_df.to_excel(writer, sheet_name='Calibration summary', index=False)
+
+        if len(workload_all):
+            workload_all.to_excel(writer, sheet_name='Workload by person', index=False)
+
+        if 'Pair disagreement' in writer.sheets:
+            _style_tracker_sheet(
+                writer.sheets['Pair disagreement'],
+                status_header='Status',
+                highlight_header='Priority focus (you look like the outlier)?',
+                highlight_value='Yes — start here',
+            )
+        if 'Consensus redo' in writer.sheets and len(tracker_df):
+            _style_tracker_sheet(writer.sheets['Consensus redo'], status_header='Status')
+            from openpyxl.styles import PatternFill
+            ws = writer.sheets['Consensus redo']
+            headers = {cell.value: idx for idx, cell in enumerate(ws[1], start=1)}
+            status_col = headers.get('Status')
+            fill = PatternFill('solid', fgColor='DDEBF7')
+            for r in range(2, ws.max_row + 1):
+                for c in range(1, ws.max_column + 1):
+                    if status_col != c:
+                        ws.cell(r, c).fill = fill
+        if 'Difficult cases' in writer.sheets and len(difficult_tracker):
+            _style_tracker_sheet(writer.sheets['Difficult cases'], status_header='Status')
+        if 'Calibration cases' in writer.sheets and len(calibration_tracker):
+            _style_tracker_sheet(writer.sheets['Calibration cases'], status_header='Status')
+        if 'Workload by person' in writer.sheets:
+            _style_tracker_sheet(writer.sheets['Workload by person'], status_header='Status')
+
+    print(f'\nSaved combined tracker: {xlsx_path}')
+except ImportError:
+    print('\n⚠ openpyxl not installed — wrote CSV only.')
+
+print(f'Saved: {csv_path_c}')
+for legacy in ('redo_queue.xlsx', 'redo_queue_consensus.xlsx'):
+    legacy_path = out_dir / legacy
+    if legacy_path.exists():
+        try:
+            legacy_path.unlink()
+            print(f'Removed legacy file: {legacy_path.name}')
+        except Exception:
+            pass
+print(
+    '\nOpen redo_tracker.xlsx — use "Pair disagreement" and "Consensus redo" for personal tasks; '
+    '"Difficult cases" / "Calibration cases" for group review.'
+)
 
 """
 ---
