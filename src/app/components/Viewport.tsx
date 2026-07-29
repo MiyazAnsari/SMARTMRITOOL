@@ -1598,8 +1598,8 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
         }
       } else if (measurement.type === 'point' && points.length >= 1) {
         const p = points[0];
-        const ptR = magnifierActive ? 3 : 5;
-        const borderR = magnifierActive ? 3.5 : 7;
+        const ptR = magnifierActive ? 2 : 3;
+        const borderR = magnifierActive ? 3 : 4.5;
         const borderW = magnifierActive ? 0.5 : 1;
         ctx.save();
         ctx.globalAlpha = overlayAlpha;
@@ -1780,16 +1780,18 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
       ctx.setLineDash([]);
 
       const rlLabel = rl.label;
-      ctx.font = 'bold 10px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'top';
-      const labelW = ctx.measureText(rlLabel).width + 10;
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
-      ctx.beginPath();
-      ctx.roundRect(clearW - labelW - 8, y - 22, labelW, 18, 6);
-      ctx.fill();
-      ctx.fillStyle = '#facc15';
-      ctx.fillText(rlLabel, clearW - labelW / 2 - 8, y - 16);
+      if (showLabels) {
+        ctx.font = 'bold 10px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        const labelW = ctx.measureText(rlLabel).width + 10;
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+        ctx.beginPath();
+        ctx.roundRect(clearW - labelW - 8, y - 22, labelW, 18, 6);
+        ctx.fill();
+        ctx.fillStyle = '#facc15';
+        ctx.fillText(rlLabel, clearW - labelW / 2 - 8, y - 16);
+      }
       ctx.restore();
     }
 
@@ -1805,7 +1807,7 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
       for (let i = 1; i < dl.points.length; i++) ctx.lineTo(dl.points[i].x, dl.points[i].y);
       ctx.stroke();
       ctx.setLineDash([]);
-      if (dl.label) {
+      if (dl.label && showLabels) {
         ctx.font = 'bold 9px sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'bottom';
@@ -1817,7 +1819,7 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
         ctx.roundRect(mx - tw / 2, my - 14, tw, 16, 4);
         ctx.fill();
         ctx.fillStyle = '#fff';
-        if (showLabels) ctx.fillText(dl.label, mx, my - 2);
+        ctx.fillText(dl.label, mx, my - 2);
       }
       ctx.restore();
     }

@@ -70,15 +70,19 @@ function storageKey(patientKey: string, laterality: Laterality): string {
   return `${patientKey}::${laterality}`;
 }
 
+
 export function HipXrayViewer({ onImagesLoad, sessionUser, sessionUserEmail }: HipXrayViewerProps) {
   // ── State ──────────────────────────────────────────────────────────
   const [images, setImages] = useState<HipXrayImage[]>([]);
   const [activeImageKey, setActiveImageKey] = useState<string | null>(null);
   const [activeLaterality, setActiveLaterality] = useState<Laterality>('left');
+  const prevImageKeyRef = useRef(activeImageKey);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<string | null>(null);
   const [activeTool, setActiveTool] = useState<MeasurementTool>('pan');
   const [userToolOverride, setUserToolOverride] = useState<MeasurementTool | null>(null);
+  const [confidenceFlags, setConfidenceFlags] = useState<Record<string, boolean>>({});
+  const importFileRef = useRef<File | null>(null);
 const [magnifierActive, setMagnifierActive] = useState(0);
 const [showLabels, setShowLabels] = useState(true);
   // Per-patient per-side measurement archive
@@ -88,6 +92,24 @@ const [showLabels, setShowLabels] = useState(true);
 
   // Persist archive on every change
   useEffect(() => { saveHipArchive(measurementArchive); }, [measurementArchive]);
+
+  // Deduplicate archive on mount (clean up any phantom from previous sessions)
+  useEffect(() => {
+    setMeasurementArchive((prev) => {
+      let changed = false;
+      const next: Record<string, Measurement[]> = {};
+      for (const [key, measList] of Object.entries(prev)) {
+        const seen = new Map<string, Measurement>();
+        for (const m of measList) {
+          if (m.workflowStepId) seen.set(m.workflowStepId, m);
+        }
+        const deduped = [...seen.values(), ...measList.filter((m) => !m.workflowStepId)];
+        if (deduped.length !== measList.length) changed = true;
+        next[key] = deduped;
+      }
+      return changed ? next : prev;
+    });
+  }, []);
 
   // Active measurements for current patient + side
   const activeStorageKey = activeImageKey ? storageKey(activeImageKey, activeLaterality) : null;
@@ -157,6 +179,14 @@ const [showLabels, setShowLabels] = useState(true);
   const dicomInputRef = useRef<HTMLInputElement | null>(null);
   const measIdCounter = useRef(0);
   const loadingAbortRef = useRef<AbortController | null>(null);
+
+  // Reset active laterality to left whenever patient changes
+  useEffect(() => {
+    if (activeImageKey && activeImageKey !== prevImageKeyRef.current) {
+      prevImageKeyRef.current = activeImageKey;
+      setActiveLaterality('left');
+    }
+  }, [activeImageKey]);
 
   const activeImage = useMemo(
     () => images.find((img) => img.patientKey === activeImageKey) ?? null,
@@ -254,6 +284,7 @@ const [showLabels, setShowLabels] = useState(true);
       if (loaded.length === 0) { alert('No valid hip X-ray DICOMs found.'); return; }
       setImages(loaded);
       setActiveImageKey(loaded[0].patientKey);
+      setActiveLaterality('left');
       onImagesLoad?.(loaded);
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
@@ -482,6 +513,28 @@ const [showLabels, setShowLabels] = useState(true);
         lines.push({ points: arcPts, label: 'Angle' });
       }
     }
+    // Femoral head circle: drawn from the head diameter line
+    if (headDiam && headDiam.points.length >= 2) {
+      const cx = (headDiam.points[0].x + headDiam.points[1].x) / 2;
+      const cy = (headDiam.points[0].y + headDiam.points[1].y) / 2;
+      const radius = Math.hypot(
+        headDiam.points[1].x - headDiam.points[0].x,
+        headDiam.points[1].y - headDiam.points[0].y
+      ) / 2
+      // Approximate circle with 24 line segments
+      const segs = 24;
+      const circlePts: { x: number; y: number }[] = [];
+      for (let i = 0; i <= segs; i++) {
+        const a = (i / segs) * Math.PI * 2;
+        circlePts.push({ x: cx + radius * Math.cos(a), y: cy + radius * Math.sin(a) });
+      }
+      lines.push({ points: circlePts, label: 'Femoral Head Circle' });
+      // Center crosshair: 4 small line segments
+      const cs = 6;
+      lines.push({ points: [{ x: cx - cs, y: cy }, { x: cx + cs, y: cy }], label: 'Head Center' });
+      lines.push({ points: [{ x: cx, y: cy - cs }, { x: cx, y: cy + cs }], label: 'Head Center' });
+    }
+
     return lines;
   }, [protocolActive, measurements, activeLaterality]);
 
@@ -633,7 +686,9 @@ const [showLabels, setShowLabels] = useState(true);
             ? (mType === 'distance' || mType === 'line')
             : stepPrimitive === 'point'
               ? (mType === 'point')
-              : false;
+              : stepPrimitive === 'ellipse'
+                ? (mType === 'ellipse')
+                : false;
         if (!matches) return; // silently reject wrong-tool drawings
         // Block if this step already has a completed result (no duplicates)
         if (workflow.stepResults[activeStep.id]) return;
@@ -656,8 +711,6 @@ const [showLabels, setShowLabels] = useState(true);
 
       setMeasurements((prev) => {
         const next = [...prev, tagged];
-        // Cascade: if this is a reference line drawn after its dependents,
-        // retroactively constrain them (e.g. M1/M2 placed before G2).
         return cascadeDependents(tagged.workflowStepId, next);
       });
 
@@ -800,7 +853,117 @@ const [showLabels, setShowLabels] = useState(true);
     a.click(); URL.revokeObjectURL(url);
   };
 
-  const exportHipCsv = useCallback(() => {
+
+  // CSV import
+  const handleImportCsv = useCallback(() => {
+    const file = importFileRef.current;
+    if (!file) { alert('Please select a CSV file first.'); return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = reader.result as string;
+      const lines = text.split('\n').filter((l: string) => l.trim());
+      if (lines.length < 2) { alert('CSV has no data rows.'); return; }
+      // Find header line (skip section markers like === CONFIDENT-ONLY ===)
+      let headerLine = '';
+      for (const l of lines) {
+        if (l.includes('point1_x') || l.includes('sessionUser')) { headerLine = l as string; break; }
+      }
+      if (!headerLine) { alert('CSV has no recognizable header row.'); return; }
+      const header = headerLine.split(',').map((h: string) => h.trim().replace(/^\uFEFF/, ''));
+      console.log('[import] header:', JSON.stringify(header));
+      const idxPx = header.indexOf('point1_x'), idxPy = header.indexOf('point1_y');
+      const idxP2x = header.indexOf('point2_x'), idxP2y = header.indexOf('point2_y');
+      const idxPatient = header.indexOf('patient'), idxLaterality = header.indexOf('laterality');
+      const idxStep = header.indexOf('step'), idxLabel = header.indexOf('label'), idxType = header.indexOf('type');
+      if (idxPx < 0 || idxPy < 0) { alert('CSV missing point1_x/point1_y columns. Header: ' + JSON.stringify(header)); return; }
+      const imported: Record<string, Measurement[]> = {};
+      let count = 0;
+      const seen = new Set<string>();
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i] as string;
+        // Skip section markers and header repeats
+        if (line.startsWith('===') || line.startsWith('sessionUser,')) continue;
+        const parts = line.split(',');
+        const px = parseFloat(parts[idxPx]), py = parseFloat(parts[idxPy]);
+        if (isNaN(px) || isNaN(py)) continue;
+        // Skip duplicate rows (CSV has CONFIDENT-ONLY + ALL MEASUREMENTS sections)
+        const rowKey = `${parts[idxPatient] || ''}::${parts[idxLaterality] || ''}::${parts[idxStep] || ''}::${px}:${py}`;
+        if (seen.has(rowKey)) continue;
+        seen.add(rowKey);
+        const patientKey = parts[idxPatient] || '', laterality = parts[idxLaterality] || '';
+        const key = `${patientKey}::${laterality}`;
+        const p2x = parseFloat(parts[idxP2x]), p2y = parseFloat(parts[idxP2y]);
+        const pts: { x: number; y: number }[] = [{ x: px, y: py }];
+        if (!isNaN(p2x) && !isNaN(p2y)) pts.push({ x: p2x, y: p2y });
+        if (!imported[key]) imported[key] = [];
+        imported[key].push({
+          id: `import-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          type: (parts[idxType] || 'point') === 'derived' || (parts[idxType] || 'point') === 'computed' ? 'point' : (parts[idxType] || 'point'),
+          points: pts, slice: 0, plane: 'coronal',
+          laterality: laterality as Laterality, label: parts[idxLabel] || '',
+          workflowStepId: parts[idxStep] || undefined,
+          timestamp: new Date().toISOString(),
+        });
+        count++;
+      }
+      if (count === 0) { alert('No measurement rows with point coordinates found.'); return; }
+      // Replace existing measurements with imported ones (match by workflowStepId).
+      // Do NOT run cascade here — cascade uses activeLaterality from closure which
+      // causes phantom measurements for non-active hips. Constraints apply naturally
+      // when the user edits/drags any endpoint after import.
+      setMeasurementArchive((prev) => {
+        const next = { ...prev };
+        for (const [k, meas] of Object.entries(imported)) {
+          const existing = next[k] ?? [];
+          const importedIds = new Set(meas.map((m) => m.workflowStepId).filter(Boolean));
+          const kept = existing.filter((m) => !m.workflowStepId || !importedIds.has(m.workflowStepId));
+          next[k] = [...kept, ...meas];
+        }
+        return next;
+      });
+      if (activeStorageKey) {
+        const stepResults: Record<string, { points: { x: number; y: number }[]; slice: number; imageScale?: any }> = {};
+        for (const [k, meas] of Object.entries(imported)) {
+          if (k === activeStorageKey) {
+            for (const m of meas) {
+              if (m.workflowStepId && HIP_MEASUREMENT_PROTOCOL.steps.some((s) => s.id === m.workflowStepId)) {
+                stepResults[m.workflowStepId] = { points: m.points, slice: 0, imageScale: m.imageScale };
+              }
+            }
+          }
+        }
+        setWorkflow((w) => ({ ...w, stepResults: { ...w.stepResults, ...stepResults } }));
+      }
+      // Restore confidence flags from the CONFIDENT-ONLY section
+      // (blank mm_value in confident-only rows = not confident at export time)
+      const confidenceSection = text.indexOf('=== CONFIDENT-ONLY ===');
+      if (confidenceSection >= 0) {
+        const confLines = text.substring(confidenceSection).split('\n').filter((l: string) => l.trim());
+        const newFlags: Record<string, boolean> = {};
+        for (const line of confLines) {
+          if (line.startsWith('===') || line.startsWith('sessionUser,')) continue;
+          const parts = line.split(',');
+          // Row: user,email,patient,laterality,step,label,type,mm_value,...
+          const label = parts[5] || '';
+          const mmVal = parts[7] || '';
+          const mMatch = label.match(/^M(\d+)\./);
+          if (mMatch && !mmVal.trim()) {
+            const mNum = parseInt(mMatch[1]);
+            const key = `${parts[2]}::${parts[3]}::m${mNum}`;
+            newFlags[key] = false;
+          }
+        }
+        if (Object.keys(newFlags).length > 0) {
+          setConfidenceFlags((prev) => ({ ...prev, ...newFlags }));
+        }
+      }
+      alert(`Imported ${count} measurements.`);
+    };
+    reader.onerror = () => alert('Failed to read file.');
+    reader.readAsText(file);
+  }, [activeStorageKey, importFileRef]);
+
+  const exportHipCsv = useCallback((confidence?: Record<string, boolean>) => {
     const rows: string[] = ['sessionUser,sessionUserEmail,patient,laterality,step,label,type,mm_value,point1_x,point1_y,point2_x,point2_y'];
     const userCols = [sessionUser ?? '', sessionUserEmail ?? ''].join(',');
     for (const [key, measList] of Object.entries(measurementArchive)) {
@@ -891,7 +1054,24 @@ const [showLabels, setShowLabels] = useState(true);
         rows.push([userCols, patientKey, laterality, m.workflowStepId || '', m.label || '', m.type, mmVal, p1x, p1y, p2x, p2y].join(','));
       }
     }
-    downloadTextFile(`hip-measurements-${Date.now()}.csv`, rows.join('\n'));
+    const ts = Date.now();
+    const confidentRows = rows.map((row) => {
+      if (!confidence) return row;
+      // Row: sessionUser,email,patient,laterality,step,label,type,mm_value,pt1x,pt1y,pt2x,pt2y
+      // idx:     0        1      2       3        4    5    6     7      8    9    10   11
+      const parts = row.split(',');
+      const label = parts[5] || '';
+      const mMatch = label.match(/^M(\d+)\./);
+      if (mMatch) {
+        const mNum = parseInt(mMatch[1]);
+        const rowKey = `${parts[2]}::${parts[3]}`;
+        const flagKey = `${rowKey}::m${mNum}`;
+        if (confidence[flagKey] === false) parts[7] = ''; // blank mm_value at index 7
+      }
+      return parts.join(',');
+    });
+    const combined = ['=== CONFIDENT-ONLY ===', ...confidentRows, '', '=== ALL MEASUREMENTS ===', ...rows];
+    downloadTextFile(`hip-measurements-${ts}.csv`, combined.join('\n'));
   }, [measurementArchive, activePixelSpacing, sessionUser, sessionUserEmail]);
 
   // ── Protocol result (computed from live measurements, not stale workflow state) ──
@@ -1037,7 +1217,7 @@ M10. Femur Neck Angle = ? (compute pending)`;
   // ── Render ─────────────────────────────────────────────────────────
   return (
     <div className="h-full flex">
-      <input ref={dicomInputRef} type="file" webkitdirectory="" directory="" multiple onChange={handleLoadFolder} className="hidden" />
+      <input ref={dicomInputRef} type="file" webkitdirectory="" directory="" multiple onChange={handleLoadFolder} className="sr-only" />
 
       {/* Center: viewport */}
       <div className="flex-1 flex flex-col min-h-0 relative">
@@ -1346,16 +1526,44 @@ M10. Femur Neck Angle = ? (compute pending)`;
                 </div>
               )}
 
-              <Button size="sm" variant="outline" className="w-full border-gray-700 bg-gray-800 text-gray-200 hover:bg-gray-700"
+              <label className="mt-1 w-full inline-flex items-center justify-center gap-1 h-7 rounded text-[11px] font-medium border border-amber-700/60 bg-amber-950/30 text-amber-300 hover:bg-amber-950/50 cursor-pointer">
+                <input type="file" accept=".csv" onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) { importFileRef.current = f; handleImportCsv(); }
+                  e.target.value = ''; // reset so same file can be re-imported
+                }} style={{ position: 'absolute', opacity: 0, width: 0, height: 0 }} />
+                Import CSV
+              </label>
+              <Button size="sm" variant="outline" className="mt-1 w-full border-gray-700 bg-gray-800 text-gray-200 hover:bg-gray-700"
                 onClick={resetProtocol}
               >
                 <RotateCcw className="w-3 h-3 mr-1" /> Reset measurements
               </Button>
+              <div className="mt-3 border-t border-gray-700 pt-2">
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-gray-500 mb-1.5">Confidence Checklist (M1–M10)</div>
+                <div className="grid grid-cols-2 gap-x-1.5 gap-y-0.5">
+                  {['M1 Cortical (Med)','M2 Cortical (Lat)','M3 Shaft Thick','M4 Neck Width','M5 Head Diam','M6 Hip Axis Len','M7 Neck Axis Len','M8 H-Offset','M9 V-Offset','M10 Neck Angle'].map((label, i) => {
+                    const mNum = i + 1;
+                    const key = `${activeStorageKey}::m${mNum}`;
+                    const confident = confidenceFlags[key] !== false;
+                    return (
+                      <button key={label} type="button"
+                        onClick={() => setConfidenceFlags((prev) => ({ ...prev, [key]: !confident }))}
+                        className={`text-left text-[9px] px-1.5 py-0.5 rounded border transition-colors ${
+                          confident ? 'border-emerald-700/60 bg-emerald-900/30 text-emerald-300' : 'border-red-700/40 bg-red-900/20 text-red-400 line-through'
+                        }`}
+                      >{label}</button>
+                    );
+                  })}
+                </div>
+              </div>
+
               <Button size="sm" variant="ghost" className="mt-1 w-full border border-emerald-700 text-emerald-300 hover:bg-emerald-950/40 hover:text-emerald-200"
-                onClick={exportHipCsv}
-              >
+                  onClick={() => exportHipCsv(confidenceFlags)}
+                >
                 Export CSV
               </Button>
+              
             </>
           )}
         </div>
