@@ -1,0 +1,8 @@
+# Python packages needed to run scripts.py (inter-rater analysis)
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+seaborn>=0.13
+scipy>=1.11
+pingouin>=0.5
+openpyxl>=3.1
