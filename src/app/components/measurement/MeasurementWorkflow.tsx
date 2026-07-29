@@ -81,18 +81,16 @@ export function MeasurementWorkflow({
   const rawMeasurementValues = useMemo(() => {
     const rows: { id: string; label: string; type: string; value: string }[] = [];
     for (const m of measurements) {
-      const is = m.imageScale ?? imageScale;
-      const sx = (is?.x ?? 1) * pixelSpacing.x;
-      const sy = (is?.y ?? 1) * pixelSpacing.y;
-      const ixx = (is?.x ?? 1);
-      const ixy = (is?.y ?? 1);
+      // Points are stored as image-pixel coordinates — use directly.
+      const spcX = pixelSpacing.x;
+      const spcY = pixelSpacing.y;
       let value = '';
 
       if ((m.type === 'distance' || m.type === 'line' || m.type === 'perpendicular') && m.points.length >= 2) {
         const dx = m.points[1].x - m.points[0].x;
         const dy = m.points[1].y - m.points[0].y;
-        const pxDist = Math.hypot(dx * ixx, dy * ixy);
-        const mmDist = Math.hypot(dx * sx, dy * sy);
+        const pxDist = Math.hypot(dx, dy);
+        const mmDist = Math.hypot(dx * spcX, dy * spcY);
         value = `${pxDist.toFixed(1)} px / ${mmDist.toFixed(1)} mm`;
       } else if (m.type === 'angle' && m.points.length >= 3) {
         const v1x = m.points[0].x - m.points[1].x;
@@ -107,15 +105,8 @@ export function MeasurementWorkflow({
           value = `${deg.toFixed(1)}°`;
         }
       } else if (m.type === 'point' && m.points.length >= 1) {
-        // Show image-pixel coordinates (invariant to viewport size)
-        // rather than CSS-pixel coordinates which change on resize.
-        const px = m.points[0].x;
-        const py = m.points[0].y;
-        const ox = is?.offsetX ?? 0;
-        const oy = is?.offsetY ?? 0;
-        const ix = (px - ox) * ixx;
-        const iy = (py - oy) * ixy;
-        value = `${ix.toFixed(1)}, ${iy.toFixed(1)} px`;
+        // Points are already image-pixel coordinates.
+        value = `${m.points[0].x.toFixed(1)}, ${m.points[0].y.toFixed(1)} px`;
       }
 
       // Fallback: show at minimum the point count so nothing is silently hidden.
@@ -133,7 +124,7 @@ export function MeasurementWorkflow({
       });
     }
     return rows;
-  }, [measurements, pixelSpacing, imageScale]);
+  }, [measurements, pixelSpacing]);
 
   const handleSelect = (id: string) => {
     const p = getProtocol(id);

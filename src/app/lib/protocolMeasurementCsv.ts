@@ -179,18 +179,15 @@ function formatPoints(
 function convertPointsToMm(
   points: { x: number; y: number }[],
   spacing: { x: number; y: number; z?: number },
-  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
+  _imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
   sliceIndex?: number,
 ) {
-  const sx = (imageScale?.x ?? 1) * spacing.x;
-  const sy = (imageScale?.y ?? 1) * spacing.y;
-  const ox = imageScale?.offsetX ?? 0;
-  const oy = imageScale?.offsetY ?? 0;
+  // Points are image-pixel coordinates — multiply directly by mm-per-pixel.
   const sz = (spacing.z ?? 1);
   const zMm = sliceIndex != null && Number.isFinite(sliceIndex) ? Number((sliceIndex * sz).toFixed(4)) : null;
   return points.map((p) => ({
-    x: Number(((p.x - ox) * sx).toFixed(4)),
-    y: Number(((p.y - oy) * sy).toFixed(4)),
+    x: Number((p.x * spacing.x).toFixed(4)),
+    y: Number((p.y * spacing.y).toFixed(4)),
     ...(zMm != null ? { z: zMm } : {}),
   }));
 }

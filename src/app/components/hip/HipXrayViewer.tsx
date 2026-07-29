@@ -406,13 +406,13 @@ const [showLabels, setShowLabels] = useState(true);
       const len = Math.hypot(dx, dy) || 1;
       const perpX = -dy / len;
       const perpY = dx / len;
-      const halfLen = Math.max(200, len); // extend past viewport
+      const halfLen = Math.max(5000, len); // extend across full image width
       lines.push({ points: [
         { x: g2Mid.x - perpX * halfLen, y: g2Mid.y - perpY * halfLen },
         { x: g2Mid.x + perpX * halfLen, y: g2Mid.y + perpY * halfLen },
       ], label: 'Femur Shaft Midline' });
     }
-    const g1Points = g2line && g2line.points.length >= 2 ? (() => { const m = { x: (g2line.points[0].x + g2line.points[1].x) / 2, y: (g2line.points[0].y + g2line.points[1].y) / 2 }; const dx = g2line.points[1].x - g2line.points[0].x, dy = g2line.points[1].y - g2line.points[0].y; const l = Math.hypot(dx, dy) || 1; const px = -dy / l, py = dx / l; const h = 300; return [{ x: m.x - px * h, y: m.y - py * h }, { x: m.x + px * h, y: m.y + py * h }]; })() : undefined;
+    const g1Points = g2line && g2line.points.length >= 2 ? (() => { const m = { x: (g2line.points[0].x + g2line.points[1].x) / 2, y: (g2line.points[0].y + g2line.points[1].y) / 2 }; const dx = g2line.points[1].x - g2line.points[0].x, dy = g2line.points[1].y - g2line.points[0].y; const l = Math.hypot(dx, dy) || 1; const px = -dy / l, py = dx / l; const h = 5000; return [{ x: m.x - px * h, y: m.y - py * h }, { x: m.x + px * h, y: m.y + py * h }]; })() : undefined;
     const ltGuid = measurements.find((m) => m.workflowStepId === 'lesser-trochanter-guideline');
     // Compute midpoint guideline on the fly from current hip's neck-width + head-diameter.
     // Never read from archive or stepResults — that's what caused cross-hip leakage.
@@ -1037,12 +1037,12 @@ const [showLabels, setShowLabels] = useState(true);
           rows.push([userCols, patientKey, laterality, 'derived', label, 'computed', val, '', '', '', ''].join(','));
         }
       }
-      // Raw measurements — use each measurement's own pixelSpacing + imageScale
+      // Points are stored as image-pixel coordinates.  Convert to mm
+      // using the measurement's stored pixel spacing.
       for (const m of measList) {
         const ps = m.sourcePixelSpacing ?? ownPS;
-        const is = m.imageScale;
-        const sx = (is?.x ?? 1) * ps.x;
-        const sy = (is?.y ?? 1) * ps.y;
+        const sx = ps.x;
+        const sy = ps.y;
         let mmVal = '';
         if ((m.type === 'distance' || m.type === 'line') && m.points.length >= 2) {
           mmVal = Math.hypot((m.points[1].x - m.points[0].x) * sx, (m.points[1].y - m.points[0].y) * sy).toFixed(2);
@@ -1575,8 +1575,8 @@ M10. Femur Neck Angle = ? (compute pending)`;
             <div className="space-y-1 max-h-60 overflow-y-auto pr-1">
               {measurements.map((m) => {
                 const is = m.imageScale;
-                const sx = (is?.x ?? 1) * activePixelSpacing.x;
-                const sy = (is?.y ?? 1) * activePixelSpacing.y;
+                const sx = activePixelSpacing.x;
+                const sy = activePixelSpacing.y;
                 let val = '';
                 if ((m.type === 'distance' || m.type === 'line') && m.points.length >= 2) {
                   const mm = Math.hypot((m.points[1].x - m.points[0].x) * sx, (m.points[1].y - m.points[0].y) * sy);

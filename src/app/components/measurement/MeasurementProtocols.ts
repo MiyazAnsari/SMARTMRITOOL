@@ -62,37 +62,35 @@ export interface MeasurementProtocol {
 
 export interface StepResult {
   primitive: Primitive;
-  /** CSS-pixel coordinate points from the viewport overlay (NOT image pixels). */
+  /** Image-pixel coordinate points (invariant to viewport size). */
   points: { x: number; y: number }[];
   /** Slice index the primitive was drawn on. */
   slice: number;
-  /** CSS→image-pixel scale factor at the moment these points were captured/remapped.
-   *  Stored atomically with points so protocol `compute` always has the correct
-   *  conversion regardless of display-size change timing. */
+  /** @deprecated Points are now image-pixel coords; this field is retained
+   *  for backward compatibility with previously saved step results. */
   imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
-  /** Viewport display height (px) when this result was captured.  Used with
-   *  imageScale.offsetY to compute the size-invariant CSS fraction. */
+  /** @deprecated No longer needed — image coordinates are size-invariant. */
   creationDisplayH?: number;
 }
 
 const toPhysical = (
   p: { x: number; y: number },
   pixelSpacing: { x: number; y: number },
-  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
+  _imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
 ) => ({
-  x: (p.x - (imageScale?.offsetX ?? 0)) * (imageScale?.x ?? 1) * pixelSpacing.x,
-  y: (p.y - (imageScale?.offsetY ?? 0)) * (imageScale?.y ?? 1) * pixelSpacing.y,
+  // Points are image-pixel coordinates — multiply directly by mm-per-pixel.
+  x: p.x * pixelSpacing.x,
+  y: p.y * pixelSpacing.y,
 });
 
 const dist = (
   a: { x: number; y: number },
   b: { x: number; y: number },
   pixelSpacing: { x: number; y: number },
-  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
+  _imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
 ) => {
-  const sx = (imageScale?.x ?? 1) * pixelSpacing.x;
-  const sy = (imageScale?.y ?? 1) * pixelSpacing.y;
-  return Math.hypot((a.x - b.x) * sx, (a.y - b.y) * sy);
+  // Points are image-pixel coordinates — multiply directly by mm-per-pixel.
+  return Math.hypot((a.x - b.x) * pixelSpacing.x, (a.y - b.y) * pixelSpacing.y);
 };
 
 /**

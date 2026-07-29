@@ -33,11 +33,12 @@ import type {
 function toPhysical(
   p: { x: number; y: number },
   pixelSpacing: { x: number; y: number },
-  imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
+  _imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number },
 ) {
+  // Points are image-pixel coordinates — multiply directly by mm-per-pixel.
   return {
-    x: (p.x - (imageScale?.offsetX ?? 0)) * (imageScale?.x ?? 1) * pixelSpacing.x,
-    y: (p.y - (imageScale?.offsetY ?? 0)) * (imageScale?.y ?? 1) * pixelSpacing.y,
+    x: p.x * pixelSpacing.x,
+    y: p.y * pixelSpacing.y,
   };
 }
 
@@ -45,11 +46,10 @@ function distMm(
   a: { x: number; y: number },
   b: { x: number; y: number },
   ps: { x: number; y: number },
-  is?: { x: number; y: number; offsetX?: number; offsetY?: number },
+  _is?: { x: number; y: number; offsetX?: number; offsetY?: number },
 ): number {
-  const sx = (is?.x ?? 1) * ps.x;
-  const sy = (is?.y ?? 1) * ps.y;
-  return Math.hypot((a.x - b.x) * sx, (a.y - b.y) * sy);
+  // Points are image-pixel coordinates — multiply directly by mm-per-pixel.
+  return Math.hypot((a.x - b.x) * ps.x, (a.y - b.y) * ps.y);
 }
 
 /** Perpendicular distance from point pt to the infinite line through p1-p2 (mm). */
@@ -58,11 +58,12 @@ function perpDistMm(
   p1: { x: number; y: number },
   p2: { x: number; y: number },
   ps: { x: number; y: number },
-  is?: { x: number; y: number; offsetX?: number; offsetY?: number },
+  _is?: { x: number; y: number; offsetX?: number; offsetY?: number },
 ): number {
-  const a = toPhysical(pt, ps, is);
-  const b1 = toPhysical(p1, ps, is);
-  const b2 = toPhysical(p2, ps, is);
+  // _is is unused — toPhysical now uses image-pixel coords directly.
+  const a = toPhysical(pt, ps);
+  const b1 = toPhysical(p1, ps);
+  const b2 = toPhysical(p2, ps);
   const dx = b2.x - b1.x;
   const dy = b2.y - b1.y;
   const len = Math.hypot(dx, dy) || 1;
@@ -86,12 +87,13 @@ function angleBetweenLinesDeg(
   p3: { x: number; y: number },
   p4: { x: number; y: number },
   ps: { x: number; y: number },
-  is?: { x: number; y: number; offsetX?: number; offsetY?: number },
+  _is?: { x: number; y: number; offsetX?: number; offsetY?: number },
 ): number {
-  const a1 = toPhysical(p1, ps, is);
-  const a2 = toPhysical(p2, ps, is);
-  const b1 = toPhysical(p3, ps, is);
-  const b2 = toPhysical(p4, ps, is);
+  // _is unused — toPhysical uses image-pixel coords directly.
+  const a1 = toPhysical(p1, ps);
+  const a2 = toPhysical(p2, ps);
+  const b1 = toPhysical(p3, ps);
+  const b2 = toPhysical(p4, ps);
   const v1x = a2.x - a1.x;
   const v1y = a2.y - a1.y;
   const v2x = b2.x - b1.x;
@@ -111,12 +113,13 @@ function signedAngleDeg(
   p3: { x: number; y: number },
   p4: { x: number; y: number },
   ps: { x: number; y: number },
-  is?: { x: number; y: number; offsetX?: number; offsetY?: number },
+  _is?: { x: number; y: number; offsetX?: number; offsetY?: number },
 ): number {
-  const a1 = toPhysical(p1, ps, is);
-  const a2 = toPhysical(p2, ps, is);
-  const b1 = toPhysical(p3, ps, is);
-  const b2 = toPhysical(p4, ps, is);
+  // _is unused — toPhysical uses image-pixel coords directly.
+  const a1 = toPhysical(p1, ps);
+  const a2 = toPhysical(p2, ps);
+  const b1 = toPhysical(p3, ps);
+  const b2 = toPhysical(p4, ps);
   const v1x = a2.x - a1.x;
   const v1y = a2.y - a1.y;
   const v2x = b2.x - b1.x;

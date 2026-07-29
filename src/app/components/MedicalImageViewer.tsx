@@ -125,9 +125,10 @@ export interface Measurement {
   workflowStepId?: string;
   /** When true the measurement is shown on parallel slices and selection shouldn't force a slice jump. */
   propagateAcrossSlices?: boolean;
-  /** CSS-pixel → image-pixel scale factor at the time the measurement was captured.
-   *  Stored so protocol `compute` can convert overlay coordinates to physical mm
-   *  regardless of the current viewport display size. */
+  /** @deprecated Points are now stored as image-pixel coordinates (invariant to
+   *  viewport size).  Conversion to physical mm uses `sourcePixelSpacing`
+   *  directly — no CSS→image scale factor is needed.  This field is retained
+   *  for backward compatibility with previously saved measurements. */
   imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number };
   /** DICOM pixel spacing for the source image at the time the measurement was captured.
    *  Stored so CSV export can correctly convert to mm for every patient, not just the active one. */
@@ -216,7 +217,6 @@ function buildSessionAnnotationRow(
     units,
     sliceIndex: m.slice,
     propagateAcrossSlices: m.propagateAcrossSlices ?? true,
-    imageScale: m.imageScale,
     annotatedBy: annotator.name,
     annotatorEmail: annotator.email,
     timestamp: ts,
@@ -275,7 +275,7 @@ export function MedicalImageViewer({
   const [workflow, setWorkflow] = useState<WorkflowState>(initialWorkflowState);
   /** Frame registration: user marks the same anatomical point (medial joint line)
    *  on sagittal + coronal.  Points stored as CSS coords; affine lookup from studyData. */
-  const [calibrationPoints, setCalibrationPoints] = useState<Partial<Record<Plane, { x: number; y: number; imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number } }>>>({});
+  const [calibrationPoints, setCalibrationPoints] = useState<Partial<Record<Plane, { x: number; y: number }>>>({});
   /** Which plane is awaiting a point placement for calibration. */
   const [calibrationPending, setCalibrationPending] = useState<Plane | null>(null);
   /** DICOM: open floating viewers + focused series (single source of truth with `open`). */
@@ -385,10 +385,9 @@ export function MedicalImageViewer({
       const sr = workflow.stepResults[step.id];
       if (!sr || sr.points.length < 1) continue;
 
-      const is = sr.imageScale ?? computePlaneImageScale('sagittal');
-      if (!is) continue;
-      const sagOffsetY = is.offsetY ?? 0;
-      const sagCssY = sr.points[0].y;
+      // Points are now image-pixel coordinates — use them directly to
+      // compute the position fraction within the sagittal image.
+      const sagImageY = sr.points[0].y;
 
       // Per-plane authoritative data from studyData.volumes.
       const planeImgH: Record<string, number> = {};
@@ -405,15 +404,9 @@ export function MedicalImageViewer({
         planeImgH[p] = nSlices;
       }
 
-      // CSS fraction for sagittal.  Prefer creation-time display height
-      // so the fraction is invariant to viewport resize.
-      const creationDH = (sr as any).creationDisplayH as number | undefined;
-      const sagDisp = viewportDisplaySizes['sagittal'];
-      const sagDisplayH = creationDH ?? sagDisp?.height ?? 0;
-      const sagDrawH = Math.max(1, sagDisplayH - 2 * sagOffsetY);
-      const sagFraction = sagDrawH > 0
-        ? Math.max(0, Math.min(1, (sagCssY - sagOffsetY) / sagDrawH))
-        : 0;
+      // Fraction of the sagittal image height (0=superior, 1=inferior).
+      const sagImgH = planeImgH['sagittal'] || 1;
+      const sagFraction = Math.max(0, Math.min(1, sagImageY / sagImgH));
 
       // ── 3D affine + calibration (DISABLED) ───────────────────────
       // Translation-only calibration can't correct for different axis
@@ -423,13 +416,12 @@ export function MedicalImageViewer({
 
       return {
         sagFraction,
-        sagCssY,
-        sagOffsetY,
+        sagImageY,         // authoritative image-pixel Y (replaces sagCssY)
         offsetMm: step.referenceLineMm,
         label: 'Joint line',
         planeZSpacing,
         planeZSliceCount: planeImgH,
-        coronalImageY,        // 3D-mapped Y on coronal (authoritative pixels)
+        coronalImageY,     // 3D-mapped Y on coronal (authoritative pixels)
         coronalImgH: planeImgH['coronal'],  // coronal authoritative slice count
       };
     }
@@ -876,7 +868,7 @@ export function MedicalImageViewer({
           if (sr && sr.points.length > 0) {
             setCalibrationPoints((prev) => ({
               ...prev,
-              sagittal: { x: sr.points[0].x, y: sr.points[0].y, imageScale: sr.imageScale },
+              sagittal: { x: sr.points[0].x, y: sr.points[0].y },
             }));
             return;
           }
@@ -908,7 +900,7 @@ export function MedicalImageViewer({
     if (newest && (newest.plane ?? '') === calibrationPending && newest.points.length > 0) {
       setCalibrationPoints((prev) => ({
         ...prev,
-        [calibrationPending]: { x: newest.points[0].x, y: newest.points[0].y, imageScale: newest.imageScale },
+        [calibrationPending]: { x: newest.points[0].x, y: newest.points[0].y },
       }));
       setCalibrationPending(null);
     }
@@ -1112,7 +1104,6 @@ export function MedicalImageViewer({
             primitive: activeStep.primitive,
             points: recordedPoints,
             slice: groupedMeasurement.slice,
-            imageScale: groupedMeasurement.imageScale,
             creationDisplayH: activeStep.plane ? viewportDisplaySizes[activeStep.plane]?.height : undefined,
           }),
         );
@@ -1152,7 +1143,6 @@ export function MedicalImageViewer({
             value: parsed ? parsed.value : row.value,
             units: parsed ? parsed.units : row.units,
             timestamp: new Date().toISOString(),
-            imageScale: imageScale ?? row.imageScale,
           };
         });
 
@@ -1297,9 +1287,6 @@ export function MedicalImageViewer({
             points: resolvedPoints,
             // Fallback generically to old m.value if we don't have a new explicit text value
             value: lengthValue !== undefined ? lengthValue : m.value,
-            // Always stamp the latest imageScale so CSV export / protocol compute
-            // recovers the same image-pixel positions regardless of viewport size.
-            imageScale: imageScale ?? m.imageScale,
           };
         });
 

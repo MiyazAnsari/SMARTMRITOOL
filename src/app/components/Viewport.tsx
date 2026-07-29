@@ -69,8 +69,8 @@ interface ViewportProps {
    *  at `offsetMm` superior. */
   referenceLineFraction?: {
     sagFraction: number;
-    sagCssY: number;
-    sagOffsetY: number;
+    /** Authoritative image-pixel Y coordinate (replaces sagCssY/sagOffsetY). */
+    sagImageY: number;
     offsetMm: number;
     label: string;
     planeZSpacing?: Record<string, number>;
@@ -116,6 +116,62 @@ interface ViewportProps {
   magnifierActive?: number;
   /** When false, measurement label text is hidden. */
   showLabels?: boolean;
+}
+
+// ── Coordinate conversion helpers ────────────────────────────────────
+// Measurements are stored as image-pixel coordinates (invariant to viewport
+// size).  The conversion functions below bridge between CSS (overlay canvas)
+// and image-pixel space at the I/O boundary.
+
+export interface ImageScale {
+  x: number;   // image pixels per CSS pixel
+  y: number;
+  offsetX: number;  // CSS pixel offset of the drawn image area (letterbox/pillarbox)
+  offsetY: number;
+}
+
+/** Convert CSS overlay-canvas pixel coordinates to image-pixel coordinates. */
+export function cssToImage(
+  cssX: number, cssY: number,
+  scale: ImageScale,
+): { x: number; y: number } {
+  return {
+    x: (cssX - scale.offsetX) * scale.x,
+    y: (cssY - scale.offsetY) * scale.y,
+  };
+}
+
+/** Convert image-pixel coordinates to CSS overlay-canvas coordinates. */
+export function imageToCss(
+  imgX: number, imgY: number,
+  scale: ImageScale,
+): { x: number; y: number } {
+  return {
+    x: imgX / scale.x + scale.offsetX,
+    y: imgY / scale.y + scale.offsetY,
+  };
+}
+
+/** Convert image-pixel coordinates to physical mm. */
+export function imageToPhysical(
+  imgX: number, imgY: number,
+  pixelSpacing: { x: number; y: number },
+): { x: number; y: number } {
+  return {
+    x: imgX * pixelSpacing.x,
+    y: imgY * pixelSpacing.y,
+  };
+}
+
+/** Clamp image-pixel coordinates to valid image bounds. */
+export function clampImagePoint(
+  pt: { x: number; y: number },
+  imgW: number, imgH: number,
+): { x: number; y: number } {
+  return {
+    x: Math.max(0, Math.min(imgW, pt.x)),
+    y: Math.max(0, Math.min(imgH, pt.y)),
+  };
 }
 
 export function Viewport({
@@ -339,8 +395,11 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
       if (!constraintLineId || constraintMode === 'none') return rawPt;
       const refMeas = measurements.find((m) => m.id === constraintLineId);
       if (!refMeas || refMeas.points.length < 2) return rawPt;
-      const p0 = refMeas.points[0];
-      const p1 = refMeas.points[1];
+      // Guideline points are stored as image coords — convert to CSS
+      // before computing constraint, since startPt/rawPt are CSS.
+      const scale = computeImageScale();
+      const p0 = imageToCss(refMeas.points[0].x, refMeas.points[0].y, scale);
+      const p1 = imageToCss(refMeas.points[1].x, refMeas.points[1].y, scale);
       const dx = p1.x - p0.x;
       const dy = p1.y - p0.y;
       const len = Math.hypot(dx, dy) || 1;
@@ -365,8 +424,11 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
 
   const buildPerpendicularPoints = useCallback((baseLine: Measurement, cursor: { x: number; y: number }) => {
     if (baseLine.points.length < 2) return null;
-    const p0 = baseLine.points[0];
-    const p1 = baseLine.points[1];
+    // Baseline points are stored as image coords — convert to CSS
+    // before computing perpendicular, since cursor is CSS.
+    const scale = computeImageScale();
+    const p0 = imageToCss(baseLine.points[0].x, baseLine.points[0].y, scale);
+    const p1 = imageToCss(baseLine.points[1].x, baseLine.points[1].y, scale);
     const dx = p1.x - p0.x;
     const dy = p1.y - p0.y;
     const len = Math.hypot(dx, dy);
@@ -585,13 +647,6 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
     };
   }, [getPlaneGeometry]);
 
-  const emitMeasurementUpdate = useCallback((id: string, newPoints: PointUpdater, value?: string, imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number }) => {
-    onMeasurementUpdate?.(id, newPoints, value, imageScale);
-    try {
-      lastBaselineUpdateRef.current.set(id, Date.now());
-    } catch {}
-  }, [onMeasurementUpdate]);
-
   // Compute the current CSS→image-pixel scale factor from displaySize.
   // Mirrors the draw-area logic in the repositioning effect and
   // calculateMeasurementValue so it's always consistent.
@@ -611,11 +666,29 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
     return { x: imgW / drawW, y: imgH / drawH, offsetX, offsetY };
   }, [displaySize, getPlaneGeometry, pixelSpacing]);
 
+  const emitMeasurementUpdate = useCallback((id: string, newPoints: PointUpdater, value?: string, imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number }) => {
+    // Array-form: convert CSS points to image coords before emitting.
+    // Function-form (used by resize remap): points are already CSS-space
+    // closures; let them pass through — the parent stores image coords.
+    if (Array.isArray(newPoints)) {
+      const scale = computeImageScale();
+      const imagePoints = newPoints.map((p) => cssToImage(p.x, p.y, scale));
+      onMeasurementUpdate?.(id, imagePoints, value, imageScale);
+    } else {
+      onMeasurementUpdate?.(id, newPoints, value, imageScale);
+    }
+    try {
+      lastBaselineUpdateRef.current.set(id, Date.now());
+    } catch {}
+  }, [onMeasurementUpdate, computeImageScale]);
+
   const emitMeasurementAdd = useCallback((m: Measurement) => {
-    // Stamp the current imageScale on every new measurement so protocol
-    // step results always have the correct px→mm conversion factor.
-    const withScale: Measurement = { ...m, imageScale: m.imageScale ?? computeImageScale() };
-    onMeasurementAdd(withScale);
+    // Convert CSS points to image-pixel coordinates so measurements are
+    // invariant to viewport size.  Image coords are the canonical storage
+    // format; CSS ↔ image conversion happens only at this I/O boundary.
+    const scale = computeImageScale();
+    const imagePoints = m.points.map((p) => cssToImage(p.x, p.y, scale));
+    onMeasurementAdd({ ...m, points: imagePoints });
     try {
       lastBaselineUpdateRef.current.set(m.id, Date.now());
     } catch {}
@@ -633,7 +706,7 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
     if (!referenceLineFraction) return lines;
 
     const {
-      sagFraction, sagCssY, offsetMm, label,
+      sagFraction, sagImageY, offsetMm, label,
       coronalImageY, coronalImgH,
     } = referenceLineFraction;
 
@@ -646,20 +719,8 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
     const myDrawH = Math.max(1, myDisplayH - 2 * myOffsetY);
 
     // ── Offset in CSS pixels for this viewport ────────────────────────
-    // The offset (e.g. 30 mm superior) is along the anatomical superior-
-    // inferior axis, which maps to the image *column* direction (screen Y).
-    //
-    // The in-plane column pixel spacing (dy = pixDims[2]) gives the
-    // physical distance between adjacent rows.  Multiply by the SI
-    // component of the column direction vector (|col_z| from IOP) to get
-    // the SI distance per row, then compute the SI fraction of the image.
-    //
-    //   siPerRow        = dy × |col_z|
-    //   imageSiExtent   = imageRows × siPerRow
-    //   offsetFraction  = offsetMm / imageSiExtent
-    //   offsetCss       = offsetFraction × myDrawH
     const iopCol = (header as any)?.imageOrientationPatient as number[] | undefined;
-    const colZ = iopCol?.length === 6 ? Math.abs(iopCol[5]) : 1; // |col_z|, SI component
+    const colZ = iopCol?.length === 6 ? Math.abs(iopCol[5]) : 1;
     const dy = header.pixDims?.[2] ?? (header as any).pixdim?.[2] ?? 1;
     const imageRows = getPlaneGeometry().height;
     const siPerRow = dy * colZ;
@@ -667,12 +728,12 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
     const offsetCss = (offsetMm / imageSiH) * myDrawH;
 
     // ── Joint line CSS Y ──────────────────────────────────────────────
+    // sagImageY is an image-pixel coordinate — convert to CSS for rendering.
     let jointCssY: number;
     if (isSagittal) {
-      jointCssY = sagCssY;
+      jointCssY = imageToCss(0, sagImageY, is).y;
     } else if (coronalImageY != null && coronalImgH && coronalImgH > 0) {
       // 3D affine mapping: coronalImageY is the authoritative image-pixel Y.
-      // Convert to CSS fraction, then to this viewport's CSS Y.
       const corFraction = Math.max(0, Math.min(1, coronalImageY / coronalImgH));
       jointCssY = corFraction * myDrawH + myOffsetY;
     } else {
@@ -727,173 +788,6 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
     prevHadRefLineForAutoNav.current = hasNow;
   }, [computedReferenceLines, onReferenceLineClick]);
 
-  const prevDisplaySizeRef = useRef<{ width: number; height: number } | null>(null);
-  const prevImageDataForRepositionRef = useRef<Uint8Array | null>(null);
-  useEffect(() => {
-    // When the underlying image volume changes (e.g. patient switch), the
-    // shared previous-display-size is no longer a valid reference for
-    // coordinate remapping.  However, each measurement stores its own
-    // imageScale (the draw-area geometry at capture time), so we can
-    // safely remap using per-measurement creation geometry even across
-    // volume switches.  Without this, switching back to a previously-
-    // viewed patient after resizing the viewport leaves measurements
-    // in the wrong coordinate system.
-    const volumeChanged = prevImageDataForRepositionRef.current !== imageData;
-    if (volumeChanged) {
-      prevImageDataForRepositionRef.current = imageData;
-      prevDisplaySizeRef.current = null;
-      // Fall through — still check whether measurements need remapping
-      // using per-measurement imageScale (the measurementOldArea helper
-      // below reconstructs the draw area from the stored imageScale,
-      // which is volume-specific and safe across patient switches).
-    }
-
-    const prev = prevDisplaySizeRef.current;
-    const cur = displaySize;
-
-    if (!prev || prev.width === 0 || prev.height === 0) {
-      prevDisplaySizeRef.current = cur;
-      // If the volume just changed, the current display size may differ
-      // from when the measurements were originally captured.  Continue
-      // to the remapping logic instead of returning early.
-      if (!volumeChanged) return;
-    }
-
-    if (cur.width === 0 || cur.height === 0) {
-        return;
-    }
-
-    // When the volume hasn't changed and display size is unchanged, skip.
-    if (!volumeChanged && prev && prev.width === cur.width && prev.height === cur.height) return;
-
-    if (
-      draggingPointRef.current ||
-      pendingLineDragRef.current ||
-      draggingPerpendicularRef.current ||
-      isPanning ||
-      isDrawing
-    ) {
-      prevDisplaySizeRef.current = cur;
-      return;
-    }
-
-    if (!onMeasurementUpdate) {
-      prevDisplaySizeRef.current = cur;
-      return;
-    }
-
-    // Compute the image draw area (size + centering offset) for a given display
-    // size.  Measurements are stored in display-canvas CSS-pixel coordinates,
-    // but the image is centered inside the canvas, so a naive display-ratio
-    // scale corrupts positions when the aspect ratio changes.  We map each
-    // point through image-fraction space instead:
-    //   canvas px  →  fraction of draw area  →  new canvas px
-    const { width: imgW, height: imgH, spacingX: geomSpacingX, spacingY: geomSpacingY } = getPlaneGeometry();
-    // Match the spacing source used by calculateMeasurementValue so the draw
-    // area is identical to the one used for px↔mm conversion.
-    const spcX = (pixelSpacing && pixelSpacing.x > 0 ? pixelSpacing.x : geomSpacingX) || 1;
-    const spcY = (pixelSpacing && pixelSpacing.y > 0 ? pixelSpacing.y : geomSpacingY) || 1;
-    const physicalW = Math.max(1, imgW * spcX);
-    const physicalH = Math.max(1, imgH * spcY);
-
-    const drawArea = (dW: number, dH: number) => {
-      const scale = Math.min(dW / physicalW, dH / physicalH);
-      const drawW = Math.max(1, Math.round(physicalW * scale));
-      const drawH = Math.max(1, Math.round(physicalH * scale));
-      return { drawW, drawH, offsetX: (dW - drawW) / 2, offsetY: (dH - drawH) / 2 };
-    };
-
-    // When the volume changed, prev is null so the shared oldArea is
-    // meaningless.  measurementOldArea will fall back to per-measurement
-    // imageScale (which is volume-specific and safe).  We still compute
-    // newArea from the current display size for the remapping target.
-    const oldArea = prev ? drawArea(prev.width, prev.height) : null;
-    const newArea = drawArea(cur.width, cur.height);
-    const currentImageScale = computeImageScale();
-
-    /** Reconstruct the display area at which a single measurement was captured
-     *  from its stored imageScale, falling back to the global oldArea.  Using
-     *  per-measurement creation geometry means each measurement is remapped
-     *  from its own original viewport size, not a shared "previous" size that
-     *  may belong to a different patient or a different resize event. */
-    const measurementOldArea = (m: { imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number } | null }) => {
-      const is = m.imageScale;
-      if (is && is.x > 0 && is.y > 0) {
-        return {
-          drawW: imgW / is.x,
-          drawH: imgH / is.y,
-          offsetX: is.offsetX ?? 0,
-          offsetY: is.offsetY ?? 0,
-        };
-      }
-      // Fall back to the shared oldArea.  When the volume changed, oldArea
-      // is null — skip measurements without stored imageScale in that case.
-      return oldArea;
-    };
-
-    // Remap ALL measurements using per-measurement imageScale so every
-    // point, line, perpendicular and angle stays invariant to viewport resize.
-    // Baselines (distance/line/angle) are processed first so dependent
-    // perpendiculars are recalculated with full geometric precision.  All
-    // remaining types (point, perpendicular without a remapped baseline,
-    // ellipse, curve, freehand) get the direct draw-area remap as a safety net.
-    const baselineTypes = new Set(['distance', 'line', 'angle']);
-    const isBaseline = (m) => baselineTypes.has(m.type);
-
-    // Pass 1 – baselines first (triggers perpendicular recalculation)
-    for (const m of measurements) {
-      if (!isBaseline(m)) continue;
-      const oa = measurementOldArea(m);
-      if (!oa) continue; // no usable old area (volume changed, no stored imageScale)
-      // Skip measurements whose stored imageScale already matches the current
-      // draw area (within rounding tolerance).  This avoids unnecessary state
-      // updates during patient switches when the display size is unchanged.
-      if (
-        Math.abs(oa.drawW - newArea.drawW) <= 1 &&
-        Math.abs(oa.drawH - newArea.drawH) <= 1 &&
-        Math.abs((oa.offsetX ?? 0) - (newArea.offsetX ?? 0)) <= 1 &&
-        Math.abs((oa.offsetY ?? 0) - (newArea.offsetY ?? 0)) <= 1
-      ) continue;
-      emitMeasurementUpdate(m.id, (oldPoints) =>
-        oldPoints.map((p) => ({
-          x: ((p.x - oa.offsetX) / oa.drawW) * newArea.drawW + newArea.offsetX,
-          y: ((p.y - oa.offsetY) / oa.drawH) * newArea.drawH + newArea.offsetY,
-        })),
-        undefined,
-        currentImageScale,
-      );
-    }
-
-    // Pass 2 – all remaining measurements (points, perpendiculars whose
-    // baseline was not remapped, ellipses, curves, freehand).
-    const remappedIds = new Set(measurements.filter((m) => isBaseline(m)).map((m) => m.id));
-    for (const m of measurements) {
-      if (isBaseline(m)) continue;
-      // Perpendicular whose baseline was remapped → recalculation handles it.
-      // All other types (point, ellipse, curve, freehand, perpendicular
-      // without a remapped baseline) get the direct remap.
-      if (m.type === 'perpendicular' && m.baseLineId && remappedIds.has(m.baseLineId)) continue;
-      const oa = measurementOldArea(m);
-      if (!oa) continue;
-      if (
-        Math.abs(oa.drawW - newArea.drawW) <= 1 &&
-        Math.abs(oa.drawH - newArea.drawH) <= 1 &&
-        Math.abs((oa.offsetX ?? 0) - (newArea.offsetX ?? 0)) <= 1 &&
-        Math.abs((oa.offsetY ?? 0) - (newArea.offsetY ?? 0)) <= 1
-      ) continue;
-      emitMeasurementUpdate(m.id, (oldPoints) =>
-        oldPoints.map((p) => ({
-          x: ((p.x - oa.offsetX) / oa.drawW) * newArea.drawW + newArea.offsetX,
-          y: ((p.y - oa.offsetY) / oa.drawH) * newArea.drawH + newArea.offsetY,
-        })),
-        undefined,
-        currentImageScale,
-      );
-    }
-
-    prevDisplaySizeRef.current = cur;
-  }, [displaySize, measurements, onMeasurementUpdate, isPanning, isDrawing, emitMeasurementUpdate, getPlaneGeometry, pixelSpacing, imageData]);
-
   // New volume buffer → reset this viewer’s W/L and brightness only (no cross-viewport state).
   const prevImageDataRef = useRef<Uint8Array | null>(null);
   useEffect(() => {
@@ -910,11 +804,6 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
     setIsBrightnessMode(false);
     setIsWlMode(false);
     setIsWwMode(false);
-    // Reset display-size tracking so the repositioning effect does not
-    // remap the new volume's measurements using the previous volume's
-    // display area as a coordinate-system reference (cross-patient
-    // measurement corruption).
-    prevDisplaySizeRef.current = null;
   }, [imageData, defaultWindowLevel]);
 
   // Apply weighting, per-viewport brightness, then window/level
@@ -1436,6 +1325,14 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
     const clearH = canvas.height / dpr;
     ctx.clearRect(0, 0, clearW, clearH);
 
+    // Skip rendering when the viewport hasn't been sized yet — the
+    // ResizeObserver will trigger a re-render with the real displaySize.
+    if (displaySize.width === 0 || displaySize.height === 0) return;
+
+    // Current image→CSS scale for rendering measurement points (which are
+    // stored as image-pixel coordinates).
+    const currentImageScale = computeImageScale();
+
     const drawLabel = (
       text: string,
       x: number,
@@ -1510,7 +1407,7 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
       ctx.fillStyle = '#3b82f6';
       ctx.lineWidth = 2;
 
-      const points = measurement.points;
+      const points = measurement.points.map((p) => imageToCss(p.x, p.y, currentImageScale));
 
       const isSelected = measurement.id === selectedLineId;
       const overlayAlpha = 1;
@@ -1798,21 +1695,23 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
     // ── Derived auto-computed lines (e.g. offsets, angles) ──────────
     for (const dl of derivedLines) {
       if (dl.points.length < 2) continue;
+      // derivedLines are computed in image-pixel space — convert to CSS.
+      const cssPts = dl.points.map((p) => imageToCss(p.x, p.y, currentImageScale));
       ctx.save();
       ctx.setLineDash([4, 4]);
       ctx.strokeStyle = 'rgba(0, 0, 0, 0.7)';
       ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.moveTo(dl.points[0].x, dl.points[0].y);
-      for (let i = 1; i < dl.points.length; i++) ctx.lineTo(dl.points[i].x, dl.points[i].y);
+      ctx.moveTo(cssPts[0].x, cssPts[0].y);
+      for (let i = 1; i < cssPts.length; i++) ctx.lineTo(cssPts[i].x, cssPts[i].y);
       ctx.stroke();
       ctx.setLineDash([]);
       if (dl.label && showLabels) {
         ctx.font = 'bold 9px sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'bottom';
-        const mx = (dl.points[0].x + dl.points[1].x) / 2;
-        const my = (dl.points[0].y + dl.points[1].y) / 2;
+        const mx = (cssPts[0].x + cssPts[1].x) / 2;
+        const my = (cssPts[0].y + cssPts[1].y) / 2;
         ctx.fillStyle = 'rgba(0,0,0,0.55)';
         const tw = ctx.measureText(dl.label).width + 8;
         ctx.beginPath();
@@ -1906,7 +1805,7 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
       ctx.lineTo(cx, cy + chLen);
       ctx.stroke();
     }
-  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool, selectedLineId, overlayTick, computedReferenceLines, referenceLine, plane, derivedLines, magnifierActive, showLabels]);
+  }, [measurements, currentSlice, isDrawing, drawingPoints, activeTool, selectedLineId, overlayTick, computedReferenceLines, referenceLine, plane, derivedLines, magnifierActive, showLabels, displaySize, computeImageScale]);
 
   // Calculate measurement value (prefer physical units mm when possible)
   const calculateMeasurementValue = (type: MeasurementTool, points: { x: number; y: number }[]): string => {
@@ -2634,10 +2533,15 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
       }
     } else if (activeTool === 'point') {
       // Snap point: pointConstraintLinePoints > pointConstraintLineId > snapToLines
+      // Guideline points are stored as image coords — convert to CSS for
+      // projection, since (x, y) is a CSS click coordinate.
+      const scale = computeImageScale();
       let pt = snappedPoint;
       let constrained = false;
       if (pointConstraintLinePoints && pointConstraintLinePoints.length >= 2) {
-        const p0 = pointConstraintLinePoints[0], p1 = pointConstraintLinePoints[1];
+        const i0 = pointConstraintLinePoints[0], i1 = pointConstraintLinePoints[1];
+        const p0 = imageToCss(i0.x, i0.y, scale);
+        const p1 = imageToCss(i1.x, i1.y, scale);
         const dx = p1.x - p0.x, dy = p1.y - p0.y;
         const len2 = dx * dx + dy * dy || 1;
         const t = ((x - p0.x) * dx + (y - p0.y) * dy) / len2;
@@ -2646,7 +2550,8 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
       } else if (pointConstraintLineId) {
         const refMeas = measurements.find((m) => m.id === pointConstraintLineId);
         if (refMeas && refMeas.points.length >= 2) {
-          const p0 = refMeas.points[0], p1 = refMeas.points[1];
+          const p0 = imageToCss(refMeas.points[0].x, refMeas.points[0].y, scale);
+          const p1 = imageToCss(refMeas.points[1].x, refMeas.points[1].y, scale);
           const dx = p1.x - p0.x, dy = p1.y - p0.y;
           const len2 = dx * dx + dy * dy || 1;
           const t = ((x - p0.x) * dx + (y - p0.y) * dy) / len2;
