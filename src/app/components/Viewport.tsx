@@ -282,6 +282,9 @@ export function Viewport({
   const draggingPerpendicularRef = useRef<{ measurementId: string; startX: number; startY: number; baseLineId?: string | null } | null>(null);
   const perpendicularBaseLineRef = useRef<string | null>(null);
   const measurementsRef = useRef(measurements);
+  /** Stores the latest image→CSS conversion scale so functions declared
+   *  before computeImageScale can read it without TDZ errors. */
+  const imageScaleRef = useRef<{ x: number; y: number; offsetX: number; offsetY: number }>({ x: 1, y: 1, offsetX: 0, offsetY: 0 });
   const suppressClickRef = useRef(false);
 const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
   const dragMovedRef = useRef(false);
@@ -303,6 +306,8 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
     measurementsRef.current = measurements;
   }, [measurements]);
 
+
+
   // Force an explicit overlay redraw when the active slice or plane changes.
   useEffect(() => {
     setOverlayTick((t) => t + 1);
@@ -321,32 +326,41 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
     return Math.hypot(pt.x - px, pt.y - py);
   }, []);
 
+  // Find the closest measurement point within snap radius (CSS pixels).
+  // Measurement points are image-pixel coords — convert to CSS for comparison.
   const findSnapPoint = useCallback((x: number, y: number, excludeMeasurementId?: string | null) => {
     let best: { x: number; y: number; dist: number } | null = null;
+    const scale = imageScaleRef.current;
     for (const measurement of measurementsRef.current) {
       if ((measurement.plane ?? measurementPlane) !== measurementPlane) continue;
       const propagate = measurement.propagateAcrossSlices ?? true;
       if (!propagate && measurement.slice !== currentSlice) continue;
       if (excludeMeasurementId && measurement.id === excludeMeasurementId) continue;
       for (const point of measurement.points) {
-        const dist = Math.hypot(point.x - x, point.y - y);
+        const css = imageToCss(point.x, point.y, scale);
+        const dist = Math.hypot(css.x - x, css.y - y);
         if (dist <= SNAP_RADIUS && (!best || dist < best.dist)) {
-          best = { x: point.x, y: point.y, dist };
+          best = { x: css.x, y: css.y, dist };
         }
       }
     }
     return best ? { x: best.x, y: best.y } : { x, y };
   }, [currentSlice]);
 
+  // Find the nearest line (distance/line type) within 10 CSS pixels.
+  // Measurement line endpoints are image-pixel coords — convert to CSS.
   const findNearbyLine = useCallback((x: number, y: number) => {
     let best: { measurement: Measurement; distance: number } | null = null;
+    const scale = imageScaleRef.current;
     for (const measurement of measurementsRef.current) {
       if ((measurement.plane ?? measurementPlane) !== measurementPlane) continue;
       const propagate = measurement.propagateAcrossSlices ?? true;
       if (!propagate && measurement.slice !== currentSlice) continue;
       if (measurement.type !== 'distance' && measurement.type !== 'line') continue;
       if (measurement.points.length < 2) continue;
-      const d = distanceToSegment({ x, y }, measurement.points[0], measurement.points[1]);
+      const p0 = imageToCss(measurement.points[0].x, measurement.points[0].y, scale);
+      const p1 = imageToCss(measurement.points[1].x, measurement.points[1].y, scale);
+      const d = distanceToSegment({ x, y }, p0, p1);
       if (d <= 10 && (!best || d < best.distance)) {
         best = { measurement, distance: d };
       }
@@ -354,15 +368,16 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
     return best?.measurement ?? null;
   }, [currentSlice, distanceToSegment]);
 
-  /** Snap (x,y) to the closest point on any nearby line. Returns {x,y} or null. */
+  /** Snap (x,y) to the closest point on any nearby line. Returns CSS {x,y} or null. */
   const snapToNearestLine = useCallback((x: number, y: number): { x: number; y: number } | null => {
     let best: { x: number; y: number; dist: number } | null = null;
+    const scale = imageScaleRef.current;
     for (const measurement of measurementsRef.current) {
       if ((measurement.plane ?? measurementPlane) !== measurementPlane) continue;
       if (measurement.type !== 'distance' && measurement.type !== 'line' && measurement.type !== 'perpendicular') continue;
       if (measurement.points.length < 2) continue;
-      const p0 = measurement.points[0];
-      const p1 = measurement.points[1];
+      const p0 = imageToCss(measurement.points[0].x, measurement.points[0].y, scale);
+      const p1 = imageToCss(measurement.points[1].x, measurement.points[1].y, scale);
       const dx = p1.x - p0.x;
       const dy = p1.y - p0.y;
       const len2 = dx * dx + dy * dy || 1;
@@ -397,9 +412,8 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
       if (!refMeas || refMeas.points.length < 2) return rawPt;
       // Guideline points are stored as image coords — convert to CSS
       // before computing constraint, since startPt/rawPt are CSS.
-      const scale = computeImageScale();
-      const p0 = imageToCss(refMeas.points[0].x, refMeas.points[0].y, scale);
-      const p1 = imageToCss(refMeas.points[1].x, refMeas.points[1].y, scale);
+      const p0 = imageToCss(refMeas.points[0].x, refMeas.points[0].y, imageScaleRef.current);
+      const p1 = imageToCss(refMeas.points[1].x, refMeas.points[1].y, imageScaleRef.current);
       const dx = p1.x - p0.x;
       const dy = p1.y - p0.y;
       const len = Math.hypot(dx, dy) || 1;
@@ -426,9 +440,8 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
     if (baseLine.points.length < 2) return null;
     // Baseline points are stored as image coords — convert to CSS
     // before computing perpendicular, since cursor is CSS.
-    const scale = computeImageScale();
-    const p0 = imageToCss(baseLine.points[0].x, baseLine.points[0].y, scale);
-    const p1 = imageToCss(baseLine.points[1].x, baseLine.points[1].y, scale);
+    const p0 = imageToCss(baseLine.points[0].x, baseLine.points[0].y, imageScaleRef.current);
+    const p1 = imageToCss(baseLine.points[1].x, baseLine.points[1].y, imageScaleRef.current);
     const dx = p1.x - p0.x;
     const dy = p1.y - p0.y;
     const len = Math.hypot(dx, dy);
@@ -665,6 +678,12 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
     const offsetY = (dH - drawH) / 2;
     return { x: imgW / drawW, y: imgH / drawH, offsetX, offsetY };
   }, [displaySize, getPlaneGeometry, pixelSpacing]);
+
+  // Keep imageScaleRef in sync so functions declared before
+  // computeImageScale can always read the latest scale.
+  useEffect(() => {
+    imageScaleRef.current = computeImageScale();
+  }, [computeImageScale]);
 
   const emitMeasurementUpdate = useCallback((id: string, newPoints: PointUpdater, value?: string, imageScale?: { x: number; y: number; offsetX?: number; offsetY?: number }) => {
     // Array-form: convert CSS points to image coords before emitting.
@@ -1890,11 +1909,13 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
       activeTool === 'perpendicular' || activeTool === 'freehand' ||
       activeTool === 'ellipse' || activeTool === 'closedCurve';
     if (activeTool === 'none' || (alwaysAllowPointDrag && !isDrawingTool)) {
+      const scl = imageScaleRef.current;
       for (const m of measurementsRef.current) {
         if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
         if (m.points.length === 0) continue;
         for (let i = 0; i < m.points.length; i++) {
-          const p = m.points[i];
+          // Measurement points are image coords — convert to CSS for hit-test.
+          const p = imageToCss(m.points[i].x, m.points[i].y, scl);
           const dist = Math.sqrt((x - p.x) ** 2 + (y - p.y) ** 2);
           if (dist < 10) {
             draggingPointRef.current = { measurementId: m.id, pointIndex: i };
@@ -1910,8 +1931,9 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
         if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
         if (m.type !== 'perpendicular' || m.points.length < 2) continue;
 
-        const anchor = m.points[0];
-        const tip = m.points[1];
+        // Convert image coords to CSS for hit-test.
+        const anchor = imageToCss(m.points[0].x, m.points[0].y, scl);
+        const tip = imageToCss(m.points[1].x, m.points[1].y, scl);
         const nearAnchor = Math.hypot(x - anchor.x, y - anchor.y) < 10;
         const nearTip = Math.hypot(x - tip.x, y - tip.y) < 10;
         const nearBody = distanceToSegment({ x, y }, anchor, tip) < 8;
@@ -1927,8 +1949,9 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
         if ((m.plane ?? measurementPlane) !== measurementPlane) continue;
         if ((m.type !== 'distance' && m.type !== 'line') || m.points.length < 2) continue;
 
-        const p0 = m.points[0];
-        const p1 = m.points[1];
+        // Convert image coords to CSS for hit-test.
+        const p0 = imageToCss(m.points[0].x, m.points[0].y, scl);
+        const p1 = imageToCss(m.points[1].x, m.points[1].y, scl);
         const dx = p1.x - p0.x;
         const dy = p1.y - p0.y;
         const lenSq = dx * dx + dy * dy;
@@ -2038,20 +2061,23 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
           ? measurementsRef.current.find((m) => m.id === targetMeasurement.baseLineId)
           : null;
         if (baseLine && baseLine.points.length >= 2) {
-          const p0 = baseLine.points[0];
-          const p1 = baseLine.points[1];
+          // All measurement points are image coords — convert to CSS for drag math.
+          const scl = imageScaleRef.current;
+          const p0 = imageToCss(baseLine.points[0].x, baseLine.points[0].y, scl);
+          const p1 = imageToCss(baseLine.points[1].x, baseLine.points[1].y, scl);
           const dx = p1.x - p0.x;
           const dy = p1.y - p0.y;
           const len = Math.hypot(dx, dy) || 1;
-          const lineX = dx / len;
-          const lineY = dy / len;
           const perpX = -dy / len;
           const perpY = dx / len;
           const anchorT = ((x - p0.x) * dx + (y - p0.y) * dy) / (len * len);
           const anchorX = p0.x + dx * Math.max(0, Math.min(1, anchorT));
           const anchorY = p0.y + dy * Math.max(0, Math.min(1, anchorT));
-          const stubDx = targetMeasurement.points[1].x - targetMeasurement.points[0].x;
-          const stubDy = targetMeasurement.points[1].y - targetMeasurement.points[0].y;
+          // Stub from existing perp measurement (image → CSS).
+          const css0 = imageToCss(targetMeasurement.points[0].x, targetMeasurement.points[0].y, scl);
+          const css1 = imageToCss(targetMeasurement.points[1].x, targetMeasurement.points[1].y, scl);
+          const stubDx = css1.x - css0.x;
+          const stubDy = css1.y - css0.y;
           const stubLen = Math.max(1, Math.hypot(stubDx, stubDy));
           const sign = stubDx * perpX + stubDy * perpY >= 0 ? 1 : -1;
           {
@@ -2070,7 +2096,13 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
           const dx = x - dragged.startX;
           const dy = y - dragged.startY;
           {
-            const pts = targetMeasurement.points.map((p) => ({ x: p.x + dx, y: p.y + dy }));
+            // Convert image-space points to CSS, apply CSS delta, emit CSS
+            // (emitMeasurementUpdate converts CSS→image on the other side).
+            const scl = imageScaleRef.current;
+            const pts = targetMeasurement.points.map((p) => {
+              const css = imageToCss(p.x, p.y, scl);
+              return { x: css.x + dx, y: css.y + dy };
+            });
             const val = calculateMeasurementValue(targetMeasurement.type as MeasurementTool, pts);
             const now = Date.now();
             lastDraggedPointRef.current = { id: targetMeasurement.id, pointIndex: -1, x: pts[0].x, y: pts[0].y, ts: now };
@@ -2091,7 +2123,12 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
       }
       if (lineDragMovedRef.current) {
         {
-          const pts = drag.initialPoints.map((p) => ({ x: p.x + dx, y: p.y + dy }));
+          // Convert image-space initial points to CSS, apply CSS delta.
+          const scl = imageScaleRef.current;
+          const pts = drag.initialPoints.map((p) => {
+            const css = imageToCss(p.x, p.y, scl);
+            return { x: css.x + dx, y: css.y + dy };
+          });
           const targetMeasurement = measurementsRef.current.find((m) => m.id === drag.measurementId);
           const val = targetMeasurement ? calculateMeasurementValue(targetMeasurement.type as MeasurementTool, pts) : undefined;
           const now = Date.now();
@@ -2110,8 +2147,10 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
       if (targetMeasurement && targetMeasurement.type === 'perpendicular' && targetMeasurement.points.length >= 2) {
         const baseLine = measurementsRef.current.find((m) => m.id === targetMeasurement.baseLineId);
         if (baseLine && baseLine.points.length >= 2) {
-          const p0 = baseLine.points[0];
-          const p1 = baseLine.points[1];
+          // All measurement points are image coords — convert to CSS for drag math.
+          const scl = imageScaleRef.current;
+          const p0 = imageToCss(baseLine.points[0].x, baseLine.points[0].y, scl);
+          const p1 = imageToCss(baseLine.points[1].x, baseLine.points[1].y, scl);
           const dx = p1.x - p0.x;
           const dy = p1.y - p0.y;
           const len = Math.hypot(dx, dy);
@@ -2123,8 +2162,11 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
             const anchorX = p0.x + t * dx;
             const anchorY = p0.y + t * dy;
 
-            const stubDx = targetMeasurement.points[1].x - targetMeasurement.points[0].x;
-            const stubDy = targetMeasurement.points[1].y - targetMeasurement.points[0].y;
+            // Stub direction and length from the existing perp (image coords → CSS).
+            const css0 = imageToCss(targetMeasurement.points[0].x, targetMeasurement.points[0].y, scl);
+            const css1 = imageToCss(targetMeasurement.points[1].x, targetMeasurement.points[1].y, scl);
+            const stubDx = css1.x - css0.x;
+            const stubDy = css1.y - css0.y;
             const stubLen = Math.hypot(stubDx, stubDy);
             const sign = stubDx * perpX + stubDy * perpY >= 0 ? 1 : -1;
 
@@ -2139,8 +2181,10 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
             dragMovedRef.current = true;
             lastDragTimestampRef.current = now;
           } else {
-            const anchorX = targetMeasurement.points[0].x;
-            const anchorY = targetMeasurement.points[0].y;
+            // Convert existing anchor to CSS before computing new tip.
+            const css0 = imageToCss(targetMeasurement.points[0].x, targetMeasurement.points[0].y, scl);
+            const anchorX = css0.x;
+            const anchorY = css0.y;
             const t = (x - anchorX) * perpX + (y - anchorY) * perpY;
             emitMeasurementUpdate(targetMeasurement.id, [
               { x: anchorX, y: anchorY },
@@ -2153,9 +2197,12 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
 
       const updatedMeasurements = measurementsRef.current.map((m) => {
         if (m.id !== draggingPointRef.current!.measurementId) return m;
-        const newPoints = [...m.points];
-        newPoints[draggingPointRef.current!.pointIndex] = findSnapPoint(x, y, m.id);
-        return { ...m, points: newPoints };
+        // Convert image points to CSS, snap in CSS, emit CSS.
+        // emitMeasurementUpdate converts CSS→image on the other side.
+        const scl = imageScaleRef.current;
+        const cssPoints = m.points.map((p) => imageToCss(p.x, p.y, scl));
+        cssPoints[draggingPointRef.current!.pointIndex] = findSnapPoint(x, y, m.id);
+        return { ...m, points: cssPoints };
       });
       const updated = updatedMeasurements.find((m) => m.id === draggingPointRef.current!.measurementId);
       if (updated) {
@@ -2406,10 +2453,12 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
       if (targetLineId) {
         const baseLine = measurements.find((m) => m.id === targetLineId);
         if (baseLine && baseLine.points.length >= 2) {
-          const p0 = baseLine.points[0];
-          const p1 = baseLine.points[1];
-          const midX = (p0.x + p1.x) / 2;
-          const midY = (p0.y + p1.y) / 2;
+          // Baseline points are image coords — convert to CSS for
+          // midpoint computation and hit-testing against CSS click (x,y).
+          const bpCss0 = imageToCss(baseLine.points[0].x, baseLine.points[0].y, imageScaleRef.current);
+          const bpCss1 = imageToCss(baseLine.points[1].x, baseLine.points[1].y, imageScaleRef.current);
+          const midX = (bpCss0.x + bpCss1.x) / 2;
+          const midY = (bpCss0.y + bpCss1.y) / 2;
           const addLabelX = midX;
           const addLabelY = midY + 14;
           const addLabelHit = x >= addLabelX - 24 && x <= addLabelX + 24 && y >= addLabelY - 10 && y <= addLabelY + 10;
@@ -2456,12 +2505,13 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
               suppressClick: suppressClickRef.current,
               draggingPointRef: draggingPointRef.current,
             });
-            const dx = p1.x - p0.x;
-            const dy = p1.y - p0.y;
+            const dx = bpCss1.x - bpCss0.x;
+            const dy = bpCss1.y - bpCss0.y;
             const len = Math.hypot(dx, dy);
             const perpX = len > 0 ? -dy / len : 0;
             const perpY = len > 0 ? dx / len : 0;
             const stubLen = 40;
+            // Create stub in CSS space — emitMeasurementAdd will convert to image.
             const stubPoints = [
               { x: midX, y: midY },
               { x: midX + perpX * stubLen, y: midY + perpY * stubLen },
@@ -2551,7 +2601,7 @@ const cursorPosRef = useRef<{ x: number; y: number } | null>(null);
         const refMeas = measurements.find((m) => m.id === pointConstraintLineId);
         if (refMeas && refMeas.points.length >= 2) {
           const p0 = imageToCss(refMeas.points[0].x, refMeas.points[0].y, scale);
-          const p1 = imageToCss(refMeas.points[1].x, refMeas.points[1].y, scale);
+          const p1 = imageToCss(refMeas.points[1].x, refMeas.points[1].y, imageScaleRef.current);
           const dx = p1.x - p0.x, dy = p1.y - p0.y;
           const len2 = dx * dx + dy * dy || 1;
           const t = ((x - p0.x) * dx + (y - p0.y) * dy) / len2;

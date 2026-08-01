@@ -1236,7 +1236,7 @@ export function MedicalImageViewer({
                 let changed = false;
                 for (const update of perpWorkflowUpdatesSession) {
                   const old = next[update.stepId];
-                  if (!old || old.points.some((p, i) => p.x !== update.points[i]?.x || p.y !== update.points[i]?.y) || old.imageScale?.x !== update.imageScale.x || old.imageScale?.y !== update.imageScale.y) {
+                  if (!old || old.points.some((p, i) => p.x !== update.points[i]?.x || p.y !== update.points[i]?.y) || old.imageScale?.x !== update.imageScale?.x || old.imageScale?.y !== update.imageScale?.y) {
                     next[update.stepId] = {
                       primitive: old?.primitive ?? 'point',
                       points: update.points,
@@ -1403,7 +1403,7 @@ export function MedicalImageViewer({
           let changed = false;
           for (const update of perpWorkflowUpdates) {
             const old = next[update.stepId];
-            if (!old || old.points.some((p, i) => p.x !== update.points[i]?.x || p.y !== update.points[i]?.y) || old.imageScale?.x !== update.imageScale.x || old.imageScale?.y !== update.imageScale.y) {
+            if (!old || old.points.some((p, i) => p.x !== update.points[i]?.x || p.y !== update.points[i]?.y) || old.imageScale?.x !== update.imageScale?.x || old.imageScale?.y !== update.imageScale?.y) {
               next[update.stepId] = {
                 primitive: old?.primitive ?? 'point',
                 points: update.points,
