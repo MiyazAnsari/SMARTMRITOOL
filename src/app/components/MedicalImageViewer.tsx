@@ -385,13 +385,22 @@ export function MedicalImageViewer({
       const sr = workflow.stepResults[step.id];
       if (!sr || sr.points.length < 1) continue;
 
-      // Points are now image-pixel coordinates — use them directly to
-      // compute the position fraction within the sagittal image.
+      // Convert the stored image-pixel Y back to CSS space using the
+      // same scale computation that the sagittal Viewport uses, then
+      // compute the CSS fraction as the original code did.
       const sagImageY = sr.points[0].y;
+      const sagScale = computePlaneImageScale('sagittal');
+      if (!sagScale) continue;
+
+      const sagCssY = sagImageY / sagScale.y + sagScale.offsetY;
+      const sagDisplayH = viewportDisplaySizes['sagittal']?.height ?? 0;
+      const sagDrawH = Math.max(1, sagDisplayH - 2 * sagScale.offsetY);
+      const sagFraction = Math.max(0, Math.min(1, (sagCssY - sagScale.offsetY) / sagDrawH));
 
       // Per-plane authoritative data from studyData.volumes.
       const planeImgH: Record<string, number> = {};
       const planeZSpacing: Record<string, number> = {};
+      const planeZOrigin: Record<string, number> = {};
 
       for (const p of ['sagittal', 'coronal', 'axial'] as const) {
         const pVol = studyData?.volumes[p];
@@ -402,27 +411,24 @@ export function MedicalImageViewer({
         planeZSpacing[p] = zSp;
         const nSlices: number = (h.dims?.[3] ?? h.dim?.[3] ?? pVol.sliceCount ?? 0);
         planeImgH[p] = nSlices;
+        // Z-origin: ImagePositionPatient[2] gives the physical Z (mm) of slice 0.
+        const ipp = h.imagePositionPatient as number[] | undefined;
+        planeZOrigin[p] = ipp?.length === 3 ? ipp[2] : 0;
       }
 
-      // Fraction of the sagittal image height (0=superior, 1=inferior).
-      const sagImgH = planeImgH['sagittal'] || 1;
-      const sagFraction = Math.max(0, Math.min(1, sagImageY / sagImgH));
-
       // ── 3D affine + calibration (DISABLED) ───────────────────────
-      // Translation-only calibration can't correct for different axis
-      // orientations between series.  CSS fraction fallback below.
       let coronalImageY: number | undefined;
-      /* 3D affine + calibration WIP — see guidelines/IMPLEMENTATION_PLAN.md P0 */
 
       return {
         sagFraction,
-        sagImageY,         // authoritative image-pixel Y (replaces sagCssY)
+        sagImageY,
         offsetMm: step.referenceLineMm,
         label: 'Joint line',
         planeZSpacing,
         planeZSliceCount: planeImgH,
-        coronalImageY,     // 3D-mapped Y on coronal (authoritative pixels)
-        coronalImgH: planeImgH['coronal'],  // coronal authoritative slice count
+        planeZOrigin,
+        coronalImageY,
+        coronalImgH: planeImgH['coronal'],
       };
     }
     return null;
@@ -446,10 +452,39 @@ export function MedicalImageViewer({
       const axialSliceCount = axialVol?.sliceCount ?? (axialVol?.header?.dims?.[3] ?? 0);
       if (axialSliceCount <= 0) return;
       const axialHeader = axialVol?.header as any;
+
+      // ── Physical Z mapping ─────────────────────────────────────────
+      // Convert the sagittal fraction (0=first sag slice, 1=last sag slice)
+      // to a physical Z position (mm), then map that Z to the axial series.
+      const rl = referenceLineFraction;
+      if (rl && rl.planeZOrigin && rl.planeZSpacing && rl.planeZSliceCount) {
+        const sagOrigin = rl.planeZOrigin['sagittal'] ?? 0;
+        const sagSpacing = rl.planeZSpacing['sagittal'] ?? 1;
+        const sagCount = rl.planeZSliceCount['sagittal'] ?? 0;
+        const sagPhysicalZ = sagOrigin + refFraction * (sagCount - 1) * sagSpacing;
+
+        const axOrigin = rl.planeZOrigin['axial'] ?? 0;
+        const axSpacing = rl.planeZSpacing['axial'] ?? 1;
+        const axCount = axialSliceCount;
+        const axPhysicalRange = (axCount - 1) * axSpacing || 1;
+        const axFraction = Math.max(0, Math.min(1, (sagPhysicalZ - axOrigin) / axPhysicalRange));
+
+        const sliceDir = axialHeader?.sliceDirection as [number, number, number] | undefined;
+        const needsInvert = sliceDir ? sliceDir[2] > 0 : true;
+        const axialFraction = needsInvert ? 1 - axFraction : axFraction;
+        const axialSlice = Math.round(axialFraction * (axCount - 1));
+        setCurrentSlice((prev) => ({ ...prev, axial: axialSlice }));
+        if (studyData) {
+          setStudyViewport((s) => ({
+            open: s.open.includes('axial') ? s.open : [...s.open, 'axial'],
+            active: 'axial',
+          }));
+        }
+        return;
+      }
+
+      // ── Fallback: simple fraction mapping (no Z-origin data) ────────
       const sliceDir = axialHeader?.sliceDirection as [number, number, number] | undefined;
-      // If sliceDir Z > 0: slice 0 is inferior → refFraction (0=sup) needs inversion.
-      // If sliceDir Z < 0: slice 0 is superior → no inversion.
-      // Safe default (no IOP data): assume standard foot-to-head (invert).
       const needsInvert = sliceDir ? sliceDir[2] > 0 : true;
       const axialFraction = needsInvert ? 1 - refFraction : refFraction;
       const axialSlice = Math.round(axialFraction * (axialSliceCount - 1));
@@ -461,7 +496,7 @@ export function MedicalImageViewer({
         }));
       }
     },
-    [studyData],
+    [studyData, referenceLineFraction],
   );
 
   const handleReferenceLineClick = useCallback(
